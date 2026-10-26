@@ -40,6 +40,39 @@ EOF
 
 GID=$(sock_gid)
 
+# Compose used to derive the project name from the checkout directory, so a
+# clone in "Dok" created a project called "dok". The project is now pinned to
+# "wickedafdok"; move an older container aside so Compose can recreate it
+# under the pinned project without a container-name conflict.
+LEGACY_CONTAINER=""
+detach_legacy_container() {
+  docker container inspect wickedafdok >/dev/null 2>&1 || return 0
+  existing=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' wickedafdok 2>/dev/null || true)
+  case "$existing" in
+    ""|"<no value>"|"wickedafdok") return 0 ;;
+  esac
+  LEGACY_CONTAINER="wickedafdok-previous-$(date +%s)"
+  echo "Moving wickedafdok from Compose project '$existing' to 'wickedafdok' (backup: $LEGACY_CONTAINER)" >&2
+  docker stop -t 20 wickedafdok >/dev/null 2>&1 || true
+  docker rename wickedafdok "$LEGACY_CONTAINER" >/dev/null 2>&1 || docker rm -f wickedafdok >/dev/null 2>&1 || true
+}
+
+finish_start() {
+  if "$@"; then
+    if [ -n "$LEGACY_CONTAINER" ]; then
+      docker rm -f "$LEGACY_CONTAINER" >/dev/null 2>&1 || true
+    fi
+  else
+    # A skipped `if` body makes the compound command exit 0, so the real status
+    # must be read here rather than after the `fi`.
+    status=$?
+    if [ -n "$LEGACY_CONTAINER" ]; then
+      echo "Start failed; the previous container was kept as $LEGACY_CONTAINER." >&2
+    fi
+    return "$status"
+  fi
+}
+
 if [ -f "$ALT" ]; then
   if grep -qE '^[[:space:]]*-[[:space:]]*"?/app/(data|sources|uploads|apps|core):/app/(data|sources|uploads|apps|core)"?$' "$ALT"; then
     echo "Ignoring managed compose with container-local bind paths: $ALT" >&2
@@ -47,6 +80,17 @@ if [ -f "$ALT" ]; then
     echo "Using managed compose: $ALT"
     cd "$DIR/data/wickedafdok"
     rm -f docker-compose.socket-gid.yml
+    # The managed compose only references the built image, so without this a
+    # code update in the checkout would never reach the container. Match the
+    # root-compose path and rebuild when a Dockerfile is present.
+    if [ -f "$DIR/Dockerfile" ]; then
+      image=$(docker compose -f docker-compose.yml config --images 2>/dev/null | head -n 1 || true)
+      if [ -n "$image" ]; then
+        echo "Building $image from $DIR"
+        docker build -t "$image" "$DIR"
+      fi
+    fi
+    detach_legacy_container
     write_socket_override docker-compose.yml docker-compose.socket-gid.yml "$GID"
     set -- docker compose -p wickedafdok -f docker-compose.yml
     if [ -f docker-compose.override.yml ]; then
@@ -56,7 +100,7 @@ if [ -f "$ALT" ]; then
       set -- "$@" -f docker-compose.socket-gid.yml
     fi
     set -- "$@" up -d --force-recreate --remove-orphans
-    "$@"
+    finish_start "$@"
     exit 0
   fi
 fi
@@ -67,8 +111,11 @@ if [ -f "$COMPOSE" ]; then
   if ! docker network inspect wicked >/dev/null 2>&1; then
     docker network create wicked >/dev/null
   fi
+  detach_legacy_container
   write_socket_override docker-compose.yml "$SOCK_OVERRIDE" "$GID"
-  set -- docker compose -f docker-compose.yml
+  # Pin the project name so the checkout directory (for example "Dok") cannot
+  # create a second Compose project named "dok" for the same container.
+  set -- docker compose -p wickedafdok -f docker-compose.yml
   if [ -f docker-compose.override.yml ]; then
     set -- "$@" -f docker-compose.override.yml
   fi
@@ -76,7 +123,7 @@ if [ -f "$COMPOSE" ]; then
     set -- "$@" -f "$SOCK_OVERRIDE"
   fi
   set -- "$@" up -d --build --remove-orphans
-  "$@"
+  finish_start "$@"
   exit 0
 fi
 

@@ -1,3 +1,5 @@
+name: wickedafdok
+
 services:
   wickedafdok:
     image: wickedafdok:latest
