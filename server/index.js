@@ -8334,7 +8334,9 @@ function beginDockerUpdate({ sourceDir, repo, branch, previousCommit, commit }) 
       const image = updateImageTag(info?.Config?.Image || info?.Image || process.env.WICKEDAFDOK_IMAGE || '');
       updateJob.image = image;
       record(`Rebuilding image ${image}...\n`);
-      const build = await run('docker', ['build', '--progress=plain', '-t', image, sourceDir], {
+      // Do not pass `--progress`: older Docker CLIs without buildx reject it
+      // with "unknown flag", and the captured output is plain either way.
+      const build = await run('docker', ['build', '-t', image, sourceDir], {
         cwd: sourceDir,
         env: dockerEnvironment()
       });
