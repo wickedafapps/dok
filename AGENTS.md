@@ -189,6 +189,7 @@ The **Core Services** subtab manages the bundled services.
 - Uses `jwilder/nginx-proxy` style setup
 - Managed compose stored in `core/nginx-proxy/docker-compose.yml`
 - `GET /api/core/nginx-proxy` reports both `exists`/`running` (live Docker state) and `installed`/`composeExists` (compose file on disk). Reading status never creates the compose file, so a fresh install stays "not created" until the user launches nginx-proxy. The UI treats `installed` as authoritative so a transient Docker/API failure cannot flip a running nginx-proxy back to "not installed"; failed lookups keep the last known state
+- Compose reads are capped at 2 MB. A managed nginx-proxy compose that grows past the cap is renamed to `docker-compose.yml.corrupt-<timestamp>` and regenerated from saved settings, so status/sync/launch recover instead of failing with `Invalid string length`
 
 **cloudflared (managed):**
 - Create/run/edit Cloudflare Tunnel via UI
@@ -383,6 +384,7 @@ The **Core Services** subtab manages the bundled services.
 - Compose validation via `/api/compose/validate`; final combined validation also checks port conflicts and unresolved networks/volumes
 - Compose builder parsing uses `docker compose config --format json` when available and a block-YAML subset reader when not; building normalizes the field model to YAML and validates conflicts server-side
 - Compose input explicitly provided as empty is rejected with `Compose file is empty`
+- `setMountSource()` rewrites bind-mount sources in place for managed composes. It decodes quoted YAML scalars and `$$` Compose escapes, normalizes the volume mode, and re-emits canonical short-syntax volumes, so repeated status/sync passes are byte-for-byte idempotent instead of growing the file
 
 ### Registry and Git Connections
 - `data/registries.json` holds `{ connections: [...] }`; each entry has `kind` (`registry` or `git`), `provider`, `name`, `host`, `username`, and `secretEnc`
@@ -549,29 +551,6 @@ The **Core Services** subtab manages the bundled services.
 
 ##------------------------------------------Your current task--------------------------------------
 
-Running Containers:
- Add a button to open the apps interface.
-
 Core Services:
- Authentication:
-  When launching an auth container. After the user hits the launch button open a window with a list of all existing containers for the user to select ones that need to be recreated with auth.
  Reverse Proxy:
-  For some reason after about 20 minutes wickedafdok reverts back to the Nginx not installed state. The nginx container is still running and appears to still be functioning correctly. But
-In Core Services it reverts back to an install state and App Creation starts displaying the nginx is not installed notification.
-
-Settings:
- Dok Settings:
-   Add a button called "Designer" that opens an app costomization window.
-     - Set a custom logo
-	 - Set a custom name
-	 - Set a custom Tag Line
-	 - A CSS override field for custom CSS
-	 - Easy access to nginxproxy files for editing error pages etc.. for custom design
-
-Apps:
- Apps should have a 1 click deploy. If a duplicate container already exists, the new container should be automatically amended in the simplest, most logical and clean way possible to fix conflicts. It should also have an edited deploy where it opens our compose editor and the user can make any changes they want. They should have the option to save a new base config for the app.
- Lets call the 1 click deploy button Quick Deploy" and for fun lets call the edit button "Alter State"
- When creating an app, I changed the volume path in the compose editor and it still used the old path. It also said it failed when it just had not finished its install yet.
-
-Ensure that we are managing passwords, secrets etc.. correctly
-Core Service containers need to be segragated from the rest of the container list and Protected from accidental or easy deletion. To start, create a group called Core Services. It should be a built in group that all Core Service Containers go to
+  Got error: Invalid string length when launching nginx. So it fails. nginx-proxy compose check failed: Invalid string length

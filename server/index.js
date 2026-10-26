@@ -347,6 +347,52 @@ function writePrivateFile(file, content) {
   try { fs.chmodSync(file, 0o600); } catch {}
 }
 
+// Generated compose files are a few kilobytes. Reading an unbounded file here
+// would let a corrupted (for example exponentially re-quoted) file exceed
+// V8's maximum string length and take the whole request down with
+// "Invalid string length", so keep compose reads small and recoverable.
+const MAX_COMPOSE_FILE_BYTES = 2 * 1024 * 1024;
+
+function readFileHead(file, bytes = 128) {
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const buffer = Buffer.alloc(bytes);
+    const read = fs.readSync(fd, buffer, 0, bytes, 0);
+    return buffer.subarray(0, read).toString('utf-8');
+  } catch {
+    return '';
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
+}
+
+function readComposeText(file) {
+  try {
+    const stat = fs.statSync(file);
+    if (!stat.isFile() || stat.size > MAX_COMPOSE_FILE_BYTES) return '';
+    return fs.readFileSync(file, 'utf-8');
+  } catch {
+    return '';
+  }
+}
+
+function recoverOversizedManagedCompose(file) {
+  try {
+    const stat = fs.statSync(file);
+    if (!stat.isFile() || stat.size <= MAX_COMPOSE_FILE_BYTES) return false;
+    if (!readFileHead(file).startsWith('# managed-by: wickedafdok')) return false;
+    const backup = `${file}.corrupt-${Date.now()}`;
+    fs.renameSync(file, backup);
+    appendServerLog('WARN', `Compose file ${file} was oversized (${stat.size} bytes); archived it at ${backup}`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function addRegistryEntry(entry) {
   const reg = readRegistry();
   const existing = (entry.appDir ? reg.find(r => r.appDir === entry.appDir) : null)
@@ -747,16 +793,58 @@ function yamlScalar(value) {
   return JSON.stringify(String(value ?? '').replace(/\r?\n/g, ' ').replace(/\$/g, () => '$$'));
 }
 
+function unquoteYamlScalar(value) {
+  const text = String(value ?? '').trim();
+  if (text.length >= 2 && text.startsWith('"') && text.endsWith('"')) {
+    try { return JSON.parse(text); } catch { return text.slice(1, -1); }
+  }
+  if (text.length >= 2 && text.startsWith("'") && text.endsWith("'")) {
+    return text.slice(1, -1).replace(/''/g, "'");
+  }
+  return text;
+}
+
+function cleanVolumeMode(value) {
+  // Keep the valid leading mode (ro, rw, z, cached, ...) and drop anything
+  // that came from a previous, mangled quoting round.
+  const match = /^[A-Za-z0-9_,.+\-=]+/.exec(String(value || '').trim());
+  return match ? match[0] : '';
+}
+
 function setMountSource(compose, mountTarget, hostSource) {
   const source = String(hostSource || '').trim();
   if (!source) return compose;
-  const escaped = String(mountTarget).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const line = new RegExp(
-    `^(\\s*-\\s*)(?:"[^"]*"|'[^']*'|[^\\s:]+):${escaped}(?::([^\\s]+))?(\\s*)$`,
-    'm'
-  );
-  return String(compose || '').replace(line, (match, prefix, mode, suffix) =>
-    `${prefix}${yamlScalar(`${source}:${mountTarget}${mode ? `:${mode}` : ''}`)}${suffix}`);
+  const target = String(mountTarget);
+  const suffix = `:${target}`;
+  const lines = String(compose || '').split('\n');
+  let changed = false;
+  for (let i = 0; i < lines.length; i++) {
+    const item = /^(\s*-\s*)(.+?)(\s*)$/.exec(lines[i]);
+    if (!item) continue;
+    // Decode quoted YAML scalars before inspecting them. The previous regex
+    // treated the closing quote as part of the mode, so every repair pass
+    // added another escaped quote and the file grew without bound.
+    const value = unquoteYamlScalar(item[2]).replace(/\$\$/g, '$');
+    let mountSource = '';
+    let mode = '';
+    if (value.endsWith(suffix)) {
+      mountSource = value.slice(0, -suffix.length);
+    } else {
+      const marker = `${suffix}:`;
+      const at = value.lastIndexOf(marker);
+      if (at === -1) continue;
+      mountSource = value.slice(0, at);
+      mode = cleanVolumeMode(value.slice(at + marker.length));
+    }
+    if (!mountSource) continue;
+    const nextValue = yamlScalar(`${source}:${target}${mode ? `:${mode}` : ''}`);
+    const nextLine = `${item[1]}${nextValue}${item[3]}`;
+    if (nextLine !== lines[i]) {
+      lines[i] = nextLine;
+      changed = true;
+    }
+  }
+  return changed ? lines.join('\n') : String(compose || '');
 }
 
 function durationValue(value) {
@@ -3930,9 +4018,9 @@ async function ensureNginxProxyCompose({ recreate = false } = {}) {
   } catch {}
   ensureNginxErrorPages();
   const composePath = path.join(dir, 'docker-compose.yml');
-  let compose = '';
-  try { compose = fs.readFileSync(composePath, 'utf-8'); } catch {}
-  if (!compose.startsWith('# managed-by: wickedafdok')) return { changed: false, recreated: false };
+  const recovered = recoverOversizedManagedCompose(composePath);
+  const compose = readComposeText(composePath);
+  if (!recovered && !compose.startsWith('# managed-by: wickedafdok')) return { changed: false, recreated: false };
   const coreHostDir = await selfMountSource('/app/core');
   if (!coreHostDir) return { changed: false, recreated: false };
   const nginxHostDir = path.join(coreHostDir, 'nginx-proxy');
@@ -6803,7 +6891,7 @@ app.get('/api/core/nginx-proxy', async (req, res) => {
       composeExists,
       dir: nginxDir,
       composePath,
-      compose: composeExists ? fs.readFileSync(composePath, 'utf-8') : '',
+      compose: composeExists ? readComposeText(composePath) : '',
       settings: settings.services?.nginxProxy || {}
     });
   } catch (e) {
@@ -6844,7 +6932,8 @@ app.post('/api/core/nginx-proxy/run', async (req, res) => {
     fs.mkdirSync(path.join(nginxDir, 'certs'), { recursive: true });
     ensureNginxErrorPages();
     const composePath = path.join(nginxDir, 'docker-compose.yml');
-    const existingCompose = fs.existsSync(composePath) ? fs.readFileSync(composePath, 'utf-8') : '';
+    recoverOversizedManagedCompose(composePath);
+    const existingCompose = readComposeText(composePath);
     const managedCompose = existingCompose.startsWith('# managed-by: wickedafdok');
     const networkLine = `name: ${network}`;
     const quotedNetworkLine = `name: ${yamlScalar(network)}`;
