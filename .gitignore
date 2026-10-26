@@ -1,0 +1,10 @@
+node_modules/
+data/
+sources/
+uploads/
+apps/
+core/
+.env
+docker-compose.override.yml
+*.log
+.DS_Store

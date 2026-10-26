@@ -1,0 +1,24 @@
+{
+  "name": "wickedafdok",
+  "version": "1.0.0",
+  "description": "WickedAFDok - a self-hosted server and Docker management dashboard",
+  "type": "module",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "dockerode": "^4.0.7",
+    "express": "^4.21.2",
+    "multer": "^2.0.2",
+    "node-pty": "^1.1.0",
+    "shell-quote": "^1.8.2",
+    "ws": "^8.22.0"
+  }
+}

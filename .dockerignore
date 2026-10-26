@@ -1,0 +1,11 @@
+node_modules
+data
+sources
+uploads
+apps
+core
+.git
+.gitignore
+.env
+docker-compose.override.yml
+*.log

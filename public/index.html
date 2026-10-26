@@ -1,0 +1,905 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WickedAFDok</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/vendor/xterm/css/xterm.css">
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <header>
+    <div class="container header-inner">
+      <div class="brand">
+        <div class="brand-mark">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/><path d="m7.5 4.3 9 5.2"/></svg>
+        </div>
+        <div>
+          <h1>Wicked<span>AFDok</span></h1>
+          <div class="subtitle">Server &amp; Docker control room</div>
+        </div>
+      </div>
+      <div class="conn-status" id="connStatus">
+        <span class="dot"></span><span class="conn-text">Connecting…</span>
+      </div>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <div class="container tabs-inner">
+      <button class="tab-btn active" data-tab="dashboard">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg>
+        Dashboard
+      </button>
+      <button class="tab-btn" data-tab="containers">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 8h18v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1Z"/><path d="M3 8 5 3h14l2 5"/><path d="M8 12h.01M12 12h.01M16 12h.01"/></svg>
+        Containers <span class="count" id="containerCount"></span>
+      </button>
+      <button class="tab-btn" data-tab="images">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-4.5-4.5L6 21"/></svg>
+        Images <span class="count" id="imageCount"></span>
+      </button>
+      <button class="tab-btn" data-tab="appcreation">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09Z"/><path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2Z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/><path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/></svg>
+        App Creation
+      </button>
+      <button class="tab-btn" data-tab="sources">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>
+        Projects
+      </button>
+      <button class="tab-btn" data-tab="apps">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 2 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/></svg>
+        Apps
+      </button>
+      <button class="tab-btn" data-tab="settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>
+        Settings
+      </button>
+    </div>
+  </nav>
+
+  <main class="container">
+    <!-- Dashboard -->
+    <section id="tab-dashboard" class="tab-pane active">
+      <div class="section-header">
+        <div>
+          <h2>System Overview</h2>
+          <p class="muted" id="hostLine">—</p>
+        </div>
+        <div class="inline">
+          <button id="dashboardTerminalBtn" class="btn" title="Open an admin shell in the browser">Terminal</button>
+          <button id="dashboardOpencodeBtn" class="btn btn-primary" title="Launch OpenCode in Admin mode">OpenCode</button>
+          <button id="refreshStats" class="btn">Refresh</button>
+        </div>
+      </div>
+      <div class="stats-grid" id="statsGrid"></div>
+      <div class="grid-2">
+        <div class="card">
+          <h3>Docker Engine</h3>
+          <div id="dockerSummary" class="kv"></div>
+        </div>
+        <div class="card">
+          <h3>Network</h3>
+          <div id="networkSummary" class="kv"></div>
+        </div>
+      </div>
+      <details class="card raw">
+        <summary>Raw system data</summary>
+        <pre id="statsDetail" class="output"></pre>
+      </details>
+    </section>
+
+    <!-- Containers -->
+    <section id="tab-containers" class="tab-pane">
+      <div class="section-header">
+        <div>
+          <h2>Containers</h2>
+          <p class="muted">Start, stop, restart and inspect your workloads.</p>
+        </div>
+        <div class="inline">
+          <input id="containerSearch" class="input" placeholder="Filter containers…">
+          <button id="refreshContainers" class="btn">Refresh</button>
+        </div>
+      </div>
+      <div id="containersList" class="list"></div>
+    </section>
+
+    <!-- Images -->
+    <section id="tab-images" class="tab-pane">
+      <div class="section-header">
+        <div>
+          <h2>Images</h2>
+          <p class="muted">Local images available on the Docker engine.</p>
+        </div>
+        <div class="inline">
+          <input id="imageSearch" class="input" placeholder="Filter images…">
+          <button id="refreshImages" class="btn">Refresh</button>
+        </div>
+      </div>
+      <div class="card pull-card">
+        <h3>Pull an image</h3>
+        <div class="row">
+          <input id="pullImageInput" placeholder="e.g. nginx:latest" class="input flex">
+          <button id="pullImageBtn" class="btn btn-primary">Pull image</button>
+        </div>
+        <pre id="pullOutput" class="output hidden"></pre>
+      </div>
+      <div id="imagesList" class="list"></div>
+    </section>
+
+    <!-- App Creation -->
+    <section id="tab-appcreation" class="tab-pane">
+      <div class="section-header">
+        <div>
+          <h2>App Creation</h2>
+          <p class="muted">Add any app to WickedAFDok. All apps are managed by compose from their own directory.</p>
+        </div>
+      </div>
+      <div id="appCreationNginxNotice" class="card hidden" style="border-color: rgba(255,180,0,0.5)">
+        <p class="muted">The core nginx service has not been created. Create it to automatically direct your domains to your containers.</p>
+        <div class="row"><button id="appCreationCreateNginx" class="btn btn-primary">Create core nginx-proxy</button></div>
+      </div>
+      <div class="subtabs">
+        <button class="subtab-btn active" data-subtab="run">Docker run</button>
+        <button class="subtab-btn" data-subtab="compose">Docker compose</button>
+        <button class="subtab-btn" data-subtab="git">Git Clone</button>
+        <button class="subtab-btn" data-subtab="upload">Local upload</button>
+      </div>
+
+      <div id="subtab-run" class="subtab-pane active">
+        <div class="card">
+          <h3>Paste a docker run command</h3>
+          <p class="muted">WickedAFDok converts the command into a managed compose app. Use <code>-p</code>, <code>--name</code>, <code>-v</code>, and <code>-e</code> as usual.</p>
+          <textarea id="runCmd" class="textarea code" placeholder="docker run -d -p 8080:80 --name myapp nginx:latest"></textarea>
+          <div class="row">
+            <input id="runName" class="input" placeholder="App name (optional)">
+            <button id="runCreateBtn" class="btn btn-primary">Create App</button>
+          </div>
+          <pre id="runOutput" class="output hidden"></pre>
+        </div>
+      </div>
+
+      <div id="subtab-compose" class="subtab-pane">
+        <div class="card">
+          <h3>Paste a compose file</h3>
+          <p class="muted">The compose file is stored in the app's own directory and always managed with <code>docker compose</code>.</p>
+          <textarea id="composeYaml" class="textarea code tall" placeholder="services:&#10;  app:&#10;    image: nginx&#10;    ports:&#10;      - '8080:80'"></textarea>
+          <div class="row">
+            <input id="composeName" class="input" placeholder="App name (optional)">
+            <button id="composeCreateBtn" class="btn btn-primary">Create App</button>
+          </div>
+          <pre id="composeOutput" class="output hidden"></pre>
+        </div>
+      </div>
+
+      <div id="subtab-git" class="subtab-pane">
+        <div class="card">
+          <h3>Clone from Git</h3>
+          <p class="muted">Any Git URL works. Repositories with a compose file or Dockerfile become apps; others are kept in Projects.</p>
+          <div class="row">
+            <input id="gitRepo" class="input flex" placeholder="https://github.com/user/repo.git">
+            <input id="gitName" class="input" placeholder="Project name (optional)">
+            <input id="gitBranch" class="input" placeholder="Branch (optional)">
+          </div>
+          <div class="row">
+            <button id="gitCloneBtn" class="btn btn-primary">Create App</button>
+            <button id="gitOpenBtn" class="btn hidden">Open project →</button>
+          </div>
+          <pre id="gitOutput" class="output hidden"></pre>
+        </div>
+      </div>
+
+      <div id="subtab-upload" class="subtab-pane">
+        <div class="card">
+          <h3>Upload local files</h3>
+          <p class="muted">Upload a folder or individual files. Uploads with a compose file or Dockerfile become apps; others are kept in Projects.</p>
+          <div class="row">
+            <input id="uploadName" class="input" placeholder="Project name">
+            <label class="file-label">Folder<input type="file" id="uploadFolder" webkitdirectory multiple></label>
+            <label class="file-label">Files<input type="file" id="uploadFiles" multiple></label>
+          </div>
+          <div class="row">
+            <button id="uploadBtn" class="btn btn-primary">Create App</button>
+            <button id="uploadOpenBtn" class="btn hidden">Open project →</button>
+          </div>
+          <pre id="uploadOutput" class="output hidden"></pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- Sources / Projects -->
+    <section id="tab-sources" class="tab-pane">
+      <div class="section-header">
+        <div>
+          <h2>Projects</h2>
+          <p class="muted">Browse files, edit them, and deploy compose or Dockerfile projects.</p>
+        </div>
+        <button id="sourcesRefresh" class="btn">Refresh</button>
+      </div>
+      <div class="card">
+        <div class="row breadcrumb-row">
+          <button id="sourcesUp" class="btn icon-btn" title="Up one level">↑</button>
+          <input id="sourcesPath" class="input flex" placeholder="Project folder (e.g. my-app)">
+          <button id="sourcesListBtn" class="btn">Open</button>
+        </div>
+        <div id="sourceBadges" class="badges"></div>
+        <div class="launch-form">
+          <div class="row">
+            <input id="sourceName" class="input" placeholder="App / container name">
+            <select id="sourceMode" class="input">
+              <option value="auto">Auto detect</option>
+              <option value="compose">docker compose</option>
+              <option value="build">Build Dockerfile</option>
+              <option value="run">docker run command</option>
+            </select>
+            <input id="sourcePorts" class="input" placeholder="Ports (e.g. 8080:80, 443:443)">
+            <input id="sourceVhost" class="input" placeholder="VIRTUAL_HOST (e.g. app.example.com)">
+            <input id="sourceVport" class="input" placeholder="VIRTUAL_PORT (e.g. 80)">
+            <button id="sourceDeployBtn" class="btn btn-primary">Deploy project</button>
+          </div>
+          <textarea id="sourceCommand" class="textarea code hidden" placeholder="docker run -d -p 8080:80 myimage:latest"></textarea>
+          <pre id="sourceOutput" class="output hidden"></pre>
+        </div>
+      </div>
+      <div class="split">
+        <div class="panel">
+          <h3>Files</h3>
+          <div id="sourcesFiles" class="filelist"></div>
+        </div>
+        <div class="panel">
+          <h3>Editor</h3>
+          <input id="editPath" class="input" placeholder="Select a file or type a relative path">
+          <textarea id="editContent" class="textarea code tall" placeholder="File contents…"></textarea>
+          <div class="row">
+            <button id="loadFileBtn" class="btn">Reload</button>
+            <button id="saveFileBtn" class="btn btn-primary">Save file</button>
+            <button id="newFileBtn" class="btn">New file</button>
+            <span id="editMsg" class="muted"></span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Apps -->
+    <section id="tab-apps" class="tab-pane">
+      <div class="section-header">
+        <div>
+          <h2>Apps</h2>
+          <p class="muted">All apps managed by compose from their own directory.</p>
+        </div>
+        <button id="appsRefresh" class="btn">Refresh</button>
+      </div>
+      <div id="appsList" class="list"></div>
+    </section>
+
+    <!-- Settings -->
+    <section id="tab-settings" class="tab-pane">
+      <div class="section-header">
+        <div>
+          <h2>Settings</h2>
+          <p class="muted">Dok Settings, core services, logs, backups, and application updates.</p>
+        </div>
+        <button id="settingsRefresh" class="btn">Refresh</button>
+      </div>
+
+      <div class="subtabs" id="settingsSubtabs">
+        <button class="subtab-btn active" data-settings-tab="core">Core Services</button>
+        <button class="subtab-btn" data-settings-tab="dok">Dok Settings</button>
+        <button class="subtab-btn" data-settings-tab="logs">Logs</button>
+        <button class="subtab-btn" data-settings-tab="backups">Backups &amp; Updates</button>
+      </div>
+
+      <div id="settings-pane-core" class="settings-pane active">
+        <div class="card">
+          <h3>Core services</h3>
+          <p class="muted">Core services are part of this WickedAFDok installation. They share the <code>wicked</code> network and can be started, stopped, and restarted together.</p>
+          <div class="row">
+            <button id="coreAllStart" class="btn">Start all</button>
+            <button id="coreAllStop" class="btn">Stop all</button>
+            <button id="coreAllRestart" class="btn">Restart all</button>
+            <span id="coreAllMsg" class="muted"></span>
+          </div>
+        </div>
+
+        <div class="card" id="coreNginxCard">
+          <h3>nginx-proxy <span class="muted">(core service)</span></h3>
+          <p class="muted">Only 1 nginx-proxy can be made from core services. Default network is "wicked".</p>
+          <div id="nginxCreateSection">
+            <div class="row">
+              <input id="nginxNetwork" class="input" placeholder="Network name" value="wicked">
+              <input id="nginxPort" class="input" placeholder="Default VIRTUAL_PORT" value="80">
+              <input id="nginxDomain" class="input" placeholder="WickedAFDok domain (optional)">
+            </div>
+            <div class="row">
+              <button id="editNginxCompose" class="btn">Edit compose</button>
+              <button id="runNginxProxyCore" class="btn btn-primary">Run nginx-proxy</button>
+              <span id="nginxMsg" class="muted"></span>
+            </div>
+          </div>
+          <div id="nginxManageSection" class="hidden">
+            <div class="row">
+              <span class="muted">nginx-proxy is running/managed from core services</span>
+              <button id="nginxStartBtn" class="btn">Start</button>
+              <button id="nginxStopBtn" class="btn">Stop</button>
+              <button id="nginxRestartBtn" class="btn">Restart</button>
+              <button id="editNginxComposeManage" class="btn">Edit compose</button>
+              <button id="viewNginxStatus" class="btn">View status</button>
+            </div>
+            <pre id="nginxStatusOut" class="output hidden"></pre>
+          </div>
+          <textarea id="nginxComposeEditor" class="textarea code tall hidden"></textarea>
+          <div class="row hidden" id="nginxEditorActions">
+            <button id="saveNginxCompose" class="btn btn-primary">Save compose</button>
+            <button id="cancelNginxCompose" class="btn">Cancel</button>
+          </div>
+        </div>
+
+        <div class="card" id="coreCloudflaredCard">
+          <h3>Cloudflare Tunnel <span class="muted">(cloudflared)</span></h3>
+          <p class="muted">Managed as a core service in core/cloudflared. Only 1 cloudflared container can be made from core services.</p>
+          <div id="cfCreateSection">
+            <div class="row">
+              <input id="cfToken" class="input flex" type="password" placeholder="Tunnel token (eyJ...)">
+            </div>
+            <div class="row">
+              <button id="editCfCompose" class="btn">Edit compose</button>
+              <button id="runCfCore" class="btn btn-primary">Run cloudflared</button>
+              <span id="cfMsg" class="muted"></span>
+            </div>
+          </div>
+          <div id="cfManageSection" class="hidden">
+            <div class="row">
+              <span class="muted">cloudflared status: —</span>
+              <button id="cfStartBtn" class="btn">Start</button>
+              <button id="cfStopBtn" class="btn">Stop</button>
+              <button id="cfRestartBtn" class="btn">Restart</button>
+              <button id="editCfComposeManage" class="btn">Edit compose</button>
+              <button id="viewCfStatus" class="btn">View status</button>
+            </div>
+            <pre id="cfStatusOut" class="output hidden"></pre>
+          </div>
+          <textarea id="cfComposeEditor" class="textarea code tall hidden"></textarea>
+          <div class="row hidden" id="cfEditorActions">
+            <button id="saveCfCompose" class="btn btn-primary">Save compose</button>
+            <button id="cancelCfCompose" class="btn">Cancel</button>
+          </div>
+        </div>
+
+        <div class="card" id="coreAuthCard">
+          <h3>Authentication <span class="muted">(Authentik)</span></h3>
+          <p class="muted">Optional single sign-on and user management. Authentik provides the login portal, users, groups, and application providers. Protect any app that supports forward auth or OIDC from the Authentik admin UI.</p>
+          <div id="authCreateSection">
+            <div class="row">
+              <input id="authEmail" class="input flex" type="email" placeholder="Admin email (optional)">
+              <input id="authPassword" class="input" type="password" placeholder="Admin password (generated if blank)">
+              <input id="authPort" class="input" type="number" min="1" max="65535" placeholder="HTTP port" value="9000">
+            </div>
+            <div class="row">
+              <input id="authDomain" class="input flex" placeholder="GUI domain, e.g. auth.example.com (optional)">
+            </div>
+            <div class="row">
+              <button id="authEditCompose" class="btn">Edit compose</button>
+              <button id="authRunBtn" class="btn btn-primary">Launch Authentik</button>
+              <span id="authMsg" class="muted"></span>
+            </div>
+          </div>
+          <div id="authManageSection" class="hidden">
+            <div class="row">
+              <span class="muted" id="authStatus">Authentik status: —</span>
+              <button id="authStartBtn" class="btn">Start</button>
+              <button id="authStopBtn" class="btn">Stop</button>
+              <button id="authRestartBtn" class="btn">Restart</button>
+              <button id="authEditComposeManage" class="btn">Edit compose</button>
+              <button id="authOpenBtn" class="btn">Open Authentik</button>
+            </div>
+            <div class="row">
+              <input id="authDomainManage" class="input flex" placeholder="GUI domain, e.g. auth.example.com">
+              <button id="authApplyDomain" class="btn">Apply domain</button>
+              <span id="authDomainMsg" class="muted"></span>
+            </div>
+          </div>
+          <textarea id="authComposeEditor" class="textarea code tall hidden"></textarea>
+          <div class="row hidden" id="authEditorActions">
+            <button id="authSaveCompose" class="btn btn-primary">Save compose</button>
+            <button id="authCancelCompose" class="btn">Cancel</button>
+          </div>
+        </div>
+
+        <div class="card" id="coreAutheliaCard">
+          <h3>Authentication <span class="muted">(Authelia)</span></h3>
+          <p class="muted">Forward auth for apps that set <code>ENABLE_AUTH=true</code> in their container environment. Authelia shows its login portal, then nginx passes the signed-in user to the app in <code>Remote-User</code>. Requires HTTPS: place certificates for the portal and protected domains in <code>core/nginx-proxy/certs/</code> as <code>&lt;domain&gt;.crt</code> and <code>&lt;domain&gt;.key</code>.</p>
+          <div id="autheliaCreateSection">
+            <div class="row">
+              <input id="autheliaDomain" class="input flex" placeholder="Portal domain, e.g. auth.example.com (required)">
+              <input id="autheliaPort" class="input" type="number" min="1" max="65535" placeholder="Port" value="9091">
+            </div>
+            <div class="row">
+              <input id="autheliaUser" class="input" placeholder="Admin username" value="admin">
+              <input id="autheliaPassword" class="input" type="password" placeholder="Admin password (generated if blank)">
+              <input id="autheliaEmail" class="input flex" type="email" placeholder="Admin email (optional)">
+            </div>
+            <div class="row">
+              <button id="autheliaEditCompose" class="btn">Edit compose</button>
+              <button id="autheliaRunBtn" class="btn btn-primary">Launch Authelia</button>
+              <span id="autheliaMsg" class="muted"></span>
+            </div>
+          </div>
+          <div id="autheliaManageSection" class="hidden">
+            <div class="row">
+              <span class="muted" id="autheliaStatus">Authelia status: —</span>
+              <button id="autheliaStartBtn" class="btn">Start</button>
+              <button id="autheliaStopBtn" class="btn">Stop</button>
+              <button id="autheliaRestartBtn" class="btn">Restart</button>
+              <button id="autheliaEditComposeManage" class="btn">Edit compose</button>
+              <button id="autheliaOpenBtn" class="btn">Open Authelia</button>
+            </div>
+            <div class="row">
+              <input id="autheliaDomainManage" class="input flex" placeholder="Portal domain, e.g. auth.example.com">
+              <button id="autheliaApplyDomain" class="btn">Apply domain</button>
+              <span id="autheliaDomainMsg" class="muted"></span>
+            </div>
+            <div class="row">
+              <span class="muted" id="autheliaProtected">Protected apps: —</span>
+              <button id="autheliaSyncBtn" class="btn">Sync protected apps</button>
+              <span id="autheliaSyncMsg" class="muted"></span>
+            </div>
+          </div>
+          <textarea id="autheliaComposeEditor" class="textarea code tall hidden"></textarea>
+          <div class="row hidden" id="autheliaEditorActions">
+            <button id="autheliaSaveCompose" class="btn btn-primary">Save compose</button>
+            <button id="autheliaCancelCompose" class="btn">Cancel</button>
+          </div>
+        </div>
+
+        <div class="card" id="coreDnsCard">
+          <h3>DNS <span class="muted">(Technitium DNS)</span></h3>
+          <p class="muted">Optional local DNS and ad blocking. Technitium provides a web console for zones, records, and blocklists.</p>
+          <div id="dnsCreateSection">
+            <div class="row">
+              <input id="dnsAdminPassword" class="input" type="password" placeholder="Admin password (generated if blank)">
+              <input id="dnsWebPort" class="input" type="number" min="1" max="65535" placeholder="Web port" value="5380">
+              <input id="dnsDnsPort" class="input" type="number" min="1" max="65535" placeholder="DNS port" value="53">
+            </div>
+            <div class="row">
+              <input id="dnsDomain" class="input flex" placeholder="GUI domain, e.g. dns.example.com (optional)">
+            </div>
+            <div class="row">
+              <button id="dnsEditCompose" class="btn">Edit compose</button>
+              <button id="dnsRunBtn" class="btn btn-primary">Launch Technitium</button>
+              <span id="dnsMsg" class="muted"></span>
+            </div>
+          </div>
+          <div id="dnsManageSection" class="hidden">
+            <div class="row">
+              <span class="muted" id="dnsStatus">Technitium status: —</span>
+              <button id="dnsStartBtn" class="btn">Start</button>
+              <button id="dnsStopBtn" class="btn">Stop</button>
+              <button id="dnsRestartBtn" class="btn">Restart</button>
+              <button id="dnsEditComposeManage" class="btn">Edit compose</button>
+              <button id="dnsOpenBtn" class="btn">Open Technitium</button>
+            </div>
+            <div class="row">
+              <input id="dnsDomainManage" class="input flex" placeholder="GUI domain, e.g. dns.example.com">
+              <button id="dnsApplyDomain" class="btn">Apply domain</button>
+              <span id="dnsDomainMsg" class="muted"></span>
+            </div>
+          </div>
+          <textarea id="dnsComposeEditor" class="textarea code tall hidden"></textarea>
+          <div class="row hidden" id="dnsEditorActions">
+            <button id="dnsSaveCompose" class="btn btn-primary">Save compose</button>
+            <button id="dnsCancelCompose" class="btn">Cancel</button>
+          </div>
+        </div>
+
+        <div class="card" id="coreOpencodeCard">
+          <div class="row" style="margin-top:0; justify-content:space-between">
+            <div>
+              <h3>OpenCode <span class="muted">(on demand)</span></h3>
+              <p class="muted">AI coding agent with full terminal access while a session is open. OpenCode is preconfigured and is never started by <em>Start all</em>.</p>
+            </div>
+            <span id="opencodeStatus" class="mode-pill">Checking…</span>
+          </div>
+          <div class="mode-grid">
+            <div class="mode-card mode-admin">
+              <div class="mode-card-head">
+                <strong>Admin mode</strong>
+                <span class="mode-pill danger">Full access</span>
+              </div>
+              <p class="muted">Maintenance, troubleshooting, Docker, and changes to WickedAFDok itself.</p>
+              <div class="row" style="margin-top:10px">
+                <button id="opencodeLaunchAdmin" class="btn btn-primary">Launch OpenCode</button>
+                <button id="opencodeShellAdmin" class="btn">Admin shell</button>
+              </div>
+            </div>
+            <div class="mode-card mode-user">
+              <div class="mode-card-head">
+                <strong>User mode</strong>
+                <span class="mode-pill">Apps only</span>
+              </div>
+              <p class="muted">Create apps and get basic troubleshooting help. OpenCode is restricted to the app workspace and safe commands; the raw shell still runs as the container user.</p>
+              <div class="row" style="margin-top:10px">
+                <button id="opencodeLaunchUser" class="btn btn-primary">Launch OpenCode</button>
+                <button id="opencodeShellUser" class="btn" title="Shell in /app/apps (not permission-restricted)">Apps shell</button>
+              </div>
+            </div>
+          </div>
+          <details class="opencode-settings">
+            <summary>Model and provider (optional)</summary>
+            <p class="muted">OpenCode can use its own provider login. Set a model and API key here to preconfigure Admin and User modes for one-click launches.</p>
+            <div class="row">
+              <input id="opencodeModel" class="input flex" placeholder="Model, e.g. anthropic/claude-sonnet-4-5">
+              <input id="opencodeProvider" class="input" placeholder="Provider, e.g. anthropic">
+              <input id="opencodeApiKey" class="input" type="password" placeholder="API key (leave blank to keep)">
+              <button id="opencodeSaveSettings" class="btn">Save</button>
+            </div>
+            <div class="row">
+              <label class="checkbox"><input type="checkbox" id="opencodeClearApiKey"> Clear stored API key</label>
+              <span id="opencodeSettingsMsg" class="muted"></span>
+            </div>
+          </details>
+          <div class="row" style="border-top:1px solid var(--border); padding-top:12px; justify-content:space-between">
+            <span id="opencodeSessions" class="muted">No OpenCode sessions running.</span>
+            <div class="inline">
+              <button id="opencodeStopBtn" class="btn btn-danger" disabled>Stop OpenCode</button>
+              <button id="opencodeTerminalBtn" class="btn">Open terminal</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" id="coreHostHelperCard">
+          <h3>Host Helper <span class="muted">(optional)</span></h3>
+          <p class="muted">Runs a small privileged companion container that lets WickedAFDok create host directories owned by the app user. This removes most "permission denied on mkdir" errors for bind mounts outside the app's runtime folders.</p>
+          <div id="helperCreateSection">
+            <div class="row">
+              <input id="helperImage" class="input flex" placeholder="Image (defaults to the WickedAFDok image)">
+              <button id="helperRunBtn" class="btn btn-primary">Launch Host Helper</button>
+              <span id="helperMsg" class="muted"></span>
+            </div>
+          </div>
+          <div id="helperManageSection" class="hidden">
+            <div class="row">
+              <span class="muted" id="helperStatus">Host Helper status: —</span>
+              <button id="helperStartBtn" class="btn">Start</button>
+              <button id="helperStopBtn" class="btn">Stop</button>
+              <button id="helperRestartBtn" class="btn">Restart</button>
+              <button id="helperEditCompose" class="btn">Edit compose</button>
+            </div>
+          </div>
+          <textarea id="helperComposeEditor" class="textarea code tall hidden"></textarea>
+          <div class="row hidden" id="helperEditorActions">
+            <button id="helperSaveCompose" class="btn btn-primary">Save compose</button>
+            <button id="helperCancelCompose" class="btn">Cancel</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="settings-pane-dok" class="settings-pane">
+        <div class="card">
+          <div class="row" style="margin-top:0; justify-content:space-between">
+            <div>
+              <h3 style="margin:0">Container Groups</h3>
+              <p class="muted">Group running containers for easier management.</p>
+            </div>
+            <button id="groupsRefresh" class="btn">Refresh</button>
+          </div>
+          <div class="row">
+            <input id="groupName" class="input" placeholder="Group name">
+            <select id="groupContainers" class="input flex" multiple size="6"></select>
+            <button id="saveGroup" class="btn btn-primary">Save Group</button>
+          </div>
+          <p class="muted">Hold Ctrl/Cmd to select multiple containers.</p>
+          <div id="groupsList" class="list"></div>
+        </div>
+
+        <div class="card">
+          <div class="row" style="margin-top:0; justify-content:space-between">
+            <div>
+              <h3 style="margin:0">Registry connections</h3>
+              <p class="muted">Store credentials for container registries and git hosts. Container pulls and HTTPS git operations automatically use the matching connection.</p>
+            </div>
+            <button id="registriesRefresh" class="btn">Refresh</button>
+          </div>
+
+          <div class="row">
+            <select id="registryKind" class="input">
+              <option value="registry">Container registry</option>
+              <option value="git">Git host</option>
+            </select>
+            <select id="registryProvider" class="input"></select>
+            <input id="registryName" class="input" placeholder="Display name">
+          </div>
+          <div class="row">
+            <input id="registryHost" class="input flex" placeholder="Host, e.g. ghcr.io">
+            <input id="registryUsername" class="input" placeholder="Username">
+            <input id="registrySecret" class="input" type="password" placeholder="Password or access token">
+          </div>
+          <div class="row">
+            <button id="saveRegistry" class="btn btn-primary">Save connection</button>
+            <button id="cancelRegistryEdit" class="btn hidden">Cancel</button>
+            <span id="registryMsg" class="muted"></span>
+          </div>
+          <p class="muted">Credentials are encrypted at rest in <code>data/registries.json</code>. For GitHub source updates, use <code>x-access-token</code> as the username and a token with repository contents read access. For GHCR, use your GitHub username and a token with <code>read:packages</code>.</p>
+          <div id="registriesList" class="list"></div>
+        </div>
+      </div>
+
+      <div id="settings-pane-logs" class="settings-pane">
+        <div class="card">
+          <div class="row" style="margin-top:0; justify-content:space-between">
+            <div>
+              <h3 style="margin:0">Server logs</h3>
+              <p class="muted">WickedAFDok activity and errors. Secrets are not written to this log.</p>
+            </div>
+            <div class="inline">
+              <label class="checkbox"><input type="checkbox" id="serverLogsAuto"> Auto refresh</label>
+              <button id="serverLogsRefresh" class="btn">Refresh</button>
+              <button id="serverLogsClear" class="btn btn-danger">Clear</button>
+            </div>
+          </div>
+          <pre id="serverLogsOutput" class="output logs-output">Loading…</pre>
+        </div>
+        <div class="card">
+          <h3>App and core service logs</h3>
+          <div class="row" style="margin-top:0">
+            <select id="appLogsSelect" class="input flex"></select>
+            <input id="appLogsTail" class="input" type="number" min="1" max="5000" value="300" placeholder="Lines">
+            <button id="appLogsRefresh" class="btn">Refresh</button>
+            <label class="checkbox"><input type="checkbox" id="appLogsAuto"> Auto refresh</label>
+          </div>
+          <pre id="appLogsOutput" class="output logs-output">Choose an app or core service, then refresh.</pre>
+        </div>
+      </div>
+
+      <div id="settings-pane-backups" class="settings-pane">
+        <div class="card">
+          <h3>Application updates</h3>
+          <p class="muted">Pull updates from a git repository. The application code directory must be writable by the server user.</p>
+          <div class="row">
+            <input id="updateRepo" class="input flex" placeholder="Git repo URL">
+            <input id="updateBranch" class="input" placeholder="Branch (optional)">
+            <button id="tempUpdateBtn" class="btn btn-primary">Update from Git</button>
+          </div>
+          <pre id="updateOutput" class="output hidden"></pre>
+        </div>
+        <div class="card">
+          <h3>Create a backup</h3>
+          <p class="muted">Backups are stored locally in <code>data/backups</code>. Back up the whole installation, a single app, or a custom mix of data, apps, core services, and sources.</p>
+          <div class="row">
+            <input id="backupName" class="input flex" placeholder="Backup name (optional)">
+            <select id="backupScope" class="input">
+              <option value="full">Full installation</option>
+              <option value="custom">Custom selection</option>
+              <option value="app">Single app</option>
+            </select>
+            <select id="backupApp" class="input hidden"></select>
+            <label class="checkbox hidden" id="backupLogsLabel"><input type="checkbox" id="backupIncludeLogs"> Include logs</label>
+            <button id="createBackupBtn" class="btn btn-primary">Create backup</button>
+          </div>
+          <div id="backupCustomOptions" class="hidden" style="margin-top:12px">
+            <div class="row" style="margin-top:0">
+              <label class="checkbox"><input type="checkbox" id="backupCompData" checked> Data &amp; settings</label>
+              <label class="checkbox"><input type="checkbox" id="backupCompApps" checked> Apps</label>
+              <label class="checkbox"><input type="checkbox" id="backupCompCore" checked> Core services</label>
+              <label class="checkbox"><input type="checkbox" id="backupCompSources" checked> Sources/projects</label>
+              <label class="checkbox"><input type="checkbox" id="backupCompLogs"> Logs</label>
+            </div>
+            <div class="row">
+              <div class="flex">
+                <div class="muted">Apps <span class="small">(none selected = all)</span></div>
+                <select id="backupAppsSelect" class="input backup-picker" multiple></select>
+              </div>
+              <div class="flex">
+                <div class="muted">Core services <span class="small">(none selected = all)</span></div>
+                <select id="backupCoreSelect" class="input backup-picker" multiple></select>
+              </div>
+            </div>
+          </div>
+          <pre id="backupMsg" class="output hidden"></pre>
+        </div>
+        <div class="card">
+          <div class="row" style="margin-top:0; justify-content:space-between">
+            <h3 style="margin:0">Local backups</h3>
+            <button id="backupRefresh" class="btn">Refresh</button>
+          </div>
+          <div id="backupsList" class="list"></div>
+        </div>
+        <div class="card">
+          <h3>Import / restore</h3>
+          <p class="muted">Upload a WickedAFDok backup archive. Restoring a full backup overwrites apps, core service files, sources, and settings. App and custom backups restore only the sections they contain.</p>
+          <div class="row">
+            <input id="importBackupName" class="input flex" placeholder="Imported backup name (optional)">
+            <label class="file-label">Archive<input type="file" id="importBackupFile" accept=".tar.gz,.tgz,application/gzip"></label>
+            <button id="importBackupBtn" class="btn btn-primary">Import backup</button>
+            <span id="importMsg" class="muted"></span>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="container footer-inner">
+      <span>WickedAFDok</span>
+      <span class="muted">Full Docker control · keep it behind a trusted network</span>
+    </div>
+  </footer>
+
+  <div id="logsModal" class="modal hidden">
+    <div class="modal-backdrop" data-close="logsModal"></div>
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="logsTitle">Logs</h3>
+        <div class="inline">
+          <label class="checkbox"><input type="checkbox" id="logsAuto"> Auto refresh</label>
+          <button id="logsRefreshBtn" class="btn">Refresh</button>
+          <button class="btn" data-close="logsModal">Close</button>
+        </div>
+      </div>
+      <pre id="logsOutput" class="output logs-output">Loading…</pre>
+    </div>
+  </div>
+
+  <div id="appConfigModal" class="modal hidden">
+    <div class="modal-backdrop" data-close="appConfigModal"></div>
+    <div class="modal-card app-config-modal-card">
+      <div class="modal-header">
+        <h3 id="appConfigTitle">Configure app</h3>
+        <button class="btn" data-close="appConfigModal">Close</button>
+      </div>
+      <div class="app-config app-config-wide">
+        <div id="appCreationNginxNoticeModal" class="card hidden" style="border-color: rgba(255,180,0,0.5); margin-bottom:12px">
+          <p class="muted">The core nginx service has not been created. Create it to automatically direct your domains to your containers.</p>
+          <div class="row"><button id="appCreationCreateNginxModal" class="btn btn-primary">Create core nginx-proxy</button></div>
+        </div>
+        <div class="row">
+          <input id="appCfgName" class="input" placeholder="App name">
+          <input id="appCfgNetwork" class="input" placeholder="Network" value="wicked" list="appNetworkList">
+          <button id="appCfgCreateNetwork" class="btn" type="button">Create network</button>
+          <datalist id="appNetworkList"></datalist>
+        </div>
+        <div id="appCfgNetworkNotice" class="card hidden" style="border-color: rgba(255,180,0,0.5); margin-bottom:12px">
+          <p class="muted">These networks do not exist on this server. Choose an existing network or create them before completing the app.</p>
+          <div id="appCfgNetworkRows"></div>
+        </div>
+        <div id="appCfgVolumeNotice" class="card hidden" style="border-color: rgba(255,180,0,0.5); margin-bottom:12px">
+          <p class="muted">These host paths do not exist. Choose a valid path or create the directories before completing the app. Directories are created by WickedAFDok with its container UID/GID; if creation is denied, run <code>sudo ./setup.sh</code> on the host, launch the optional Host Helper in Core Services, or choose an existing writable path.</p>
+          <div id="appCfgVolumeRows"></div>
+        </div>
+        <div class="compose-builder-layout">
+          <div class="compose-raw-pane">
+            <div class="compose-pane-header">
+              <div>
+                <strong>Compose file</strong>
+                <span id="appCfgComposeState" class="muted">(read-only preview)</span>
+              </div>
+              <div class="inline">
+                <button id="appCfgEditCompose" class="btn" type="button">Manually edit</button>
+                <button id="appCfgValidate" class="btn" type="button">Validate</button>
+              </div>
+            </div>
+            <textarea id="appCfgCompose" class="textarea code tall compose-raw-text" spellcheck="false" readonly></textarea>
+            <pre id="appCfgSummary" class="output hidden"></pre>
+          </div>
+          <div class="compose-fields-pane">
+            <div id="appCfgBuilderCard" class="card compose-builder-card">
+              <div class="row" style="margin-top:0; justify-content:space-between">
+                <div>
+                  <strong>Visual fields</strong>
+                  <span id="appCfgBuilderStatus" class="muted">Loading…</span>
+                </div>
+                <button id="appCfgAddService" class="btn" type="button">+ Add service</button>
+              </div>
+              <p class="muted">Fields follow the same order every time. Use Additional settings for anything not listed. Changes update the compose preview on the left.</p>
+              <div id="appCfgBuilder"></div>
+              <div id="appCfgBuilderIssues" class="builder-issues hidden"></div>
+            </div>
+          </div>
+        </div>
+        <div class="row app-config-footer">
+          <button id="appCfgComplete" class="btn btn-primary">Complete Creation</button>
+          <button id="appCfgCompleteRun" class="btn btn-primary">Complete Creation and Launch</button>
+          <span id="appCfgMsg" class="muted"></span>
+          <div id="appCfgProgress" class="app-progress hidden">
+            <div class="app-progress-track"><div id="appCfgProgressFill" class="app-progress-fill"></div></div>
+            <div class="app-progress-meta">
+              <span id="appCfgProgressText">Preparing…</span>
+              <span id="appCfgProgressPct">0%</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="composeEditWarningModal" class="modal hidden">
+    <div class="modal-backdrop" data-close="composeEditWarningModal"></div>
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>Edit compose file</h3>
+        <button class="btn" data-close="composeEditWarningModal">Close</button>
+      </div>
+      <div class="app-config">
+        <p class="muted">Editing the compose file manually can cause the app not to function correctly.</p>
+        <div class="row">
+          <button id="composeEditProceed" class="btn btn-primary">Proceed to edit</button>
+          <button class="btn" data-close="composeEditWarningModal">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="composeSaveConfirmModal" class="modal hidden">
+    <div class="modal-backdrop" data-close="composeSaveConfirmModal"></div>
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>Compose validation issues</h3>
+        <button class="btn" data-close="composeSaveConfirmModal">Close</button>
+      </div>
+      <div class="app-config">
+        <pre id="composeSaveIssues" class="output"></pre>
+        <p id="composeSavePrompt" class="muted">Some errors or incompatibilities were found. Do you still want to save?</p>
+        <div class="row">
+          <button id="composeSaveAnyway" class="btn btn-primary">Save anyway</button>
+          <button id="composeContinueEdit" class="btn" data-close="composeSaveConfirmModal">Continue editing</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="appOverwriteModal" class="modal hidden">
+    <div class="modal-backdrop" data-close="appOverwriteModal"></div>
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>Overwrite app</h3>
+        <button class="btn" data-close="appOverwriteModal">Close</button>
+      </div>
+      <div class="app-config">
+        <p class="muted">An app named <strong id="appOverwriteName"></strong> already exists. Overwriting replaces its compose file and app files. This cannot be undone.</p>
+        <div class="row">
+          <button id="appOverwriteConfirm" class="btn btn-danger">Overwrite app</button>
+          <button class="btn" data-close="appOverwriteModal">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="terminalModal" class="modal hidden">
+    <div class="modal-backdrop" data-close="terminalModal"></div>
+    <div class="modal-card terminal-modal-card">
+      <div class="modal-header terminal-modal-header">
+        <div>
+          <h3 id="terminalTitle">Terminal</h3>
+          <div class="inline terminal-meta">
+            <span id="terminalModeBadge" class="mode-pill">Admin</span>
+            <span id="terminalStatus" class="muted">Connecting…</span>
+          </div>
+        </div>
+        <div class="inline">
+          <select id="terminalModeSelect" class="input" title="Mode for the next session">
+            <option value="admin">Admin mode</option>
+            <option value="user">User mode</option>
+          </select>
+          <button id="terminalShellBtn" class="btn">Shell</button>
+          <button id="terminalOpencodeBtn" class="btn btn-primary">OpenCode</button>
+          <button id="terminalStopBtn" class="btn btn-danger">Stop</button>
+          <button class="btn" data-close="terminalModal">Close</button>
+        </div>
+      </div>
+      <div id="terminalContainer" class="terminal-container"></div>
+      <div class="terminal-footer">
+        <span class="muted">Admin mode has full container access. User mode restricts OpenCode to apps; shells always run as the container user.</span>
+        <span id="terminalSessionLabel" class="muted"></span>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/vendor/xterm/lib/xterm.js"></script>
+  <script src="/vendor/xterm-fit/lib/addon-fit.js"></script>
+  <script src="/js/app.js"></script>
+</body>
+</html>
