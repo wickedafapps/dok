@@ -28,22 +28,25 @@ Open `http://localhost:8080`. The UI has no built-in login — put it behind a r
 
 ## Highlights
 
-- Manage containers, images, apps, compose stacks, and core services from one UI.
+- Manage containers, images, apps, compose stacks, and core services from one UI. The Containers tab splits protected **Core Services** from workloads and has an **Apps interface** button.
+- Use **Quick Deploy** for one-click app redeploys (duplicate container names are renamed safely) or **Alter State** to edit an app's compose file and save it as the new base configuration.
+- Customize the installation from **Settings → Dok Settings → Designer**: logo, name, tagline, CSS override, and direct editing of nginx-proxy error pages and configuration files.
 - Open a browser terminal from the dashboard, or launch OpenCode in Admin or User mode without any setup. OpenCode starts on demand and stops when you close the terminal.
 - Give the Authentik and Technitium DNS web consoles their own domain; WickedAFDok writes the `VIRTUAL_HOST`/`VIRTUAL_PORT` reverse-proxy entries and can apply the change to an existing service.
-- Add Authelia forward auth to any app: set `ENABLE_AUTH=true` on the container and WickedAFDok generates the nginx protection for its `VIRTUAL_HOST`. Authelia runs alongside Authentik, not instead of it.
+- Add Authelia forward auth to any app: launch the auth service, pick containers from the window that opens, and WickedAFDok recreates them with `ENABLE_AUTH=true` or patches their compose file. Authelia runs alongside Authentik, not instead of it.
 - Create full, single-app, or custom backups. Custom backups can mix data, apps, core services, sources, and logs, and optionally include only selected apps or core services.
 - Store encrypted credentials for Docker Hub, GHCR, GitLab, Quay, and other registries in **Settings → Dok Settings**, and use them automatically for pulls and compose launches.
 - App creation shows a live progress bar and closes the configuration window when the app is created.
 
-## Dok Settings: groups and registry connections
+## Dok Settings: Designer, groups, and registry connections
 
 **Settings → Dok Settings** holds the app's own management options:
 
-- **Container Groups** groups running containers for easier management. Groups are stored in `data/groups.json`.
+- **Designer** changes the logo, name, tagline, and CSS override, and opens the nginx-proxy files under `core/nginx-proxy` for editing error pages and vhost snippets. Uploaded logos are stored in `data/designer/`; private key files are not exposed.
+- **Container Groups** groups running containers for easier management. Groups are stored in `data/groups.json`. The **Core Services** group is built in and computed from the running core containers, so it cannot be edited or deleted.
 - **Registry connections** stores credentials for container registries and git hosts. Presets cover Docker Hub, GitHub Container Registry (`ghcr.io`), GitLab Container Registry, Quay.io, GitHub, GitLab, Gitea/Forgejo, and custom hosts.
 
-Secrets are encrypted at rest in `data/registries.json` with a key in `data/.credentials-key`. Keep that file with your data backups; without it, stored secrets cannot be decrypted and must be re-entered. The API never returns stored secrets.
+Secrets are encrypted at rest in `data/registries.json` and `data/settings.json` with a key in `data/.credentials-key`. Keep that file with your data backups; without it, stored secrets cannot be decrypted and must be re-entered. The API returns only whether a secret is set, never the secret itself. A blank secret field keeps the existing value; use `clearSecrets` when you want to remove one.
 
 WickedAFDok applies credentials automatically:
 
@@ -95,7 +98,7 @@ Settings → Core Services has an **Authentication (Authelia)** card next to Aut
 1. Put TLS certificates in `core/nginx-proxy/certs/`: one `<domain>.crt`/`<domain>.key` pair for the Authelia portal and one for each protected host. Authelia only works over HTTPS (it rejects insecure redirects and marks its session cookies Secure), and nginx-proxy will not answer TLS for a host without a matching certificate.
 2. Launch nginx-proxy from Core Services (ports 80 and 443), if it is not already running.
 3. Launch Authelia with a portal domain such as `auth.example.com` and an admin user. Leave the password blank to generate one; the generated password is shown once in the result message.
-4. Start or redeploy the app with `ENABLE_AUTH=true`, a `VIRTUAL_HOST`, and `VIRTUAL_PORT` if the app does not listen on port 80. Add them as environment variables in the app's compose file.
+4. Launch Authelia and choose containers in the picker window that opens. WickedAFDok recreates the selected containers with `ENABLE_AUTH=true`; compose-managed apps are patched in their own compose file. You can also add `ENABLE_AUTH=true`, a `VIRTUAL_HOST`, and `VIRTUAL_PORT` (if the app does not listen on port 80) manually in the app's compose file. Authentik is an SSO portal for apps that support it; the `ENABLE_AUTH` forward-auth vhosts are generated by Authelia.
 5. WickedAFDok notices the app within a minute and writes the nginx config. Use **Sync protected apps** on the Authelia card to apply it immediately.
 
 Unauthenticated requests to a protected host are redirected to the Authelia portal and returned to the app after sign-in. Authenticated requests are proxied with `Remote-User`, `Remote-Groups`, `Remote-Name`, and `Remote-Email` headers, so apps that support header auth can trust the signed-in user. Removing `ENABLE_AUTH` or stopping the app removes its protection on the next sync.

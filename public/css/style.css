@@ -63,6 +63,9 @@ header { padding: 26px 0 16px; }
 }
 
 .brand-mark svg { width: 26px; height: 26px; }
+.brand-logo { width: 100%; height: 100%; object-fit: contain; border-radius: 11px; }
+.designer-modal-card { width: min(1100px, 96vw); max-height: 92vh; overflow-y: auto; }
+.designer-logo-preview { max-height: 46px; max-width: 140px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg-soft); padding: 4px; }
 
 header h1 {
   margin: 0;
@@ -502,6 +505,19 @@ select.input { cursor: pointer; }
 .output.hidden, .hidden { display: none !important; }
 
 .list { display: grid; gap: 10px; }
+
+.section-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 14px 0 0;
+  padding: 0 2px 6px;
+  border-bottom: 1px solid var(--border);
+}
+.section-heading:first-child { margin-top: 0; }
+.section-heading h3 { margin: 0; font-size: 14px; letter-spacing: 0.02em; text-transform: uppercase; }
+.section-heading .muted { font-size: 12px; }
 
 .item {
   background: var(--card);

@@ -25,10 +25,13 @@ const backupsDir = path.join(dataDir, 'backups');
 const logsDir = path.join(dataDir, 'logs');
 const tmpDir = path.join(dataDir, 'tmp');
 const opencodeDir = path.join(dataDir, 'opencode');
+const designerDir = path.join(dataDir, 'designer');
 
-for (const dir of [dataDir, sourcesDir, uploadsDir, appsDir, coreDir, backupsDir, logsDir, tmpDir, opencodeDir]) {
+for (const dir of [dataDir, sourcesDir, uploadsDir, appsDir, coreDir, backupsDir, logsDir, tmpDir, opencodeDir, designerDir]) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
+
+const upload = multer({ dest: uploadsDir, limits: { fileSize: 200 * 1024 * 1024, files: 200 } });
 
 // ---------- logging ----------
 const serverLogPath = path.join(logsDir, 'server.log');
@@ -190,7 +193,8 @@ function readSettings() {
           opencode: { model: '', provider: '', apiKey: '' }
         },
         backups: { includeLogs: false },
-        logs: { tail: 500 }
+        logs: { tail: 500 },
+        designer: { name: 'WickedAFDok', tagline: 'Server & Docker control room', css: '', logo: '' }
       };
       fs.writeFileSync(settingsPath, JSON.stringify(defaults, null, 2), { mode: 0o600 });
       return defaults;
@@ -217,7 +221,12 @@ function readSettings() {
     cur.services.opencode = { model: '', provider: '', apiKey: '', ...(cur.services.opencode || {}) };
     cur.backups = { includeLogs: false, ...(cur.backups || {}) };
     cur.logs = { tail: 500, ...(cur.logs || {}) };
-    return cur;
+    cur.designer = {
+      name: 'WickedAFDok', tagline: 'Server & Docker control room', css: '', logo: '',
+      ...(cur.designer || {})
+    };
+    delete cur.clearSecrets;
+    return decryptSettingsSecrets(cur);
   } catch {
     return {
       services: {
@@ -230,12 +239,106 @@ function readSettings() {
         opencode: { model: '', provider: '', apiKey: '' }
       },
       backups: { includeLogs: false },
-      logs: { tail: 500 }
+      logs: { tail: 500 },
+      designer: { name: 'WickedAFDok', tagline: 'Server & Docker control room', css: '', logo: '' }
     };
   }
 }
+
+// Secret settings stay encrypted at rest with the same AES-256-GCM key used
+// for registry connections. readSettings() decrypts for internal use and
+// writeSettings() encrypts again, so callers keep working with plaintext.
+const SETTINGS_SECRET_PATHS = [
+  ['services', 'cloudflared', 'token'],
+  ['services', 'authentik', 'adminPassword'],
+  ['services', 'authentik', 'secretKey'],
+  ['services', 'authentik', 'postgresPassword'],
+  ['services', 'authelia', 'adminPassword'],
+  ['services', 'authelia', 'adminPasswordHash'],
+  ['services', 'authelia', 'sessionSecret'],
+  ['services', 'authelia', 'encryptionKey'],
+  ['services', 'authelia', 'jwtSecret'],
+  ['services', 'technitium', 'adminPassword'],
+  ['services', 'opencode', 'apiKey']
+];
+
+function isStoredSecret(value) {
+  if (typeof value !== 'string') return false;
+  const parts = value.split(':');
+  return parts.length === 4 && parts[0] === 'v1' &&
+    parts.slice(1).every(part => /^[A-Za-z0-9+/=]+$/.test(part));
+}
+
+function mapSettingsSecrets(settings, transform) {
+  if (!settings || typeof settings !== 'object') return settings;
+  for (const parts of SETTINGS_SECRET_PATHS) {
+    let target = settings;
+    for (const part of parts.slice(0, -1)) {
+      if (!target || typeof target !== 'object') { target = null; break; }
+      target = target[part];
+    }
+    const key = parts[parts.length - 1];
+    if (!target || typeof target !== 'object' || !(key in target)) continue;
+    const value = target[key];
+    if (!value) continue;
+    try { target[key] = transform(String(value)); } catch {}
+  }
+  return settings;
+}
+
+function encryptSettingsSecrets(settings) {
+  const clone = JSON.parse(JSON.stringify(settings || {}));
+  return mapSettingsSecrets(clone, value => isStoredSecret(value) ? value : encryptSecret(value));
+}
+
+function decryptSettingsSecrets(settings) {
+  return mapSettingsSecrets(settings, value => {
+    if (!isStoredSecret(value)) return value;
+    try { return decryptSecret(value); } catch { return ''; }
+  });
+}
+
+function redactSettingsSecrets(settings) {
+  const clone = JSON.parse(JSON.stringify(settings || {}));
+  for (const parts of SETTINGS_SECRET_PATHS) {
+    let target = clone;
+    for (const part of parts.slice(0, -1)) {
+      if (!target || typeof target !== 'object') { target = null; break; }
+      target = target[part];
+    }
+    const key = parts[parts.length - 1];
+    if (!target || typeof target !== 'object') continue;
+    const hadValue = !!target[key];
+    target[key] = '';
+    target[`${key}Set`] = hadValue;
+  }
+  return clone;
+}
+
+function preserveEmptySettingsSecrets(next, current, clearSecrets = []) {
+  const clear = new Set(Array.isArray(clearSecrets) ? clearSecrets.map(String) : []);
+  for (const parts of SETTINGS_SECRET_PATHS) {
+    const dot = parts.join('.');
+    let nextTarget = next;
+    let currentTarget = current;
+    for (const part of parts.slice(0, -1)) {
+      nextTarget = nextTarget?.[part];
+      currentTarget = currentTarget?.[part];
+    }
+    const key = parts[parts.length - 1];
+    if (!nextTarget || typeof nextTarget !== 'object') continue;
+    if (clear.has(dot) || clear.has(key)) continue;
+    if (!nextTarget[key] && currentTarget?.[key]) nextTarget[key] = currentTarget[key];
+  }
+  return next;
+}
+
+function redactServiceSecrets(service, value) {
+  return redactSettingsSecrets({ services: { [service]: value || {} } }).services[service];
+}
+
 function writeSettings(s) {
-  fs.writeFileSync(settingsPath, JSON.stringify(s, null, 2), { mode: 0o600 });
+  fs.writeFileSync(settingsPath, JSON.stringify(encryptSettingsSecrets(s), null, 2), { mode: 0o600 });
   try { fs.chmodSync(settingsPath, 0o600); } catch {}
 }
 
@@ -4081,6 +4184,45 @@ function prepareHostBindDirs(base, entries = []) {
   }
 }
 
+// Core-service containers are part of the WickedAFDok installation rather than
+// user workloads. They are grouped automatically and protected from deletion
+// unless the user explicitly confirms the container name.
+const CORE_COMPOSE_PROJECTS = new Set([
+  'nginx-proxy',
+  'cloudflared',
+  'authentik',
+  'authelia',
+  'technitium',
+  'wickedafdok-host-helper'
+]);
+
+const CORE_CONTAINER_NAMES = [
+  'nginx-proxy',
+  'cloudflared',
+  'authelia',
+  'technitium-dns',
+  'wickedafdok-host-helper',
+  'wickedafdok-updater',
+  'authentik-server',
+  'authentik-worker',
+  'authentik-postgresql',
+  'authentik-redis'
+];
+
+function coreContainerInfo(container) {
+  const name = String(container?.name || (container?.Names || [])[0] || '').replace(/^\//, '');
+  const labels = container?.Labels || {};
+  const project = labels['com.docker.compose.project'] || '';
+  const selfName = /^wickedafdok(-|$)/.test(name) && !/updater|helper/.test(name);
+  if (selfName || project === 'wickedafdok') {
+    return { core: false, protected: true, self: true, role: 'WickedAFDok' };
+  }
+  if (CORE_COMPOSE_PROJECTS.has(project) || CORE_CONTAINER_NAMES.includes(name)) {
+    return { core: true, protected: true, self: false, role: project || 'Core service' };
+  }
+  return { core: false, protected: false, self: false, role: '' };
+}
+
 async function coreServiceStatus(project, { nameHint = '', primaryHint = '' } = {}) {
   let running = false;
   let exists = false;
@@ -4548,7 +4690,56 @@ function appDirFor(entry) {
   return path.join(appsDir, name);
 }
 
-async function composeAction(entry, action) {
+function composeContainerNames(compose) {
+  const names = {};
+  let service = '';
+  for (const line of String(compose || '').split('\n')) {
+    const header = line.match(/^  ([A-Za-z0-9_.-]+):\s*$/);
+    if (header) { service = header[1]; continue; }
+    const value = line.match(/^\s+container_name:\s*['"]?([^'"#\s]+)/);
+    if (value && service) names[service] = value[1];
+  }
+  return names;
+}
+
+// Compose refuses to start when a container_name already belongs to another
+// container. Rename the stale container instead of deleting it, which keeps
+// its data and makes Quick Deploy succeed on the first try.
+async function resolveProjectNameConflicts(project, compose) {
+  const desired = composeContainerNames(compose);
+  if (!Object.keys(desired).length) return [];
+  let containers = [];
+  try { containers = await docker.listContainers({ all: true }); } catch { return []; }
+  const renamed = [];
+  for (const [service, containerName] of Object.entries(desired)) {
+    const existing = containers.find(c => (c.Names || []).some(n => n.replace(/^\//, '') === containerName));
+    if (!existing) continue;
+    const labels = existing.Labels || {};
+    if (labels['com.docker.compose.project'] === project) continue;
+    const protection = coreContainerInfo({ name: containerName, Labels: labels });
+    if (protection.protected) {
+      throw httpError(409,
+        `"${containerName}" belongs to a protected core service and cannot be reused by ${project}. ` +
+        'Change container_name in the compose file or remove the conflicting service first.');
+    }
+    const shortId = existing.Id.slice(0, 8);
+    let nextName = `${containerName}-previous-${shortId}`;
+    let suffix = 1;
+    while (containers.some(c => (c.Names || []).some(n => n.replace(/^\//, '') === nextName))) {
+      nextName = `${containerName}-previous-${shortId}-${suffix++}`;
+    }
+    try {
+      await docker.getContainer(existing.Id).rename({ name: nextName });
+      renamed.push({ service, from: containerName, to: nextName });
+      appendServerLog('INFO', `Quick Deploy renamed conflicting container ${containerName} to ${nextName}`);
+    } catch (e) {
+      throw httpError(409, `Unable to resolve the container name conflict for "${containerName}": ${e.message}`);
+    }
+  }
+  return renamed;
+}
+
+async function composeAction(entry, action, { allowStartupGrace = false } = {}) {
   const name = projectName(entry?.name, 'app');
   let appDir = appDirFor(entry);
   if (isSymlink(appDir)) throw httpError(400, 'Invalid app directory');
@@ -4562,14 +4753,39 @@ async function composeAction(entry, action) {
   }
   if (!composeFile) throw new Error('This app has no compose file in its app directory');
 
+  let renamed = [];
+  if (action === 'up' || action === 'start') {
+    renamed = await resolveProjectNameConflicts(name, fs.readFileSync(composeFile, 'utf-8'));
+  }
+
   const args = ['compose', '-f', composeFile, '-p', name];
   const overridePath = path.join(appDir, 'docker-compose.wickedafdok.yml');
   if (fs.existsSync(overridePath)) args.push('-f', overridePath);
   if (action === 'up' || action === 'start') args.push('up', '-d', '--remove-orphans');
   else args.push(action);
 
-  const { stdout, stderr } = await run('docker', args, { cwd: appDir });
-  return { stdout, stderr, appDir, composeFile };
+  try {
+    const { stdout, stderr } = await run('docker', args, { cwd: appDir });
+    return { stdout, stderr, appDir, composeFile, renamed };
+  } catch (e) {
+    if (allowStartupGrace) {
+      // A build or a slow first start can fail the compose command while the
+      // project containers are already being created. Treat that as "still
+      // starting" instead of reporting a hard failure to the user.
+      const containers = await docker.listContainers({ all: true }).catch(() => []);
+      const projectContainers = containers.filter(c =>
+        c.Labels?.['com.docker.compose.project'] === name &&
+        ['created', 'running', 'restarting'].includes(c.State));
+      if (projectContainers.length) {
+        return {
+          stdout: e.stdout || '', stderr: e.stderr || e.message || '',
+          appDir, composeFile, renamed, pending: true,
+          message: `${entry?.name || name} is still starting.`
+        };
+      }
+    }
+    throw e;
+  }
 }
 
 // ---------- system ----------
@@ -4659,17 +4875,24 @@ app.get('/api/system/stats', async (req, res) => {
 app.get('/api/containers', async (req, res) => {
   try {
     const containers = await docker.listContainers({ all: true });
-    res.json(containers.map(c => ({
-      id: c.Id,
-      shortId: c.Id.substring(0, 12),
-      name: (c.Names && c.Names[0]) ? c.Names[0].replace(/^\//, '') : '',
-      image: c.Image,
-      state: c.State,
-      status: c.Status,
-      ports: c.Ports || [],
-      created: c.Created,
-      running: c.State === 'running'
-    })));
+    res.json(containers.map(c => {
+      const name = (c.Names && c.Names[0]) ? c.Names[0].replace(/^\//, '') : '';
+      const protection = coreContainerInfo({ name, Labels: c.Labels || {} });
+      return {
+        id: c.Id,
+        shortId: c.Id.substring(0, 12),
+        name,
+        image: c.Image,
+        state: c.State,
+        status: c.Status,
+        ports: c.Ports || [],
+        created: c.Created,
+        running: c.State === 'running',
+        project: c.Labels?.['com.docker.compose.project'] || '',
+        service: c.Labels?.['com.docker.compose.service'] || '',
+        ...protection
+      };
+    }));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -4787,6 +5010,22 @@ app.post('/api/containers/:id/save-to-registry', async (req, res) => {
 app.delete('/api/containers/:id', async (req, res) => {
   try {
     const cont = docker.getContainer(req.params.id);
+    const info = await cont.inspect();
+    const name = String(info.Name || '').replace(/^\//, '');
+    const protection = coreContainerInfo({ name, Labels: info.Config?.Labels || {} });
+    if (protection.protected) {
+      const confirmName = String(req.body?.confirmName || req.query?.confirmName || '').trim();
+      if (confirmName !== name) {
+        return res.status(403).json({
+          error: protection.core
+            ? `"${name}" is a protected core service. Type the container name to confirm removal.`
+            : `"${name}" is protected. Type the container name to confirm removal.`,
+          protected: true,
+          core: protection.core,
+          name
+        });
+      }
+    }
     await cont.remove({ force: true });
     res.json({ ok: true });
   } catch (e) {
@@ -5074,8 +5313,6 @@ app.post('/api/launch/git', async (req, res) => {
     res.status(e.status || 500).json({ error: e.message, stdout: e.stdout, stderr: e.stderr });
   }
 });
-
-const upload = multer({ dest: uploadsDir, limits: { fileSize: 200 * 1024 * 1024, files: 200 } });
 
 app.post('/api/launch/upload', upload.array('files', 200), async (req, res) => {
   const movedFiles = [];
@@ -5664,6 +5901,7 @@ app.post('/api/launch/finalize', async (req, res) => {
 
     let result = { stdout: 'Created (not launched)', stderr: '' };
     let launchError = '';
+    let launchPending = false;
     if (launchNow !== false) {
       const args = ['compose', '-f', composePath, '-p', name];
       if (fs.existsSync(overridePath)) args.push('-f', overridePath);
@@ -5671,14 +5909,28 @@ app.post('/api/launch/finalize', async (req, res) => {
       try {
         result = await run('docker', args, { cwd: targetDir });
       } catch (e) {
-        launchError = e.message;
-        result = { stdout: e.stdout || '', stderr: e.stderr || '' };
+        // A first start often reports failure while the project containers are
+        // still being created (image build, dependency startup). If they exist,
+        // report a pending launch so the UI does not call it a failure.
+        const containers = await docker.listContainers({ all: true }).catch(() => []);
+        const projectContainers = containers.filter(c =>
+          c.Labels?.['com.docker.compose.project'] === name &&
+          ['created', 'running', 'restarting'].includes(c.State));
+        if (projectContainers.length) {
+          launchPending = true;
+          result = { stdout: e.stdout || '', stderr: e.stderr || '' };
+        } else {
+          launchError = e.message;
+          result = { stdout: e.stdout || '', stderr: e.stderr || '' };
+        }
       }
     }
 
     res.json({
       ok: true, appDir: targetDir, appName: name, ...result,
-      issues: [...new Set([...validationIssues, ...combinedIssues])], launchError
+      issues: [...new Set([...validationIssues, ...combinedIssues])], launchError,
+      launchPending,
+      message: launchPending ? `${name} is still starting.` : ''
     });
   } catch (e) {
     res.status(e.status || 500).json({
@@ -5755,7 +6007,7 @@ async function registryAction(req, res, action) {
   try {
     const entry = readRegistry().find(r => r.id === req.params.id);
     if (!entry) return res.status(404).json({ error: 'App not found' });
-    const result = await composeAction(entry, action);
+    const result = await composeAction(entry, action, { allowStartupGrace: action === 'up' });
     try { await syncAuthVhosts(); } catch {}
     res.json({ ok: true, ...result });
   } catch (e) {
@@ -5765,6 +6017,96 @@ async function registryAction(req, res, action) {
 
 app.post('/api/registry/:id/deploy', (req, res) => registryAction(req, res, 'up'));
 app.post('/api/registry/:id/:action(start|stop|restart)', (req, res) => registryAction(req, res, req.params.action));
+
+function appEntryForRequest(req) {
+  const entry = readRegistry().find(r => r.id === req.params.id);
+  if (!entry) throw httpError(404, 'App not found');
+  return entry;
+}
+
+// Shared by Alter State (compose editor). The saved compose becomes the app's
+// new base configuration, so subsequent Quick Deploys use exactly what the
+// user sees. The generated override is removed to avoid stale volume, network,
+// or environment values winning over the edited base file.
+function normalizeEditedAppCompose(entry, compose) {
+  let next = String(compose || '');
+  if (!/^networks\s*:/m.test(next) && !/\bnetwork_mode\s*:/.test(next)) {
+    next = next.replace(/\s*$/, '') +
+      '\n\nnetworks:\n  default:\n    name: wicked\n    external: true\n';
+  }
+  const vhost = String(entry?.launch?.vhost || '').trim();
+  if (vhost) {
+    const services = serviceNamesFromCompose(next);
+    const preferred = String(entry?.launch?.name || '').trim();
+    const service = services.includes(preferred) ? preferred : services[0];
+    if (service) {
+      const vhostPort = String(entry?.launch?.vhostPort || '').trim();
+      next = setComposeServiceEnv(next, service, {
+        VIRTUAL_HOST: vhost,
+        ...(vhostPort ? { VIRTUAL_PORT: vhostPort } : {})
+      });
+    }
+  }
+  return next;
+}
+
+app.get('/api/apps/:id/compose', (req, res) => {
+  try {
+    const entry = appEntryForRequest(req);
+    const appDir = appDirFor(entry);
+    const composeFile = findComposeFile(appDir);
+    if (!composeFile) return res.status(404).json({ error: 'This app has no compose file' });
+    res.json({
+      entry,
+      appDir,
+      composeFile,
+      compose: fs.readFileSync(composeFile, 'utf-8')
+    });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+app.post('/api/apps/:id/compose', async (req, res) => {
+  try {
+    const entry = appEntryForRequest(req);
+    const appDir = appDirFor(entry);
+    if (isSymlink(appDir)) throw httpError(400, 'Invalid app directory');
+    if (!isInsideApps(appDir)) throw httpError(400, 'Invalid app directory');
+    ensureWritableDirectory(appDir, { label: 'app directory' });
+    const deploy = req.body?.deploy === true;
+    const force = req.body?.force === true;
+    const compose = normalizeEditedAppCompose(entry, req.body?.compose || '');
+    if (!compose.trim()) return res.status(400).json({ error: 'Compose file is empty' });
+    const validation = await validateCompose(compose, { projectDir: appDir });
+    if (!validation.ok && !force) {
+      return res.status(400).json({
+        error: 'Compose validation failed. Fix the issues or choose to save anyway.',
+        issues: validation.issues || []
+      });
+    }
+    const composePath = findComposeFile(appDir) || path.join(appDir, 'docker-compose.yml');
+    writePrivateFile(composePath, compose);
+    try { fs.unlinkSync(path.join(appDir, 'docker-compose.wickedafdok.yml')); } catch {}
+    let result = { stdout: 'Base configuration saved', stderr: '', renamed: [] };
+    if (deploy) {
+      result = await composeAction(entry, 'up', { allowStartupGrace: true });
+      try { await syncAuthVhosts(); } catch {}
+    }
+    res.json({
+      ok: true,
+      deploy,
+      composePath,
+      issues: validation.issues || [],
+      ...result,
+      message: result.pending
+        ? (result.message || 'Changes saved; the app is still starting.')
+        : deploy ? 'Changes saved and deployed.' : 'Base configuration saved.'
+    });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message, stdout: e.stdout, stderr: e.stderr });
+  }
+});
 
 app.delete('/api/registry/:id', (req, res) => {
   try {
@@ -5776,7 +6118,7 @@ app.delete('/api/registry/:id', (req, res) => {
 });
 
 app.get('/api/settings', (req, res) => {
-  res.json(readSettings());
+  res.json(redactSettingsSecrets(readSettings()));
 });
 
 app.post('/api/compose/validate', async (req, res) => {
@@ -5831,6 +6173,8 @@ app.post('/api/settings', (req, res) => {
     if (!next.services) next.services = {};
     if (!next.services.nginxProxy) next.services.nginxProxy = {};
     if (!next.services.nginxProxy.network) next.services.nginxProxy.network = 'wicked';
+    preserveEmptySettingsSecrets(next, current, body.clearSecrets);
+    delete next.clearSecrets;
     const ng = next.services.nginxProxy;
     if (ng.domain !== undefined) {
       ng.domain = normalizeDomain(ng.domain);
@@ -5846,16 +6190,214 @@ app.post('/api/settings', (req, res) => {
       ng.defaultVhostPort = vp;
     }
     writeSettings(next);
-    res.json(next);
+    res.json(redactSettingsSecrets(next));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-app.get('/api/groups', (req, res) => {
-  const data = readJson(groupsPath, { groups: [] });
-  if (!Array.isArray(data.groups)) data.groups = [];
-  res.json(data);
+const BUILTIN_CORE_GROUP = { id: 'core-services', name: 'Core Services' };
+
+// ---------- designer ----------
+function designerLogoPath() {
+  const logo = String(readSettings().designer?.logo || '').trim();
+  if (!logo) return '';
+  const target = path.resolve(designerDir, logo);
+  if (!target.startsWith(designerDir + path.sep)) return '';
+  return fs.existsSync(target) ? target : '';
+}
+
+function designerFilesRoot() {
+  const rootDir = path.join(coreDir, 'nginx-proxy');
+  fs.mkdirSync(rootDir, { recursive: true });
+  return rootDir;
+}
+
+function designerFilePath(relPath, { forWrite = false } = {}) {
+  const base = fs.realpathSync(designerFilesRoot());
+  const target = path.resolve(base, '.' + path.sep + String(relPath || '').replace(/^[/\\]+/, ''));
+  if (target !== base && !target.startsWith(base + path.sep)) throw httpError(400, 'Invalid designer path');
+  // Check the real path of the file (or its parent for new files) so a symlink
+  // inside core/nginx-proxy cannot be used to read or write outside it.
+  const probe = fs.existsSync(target) ? target : path.dirname(target);
+  let real = probe;
+  try { real = fs.realpathSync(probe); } catch {}
+  if (real !== base && !real.startsWith(base + path.sep)) throw httpError(400, 'Invalid designer path');
+  if (!forWrite && !fs.existsSync(target)) throw httpError(404, 'File not found');
+  return target;
+}
+
+app.get('/api/designer', (req, res) => {
+  const settings = readSettings();
+  const logo = designerLogoPath();
+  res.json({
+    ...(settings.designer || {}),
+    logo: '',
+    hasLogo: !!logo,
+    logoUrl: logo ? `/api/designer/logo?v=${fs.statSync(logo).mtimeMs}` : ''
+  });
+});
+
+app.post('/api/designer', (req, res) => {
+  try {
+    const body = req.body || {};
+    const settings = readSettings();
+    const current = { ...(settings.designer || {}) };
+    if (body.name !== undefined) {
+      const name = String(body.name || '').trim().slice(0, 60);
+      current.name = name || 'WickedAFDok';
+    }
+    if (body.tagline !== undefined) current.tagline = String(body.tagline || '').trim().slice(0, 140);
+    if (body.css !== undefined) {
+      const css = String(body.css || '');
+      if (css.length > 200 * 1024) return res.status(400).json({ error: 'CSS override is limited to 200 KB' });
+      current.css = css;
+    }
+    if (body.removeLogo === true) {
+      const logo = designerLogoPath();
+      if (logo) { try { fs.unlinkSync(logo); } catch {} }
+      current.logo = '';
+    }
+    settings.designer = current;
+    writeSettings(settings);
+    res.json({
+      ok: true,
+      designer: { ...current, logo: '', hasLogo: !!designerLogoPath(), logoUrl: designerLogoPath() ? '/api/designer/logo' : '' }
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/designer/logo', upload.single('logo'), (req, res) => {
+  const file = req.file;
+  if (!file) return res.status(400).json({ error: 'Choose an image file' });
+  try {
+    const allowed = { 'image/png': '.png', 'image/jpeg': '.jpg', 'image/webp': '.webp', 'image/svg+xml': '.svg', 'image/x-icon': '.ico', 'image/vnd.microsoft.icon': '.ico' };
+    let ext = allowed[file.mimetype] || path.extname(file.originalname || '').toLowerCase();
+    if (!['.png', '.jpg', '.jpeg', '.webp', '.svg', '.ico'].includes(ext)) {
+      try { fs.unlinkSync(file.path); } catch {}
+      return res.status(400).json({ error: 'Logo must be a PNG, JPG, WebP, SVG, or ICO image' });
+    }
+    if (ext === '.jpeg') ext = '.jpg';
+    const target = path.join(designerDir, `logo${ext}`);
+    for (const name of fs.readdirSync(designerDir)) {
+      if (/^logo\.[a-z0-9]+$/i.test(name) && path.join(designerDir, name) !== target) {
+        try { fs.unlinkSync(path.join(designerDir, name)); } catch {}
+      }
+    }
+    try {
+      fs.renameSync(file.path, target);
+    } catch {
+      fs.copyFileSync(file.path, target);
+      try { fs.unlinkSync(file.path); } catch {}
+    }
+    try { fs.chmodSync(target, 0o600); } catch {}
+    const settings = readSettings();
+    settings.designer = { ...(settings.designer || {}), logo: path.basename(target) };
+    writeSettings(settings);
+    res.json({ ok: true, logoUrl: `/api/designer/logo?v=${Date.now()}`, hasLogo: true });
+  } catch (e) {
+    try { if (file?.path) fs.unlinkSync(file.path); } catch {}
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/designer/logo', (req, res) => {
+  const logo = designerLogoPath();
+  if (!logo) return res.status(404).json({ error: 'No logo configured' });
+  res.set('Cache-Control', 'no-cache');
+  res.sendFile(logo);
+});
+
+app.get('/api/designer/files', (req, res) => {
+  try {
+    const base = designerFilesRoot();
+    const items = [];
+    const walk = (dir, prefix = '') => {
+      if (items.length >= 800) return;
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (entry.name.startsWith('.') || entry.name === 'node_modules') continue;
+        const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          items.push({ name: entry.name, rel, type: 'dir' });
+          walk(full, rel);
+        } else if (entry.isFile()) {
+          const stat = fs.statSync(full);
+          items.push({ name: entry.name, rel, type: 'file', size: stat.size });
+        }
+      }
+    };
+    walk(base);
+    items.sort((a, b) => (a.type === b.type ? a.rel.localeCompare(b.rel) : a.type === 'dir' ? -1 : 1));
+    res.json({ root: 'core/nginx-proxy', items });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/designer/file', (req, res) => {
+  try {
+    const rel = String(req.query.path || '');
+    if (!rel) return res.status(400).json({ error: 'path required' });
+    if (/\.(key|pem)$/i.test(rel)) return res.status(403).json({ error: 'Private key files are not editable here' });
+    const target = designerFilePath(rel);
+    const stat = fs.statSync(target);
+    if (!stat.isFile()) return res.status(400).json({ error: 'Not a file' });
+    if (stat.size > 1024 * 1024) return res.status(400).json({ error: 'File is too large to edit (max 1 MB)' });
+    const buffer = fs.readFileSync(target);
+    if (buffer.includes(0)) return res.status(400).json({ error: 'Binary files cannot be edited' });
+    res.json({ path: rel, content: buffer.toString('utf-8') });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+app.post('/api/designer/file', (req, res) => {
+  try {
+    const rel = String(req.body?.path || '');
+    const content = String(req.body?.content ?? '');
+    if (!rel) return res.status(400).json({ error: 'path required' });
+    if (/\.(key|pem)$/i.test(rel)) return res.status(403).json({ error: 'Private key files are not editable here' });
+    if (content.length > 1024 * 1024) return res.status(400).json({ error: 'File content is limited to 1 MB' });
+    const target = designerFilePath(rel, { forWrite: true });
+    // Existing extensionless files (for example nginx vhost snippets) are
+    // editable; new files must use a known text extension.
+    if (!fs.existsSync(target) &&
+        (!/\.[A-Za-z0-9]+$/.test(rel) ||
+         !/\.(html?|conf|txt|css|js|json|md|xml|svg|log)$/i.test(rel))) {
+      return res.status(400).json({ error: 'Only text configuration, HTML, CSS, JavaScript, JSON, and log files can be edited' });
+    }
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, content, { mode: 0o600 });
+    try { fs.chmodSync(target, 0o600); } catch {}
+    res.json({ ok: true, path: rel, message: 'File saved. Restart nginx-proxy to reload configuration changes.' });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+app.get('/api/groups', async (req, res) => {
+  try {
+    const data = readJson(groupsPath, { groups: [] });
+    if (!Array.isArray(data.groups)) data.groups = [];
+    // The Core Services group is computed from live containers, so it always
+    // includes every bundled service without the user maintaining a list.
+    let coreIds = [];
+    try {
+      const containers = await docker.listContainers({ all: true });
+      coreIds = containers
+        .filter(c => coreContainerInfo({ name: (c.Names || [])[0], Labels: c.Labels || {} }).core)
+        .map(c => c.Id);
+    } catch {}
+    const groups = data.groups
+      .filter(g => g.id !== BUILTIN_CORE_GROUP.id && String(g.name || '').toLowerCase() !== 'core services')
+      .map(g => ({ ...g, builtin: false }));
+    res.json({ groups: [{ ...BUILTIN_CORE_GROUP, containers: coreIds, builtin: true, protected: true }, ...groups] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.post('/api/groups', (req, res) => {
@@ -5864,6 +6406,9 @@ app.post('/api/groups', (req, res) => {
     if (!Array.isArray(data.groups)) data.groups = [];
     const { name, containers = [] } = req.body || {};
     if (!name) return res.status(400).json({ error: 'name required' });
+    if (String(name).trim().toLowerCase() === 'core services') {
+      return res.status(400).json({ error: 'Core Services is a built-in group and cannot be edited' });
+    }
     const list = Array.isArray(containers) ? containers : [];
     const existing = data.groups.find(g => g.name === name);
     if (existing) {
@@ -5880,6 +6425,9 @@ app.post('/api/groups', (req, res) => {
 
 app.delete('/api/groups/:id', (req, res) => {
   try {
+    if (req.params.id === BUILTIN_CORE_GROUP.id) {
+      return res.status(403).json({ error: 'Core Services is a built-in group and cannot be deleted' });
+    }
     const data = readJson(groupsPath, { groups: [] });
     if (!Array.isArray(data.groups)) data.groups = [];
     data.groups = data.groups.filter(g => g.id !== req.params.id);
@@ -6096,39 +6644,42 @@ app.get('/api/core/nginx-proxy', async (req, res) => {
     const composePath = path.join(nginxDir, 'docker-compose.yml');
     const existingCompose = fs.existsSync(composePath) ? fs.readFileSync(composePath, 'utf-8') : '';
     if (!existingCompose) {
-      const network = settings.services?.nginxProxy?.network || 'wicked';
-      const domain = settings.services?.nginxProxy?.domain || '';
-      const coreHostDir = await selfMountSource('/app/core');
-      writePrivateFile(composePath, nginxProxyCompose(
-        network,
-        domain,
-        coreHostDir ? path.join(coreHostDir, 'nginx-proxy') : ''
-      ));
-    } else {
-      await ensureNginxProxyCompose();
-    }
-    let running = false;
-    let exists = false;
-    let state = 'not created';
-    let containerId = null;
-    try {
-      const containers = await docker.listContainers({ all: true });
-      const found = containers.find(c => (c.Names || []).some(n => n.includes('nginx-proxy')));
-      if (found) {
-        exists = true;
-        state = found.State;
-        containerId = found.Id;
-        running = found.State === 'running';
+      try {
+        const network = settings.services?.nginxProxy?.network || 'wicked';
+        const domain = settings.services?.nginxProxy?.domain || '';
+        const coreHostDir = await selfMountSource('/app/core');
+        writePrivateFile(composePath, nginxProxyCompose(
+          network,
+          domain,
+          coreHostDir ? path.join(coreHostDir, 'nginx-proxy') : ''
+        ));
+      } catch (e) {
+        appendServerLog('WARN', `nginx-proxy compose preparation failed: ${e.message}`);
       }
-    } catch {}
+    } else {
+      try {
+        await ensureNginxProxyCompose();
+      } catch (e) {
+        appendServerLog('WARN', `nginx-proxy compose check failed: ${e.message}`);
+      }
+    }
+    const composeExists = fs.existsSync(composePath);
+    // Keep "installed" tied to either the compose file or the live container.
+    // A transient Docker lookup failure must not make a running nginx-proxy
+    // look like it was never created.
+    let status = { exists: false, running: false, state: 'not created', containerId: null };
+    try {
+      status = await coreServiceStatus('nginx-proxy', { nameHint: 'nginx-proxy', primaryHint: 'nginx-proxy' });
+    } catch (e) {
+      appendServerLog('WARN', `nginx-proxy status lookup failed: ${e.message}`);
+    }
     res.json({
-      exists,
-      running,
-      state,
-      containerId,
+      ...status,
+      installed: !!(status.exists || composeExists),
+      composeExists,
       dir: nginxDir,
       composePath,
-      compose: fs.existsSync(composePath) ? fs.readFileSync(composePath, 'utf-8') : '',
+      compose: composeExists ? fs.readFileSync(composePath, 'utf-8') : '',
       settings: settings.services?.nginxProxy || {}
     });
   } catch (e) {
@@ -6314,7 +6865,7 @@ app.get('/api/core/cloudflared', async (req, res) => {
       dir: cfDir,
       composePath,
       compose: fs.existsSync(composePath) ? fs.readFileSync(composePath, 'utf-8') : '',
-      settings: settings.services?.cloudflared || {}
+      settings: redactServiceSecrets('cloudflared', settings.services?.cloudflared || {})
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -6339,19 +6890,17 @@ app.post('/api/core/cloudflared/run', async (req, res) => {
   try {
     const { token } = req.body || {};
     const settings = readSettings();
-    if (token !== undefined) {
+    const newToken = String(token || '').trim();
+    if (newToken) {
       settings.services = settings.services || {};
-      settings.services.cloudflared = { ...(settings.services.cloudflared || {}), token: String(token).trim(), enabled: true };
+      settings.services.cloudflared = { ...(settings.services.cloudflared || {}), token: newToken, enabled: true };
       writeSettings(settings);
     }
     const cfDir = path.join(coreDir, 'cloudflared');
     if (!fs.existsSync(cfDir)) fs.mkdirSync(cfDir, { recursive: true });
     const composePath = path.join(cfDir, 'docker-compose.yml');
     const existingCompose = fs.existsSync(composePath) ? fs.readFileSync(composePath, 'utf-8') : '';
-    if (!existingCompose) {
-      const s = readSettings();
-      writePrivateFile(composePath, cloudflaredCompose(s.services?.cloudflared?.token || ''));
-    } else if (token !== undefined) {
+    if (!existingCompose || newToken) {
       const s = readSettings();
       writePrivateFile(composePath, cloudflaredCompose(s.services?.cloudflared?.token || ''));
     }
@@ -6384,7 +6933,7 @@ app.get('/api/core/auth', async (req, res) => {
       dir,
       composePath,
       compose,
-      settings: settings.services?.authentik || {},
+      settings: redactServiceSecrets('authentik', settings.services?.authentik || {}),
       url: coreServiceUrl(settings.services?.authentik?.domain, settings.services?.authentik?.port || 9000)
     });
   } catch (e) {
@@ -6502,7 +7051,7 @@ app.get('/api/core/authelia', async (req, res) => {
       dir,
       composePath,
       compose,
-      settings: stored,
+      settings: redactServiceSecrets('authelia', stored),
       protectedHosts,
       url: stored.domain ? `https://${stored.domain}` : `http://localhost:${stored.port || 9091}`
     });
@@ -6636,6 +7185,168 @@ app.post('/api/core/authelia/sync', async (req, res) => {
   }
 });
 
+function containerHasEnv(info, key, value) {
+  const env = info?.Config?.Env || [];
+  const prefix = `${key}=`;
+  const found = env.find(item => item.startsWith(prefix));
+  if (found === undefined) return false;
+  return value === undefined || found.slice(prefix.length) === value;
+}
+
+// Recreate a standalone container with an added environment variable while
+// keeping its image, command, mounts, ports, labels, and networks. The new
+// container is created under a temporary name first so a failed create leaves
+// the original untouched.
+async function recreateContainerWithEnv(info, envPatch) {
+  const name = String(info.Name || '').replace(/^\//, '');
+  const tempName = `${name}-auth-${crypto.randomBytes(3).toString('hex')}`;
+  const env = (info.Config?.Env || [])
+    .filter(item => !Object.keys(envPatch).some(key => item.startsWith(`${key}=`)));
+  for (const [key, value] of Object.entries(envPatch)) env.push(`${key}=${value}`);
+  const endpoints = {};
+  for (const [network, config] of Object.entries(info.NetworkSettings?.Networks || {})) {
+    endpoints[network] = { Aliases: Array.isArray(config.Aliases) && config.Aliases.length ? config.Aliases : undefined };
+  }
+  const createOptions = {
+    name: tempName,
+    Image: info.Config?.Image,
+    Env: env,
+    Cmd: info.Config?.Cmd,
+    Entrypoint: info.Config?.Entrypoint,
+    WorkingDir: info.Config?.WorkingDir,
+    User: info.Config?.User,
+    Tty: info.Config?.Tty === true,
+    OpenStdin: info.Config?.OpenStdin === true,
+    StdinOnce: info.Config?.StdinOnce === true,
+    AttachStdin: false,
+    AttachStdout: false,
+    AttachStderr: false,
+    Labels: info.Config?.Labels || {},
+    ExposedPorts: info.Config?.ExposedPorts || {},
+    StopSignal: info.Config?.StopSignal,
+    StopTimeout: info.Config?.StopTimeout,
+    Healthcheck: info.Config?.Healthcheck,
+    HostConfig: info.HostConfig || {},
+    NetworkingConfig: { EndpointsConfig: endpoints }
+  };
+  let created;
+  try {
+    created = await docker.createContainer(createOptions);
+  } catch (e) {
+    throw new Error(`Could not prepare the updated container: ${e.message}`);
+  }
+  const old = docker.getContainer(info.Id);
+  try {
+    await old.stop({ t: 20 }).catch(() => {});
+    await old.remove({ force: false });
+    await created.rename({ name });
+    await created.start();
+  } catch (e) {
+    // Try to leave the user with a usable container rather than a half-removed
+    // one. The temporary container keeps the updated configuration.
+    try { await created.start(); } catch {}
+    throw new Error(
+      `The updated container was created as "${tempName}" but could not replace "${name}": ${e.message}`
+    );
+  }
+  return { name, container: tempName };
+}
+
+async function addAuthEnvToProject(project, serviceName, composeFile, appDir) {
+  const compose = fs.readFileSync(composeFile, 'utf-8');
+  if (!serviceNamesFromCompose(compose).includes(serviceName)) {
+    throw new Error(`Service "${serviceName}" was not found in the app compose file`);
+  }
+  const next = setComposeServiceEnv(compose, serviceName, { ENABLE_AUTH: 'true' });
+  const patched = next !== compose;
+  if (patched) writePrivateFile(composeFile, next);
+  const overridePath = path.join(appDir, 'docker-compose.wickedafdok.yml');
+  const args = ['compose', '-f', composeFile, '-p', project];
+  if (fs.existsSync(overridePath)) args.push('-f', overridePath);
+  args.push('up', '-d', '--remove-orphans');
+  await run('docker', args, { cwd: appDir });
+  return patched;
+}
+
+app.post('/api/core/auth/apply', async (req, res) => {
+  try {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String) : [];
+    if (!ids.length) return res.status(400).json({ error: 'Select at least one container' });
+    const results = [];
+    const projects = new Map();
+    for (const id of ids) {
+      try {
+        const info = await docker.getContainer(id).inspect();
+        const name = String(info.Name || '').replace(/^\//, '');
+        const protection = coreContainerInfo({ name, Labels: info.Config?.Labels || {} });
+        if (protection.protected) {
+          results.push({ id, name, ok: false, skipped: true, reason: 'Protected core service' });
+          continue;
+        }
+        if (containerHasEnv(info, 'ENABLE_AUTH', 'true')) {
+          results.push({ id, name, ok: true, already: true, reason: 'Already protected' });
+          continue;
+        }
+        const labels = info.Config?.Labels || {};
+        const project = labels['com.docker.compose.project'] || '';
+        const service = labels['com.docker.compose.service'] || '';
+        if (project && service) {
+          const entry = readRegistry().find(item =>
+            projectName(item.name, 'app') === project ||
+            path.basename(appDirFor(item)) === project);
+          const appDir = entry ? appDirFor(entry) : path.join(appsDir, project);
+          const composeFile = findComposeFile(appDir);
+          if (composeFile) {
+            if (!projects.has(project)) projects.set(project, { appDir, composeFile, ids: [] });
+            projects.get(project).ids.push({ id, name, service });
+            continue;
+          }
+        }
+        await recreateContainerWithEnv(info, { ENABLE_AUTH: 'true' });
+        results.push({ id, name, ok: true, method: 'recreate' });
+      } catch (e) {
+        results.push({ id, name: id, ok: false, error: e.message });
+      }
+    }
+    for (const [project, target] of projects) {
+      try {
+        let patched = false;
+        for (const item of target.ids) {
+          if (await addAuthEnvToProject(project, item.service, target.composeFile, target.appDir)) patched = true;
+        }
+        for (const item of target.ids) {
+          results.push({ id: item.id, name: item.name, ok: true, method: 'compose', patched });
+        }
+      } catch (e) {
+        for (const item of target.ids) {
+          results.push({ id: item.id, name: item.name, ok: false, error: e.message });
+        }
+      }
+    }
+    try { await syncAuthVhosts(); } catch {}
+    const applied = results.filter(item => item.ok && !item.already).length;
+    const already = results.filter(item => item.already).length;
+    const failed = results.filter(item => !item.ok && !item.skipped);
+    // ENABLE_AUTH only produces nginx forward-auth configs once Authelia has a
+    // portal domain. Tell the user instead of leaving them with a silent no-op.
+    const authelia = autheliaDefaults(readSettings().services?.authelia || {});
+    const portalReady = !!normalizeDomain(authelia.domain);
+    const suffix = applied && !portalReady ? ' Set the Authelia portal domain in Core Services to activate the protection.' : '';
+    res.json({
+      ok: failed.length === 0,
+      applied,
+      already,
+      failed: failed.length,
+      results,
+      message: applied
+        ? `Enabled auth on ${applied} container${applied === 1 ? '' : 's'}.${suffix}`
+        : already ? 'Those containers already have auth enabled.' : 'No containers were changed.'
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message, stdout: e.stdout, stderr: e.stderr });
+  }
+});
+
 // Core services - Technitium DNS
 app.get('/api/core/dns', async (req, res) => {
   try {
@@ -6653,7 +7364,7 @@ app.get('/api/core/dns', async (req, res) => {
       dir,
       composePath,
       compose,
-      settings: settings.services?.technitium || {},
+      settings: redactServiceSecrets('technitium', settings.services?.technitium || {}),
       url: coreServiceUrl(settings.services?.technitium?.domain, settings.services?.technitium?.webPort || 5380)
     });
   } catch (e) {
@@ -8009,6 +8720,13 @@ terminalWss.on('connection', (ws, req, session) => {
     session.clients.delete(ws);
   });
 });
+
+// Encrypt legacy plaintext secrets on first start and keep settings normalized.
+try {
+  writeSettings(readSettings());
+} catch (e) {
+  appendServerLog('WARN', `settings secret migration failed: ${e.message}`);
+}
 
 const port = process.env.PORT || 8080;
 server.listen(port, () => {

@@ -42,7 +42,7 @@ docker run -d --name wickedafdok -p 8080:8080 \
 - OpenCode is installed into the image at build time from the official installer (`OPENCODE_VERSION` build arg, symlinked to `/usr/local/bin/opencode`). Setting `OPENCODE_BIN` points the server at a different binary, which is useful for development.
 - The Dockerfile starts Node directly (`node server/index.js`) so non-root operation does not depend on npm having a writable home; setup sets `HOME=/app/data/.home`
 - No built-in authentication - put behind a reverse proxy with auth if exposed publicly. `/api/auth` is a settings placeholder, not an auth middleware; it stores credentials and does not protect API routes.
-- Runtime JSON files are written with mode `600` because settings/auth/DNS files can contain secrets. Registry/git connection secrets in `data/registries.json` are AES-256-GCM encrypted; other runtime JSON remains plaintext.
+- Runtime JSON files are written with mode `600` because settings/auth/DNS files can contain secrets. Registry/git connection secrets in `data/registries.json` and service secrets in `data/settings.json` are AES-256-GCM encrypted with `data/.credentials-key`; other runtime JSON remains plaintext.
 
 ## Directory Structure
 ```
@@ -59,7 +59,8 @@ docker run -d --name wickedafdok -p 8080:8080 \
 ├── core/                # Core services (nginx-proxy, cloudflared, authentik, dns, host-helper)
 ├── data/                # Persistent data (registry, settings, backups, logs, managed compose)
 │   ├── registries.json  # Encrypted registry and git connection credentials
-│   ├── .credentials-key # 0600 AES-256-GCM key used for registries.json secrets
+│   ├── .credentials-key # 0600 AES-256-GCM key used for registry and settings secrets
+│   ├── designer/        # Uploaded Designer logo files
 │   ├── docker-config/   # Generated Docker auth config used for pulls (0700/0600)
 │   ├── backups/         # Local full/app backup archives + metadata
 │   ├── logs/            # server.log
@@ -80,7 +81,10 @@ docker run -d --name wickedafdok -p 8080:8080 \
 - Live auto-refresh
 
 ### Containers
-- List all containers (running/stopped)
+- List all containers (running/stopped), split into **Core Services** and **Workloads**
+- Core containers are identified from compose project labels/known names, protected from easy deletion, and cannot be updated/re-saved as apps from this tab
+- Protected removal requires typing the exact container name; the API enforces `confirmName`
+- **Apps interface** button opens the Apps tab
 - Actions: start, stop, restart, pause, unpause
 - Remove containers
 - View container logs (modal)
@@ -133,7 +137,10 @@ The unified way to deploy applications. Every app is stored in `apps/<name>/` wi
 ### Apps
 - Lists all apps from `data/registry.json`
 - Each app managed from `apps/<name>/` via docker compose
-- Actions: redeploy, start, stop, manage
+- Actions: **Quick Deploy** (one-click compose up), **Alter State** (opens the compose editor for the app's base config), start, stop, restart, and remove
+- Quick Deploy resolves duplicate `container_name` conflicts by renaming the stale non-core container to `<name>-previous-<shortid>`; conflicts with protected core services abort with `409`
+- Alter State saves the edited compose as the new base `docker-compose.yml` (or the app's existing compose filename), removes the generated `docker-compose.wickedafdok.yml` override, re-adds the `wicked` default network and prior `VIRTUAL_HOST`/`VIRTUAL_PORT` when needed, and can save only or save and deploy
+- A first start that reports failure while project containers already exist is returned as `launchPending` instead of a failure so slow builds are not misreported
 - UI element: `#tab-apps`, `#appsList`, `#appsRefresh`
 
 ### Projects / Sources
@@ -144,10 +151,18 @@ The unified way to deploy applications. Every app is stored in `apps/<name>/` wi
 
 ### Dok Settings
 
-Settings is split into four subtabs: **Core Services**, **Dok Settings**, **Logs**, and **Backups & Updates**. Dok Settings contains the app's own management options, currently Groups and registry connections.
+Settings is split into four subtabs: **Core Services**, **Dok Settings**, **Logs**, and **Backups & Updates**. Dok Settings contains the app's own management options: Designer, Groups, and registry connections.
+
+**Designer:**
+- `#openDesigner` in Dok Settings opens `#designerModal`
+- Stores `designer.name`, `designer.tagline`, `designer.css`, and `designer.logo` in `data/settings.json`; uploaded logos live under `data/designer/`
+- `GET/POST /api/designer`, `POST /api/designer/logo`, `GET /api/designer/logo`
+- Name, tagline, and CSS are applied live to the header; the CSS override is injected as a `<style>` element
+- `GET /api/designer/files`, `GET /api/designer/file?path=`, and `POST /api/designer/file` expose editable text files under `core/nginx-proxy` (error pages, vhost snippets, configs); dotfiles and private key/`.pem` files are excluded
 
 **Groups:**
 - Stores container groups in `data/groups.json`
+- The **Core Services** group is built in and computed from live Docker labels/names (`com.docker.compose.project` and known core container names). It cannot be edited or deleted and appears first in `GET /api/groups`
 - `GET /api/groups`, `POST /api/groups`, and `DELETE /api/groups/:id`
 - UI elements live inside `#settings-pane-dok`: `#groupName`, `#groupContainers`, `#saveGroup`, `#groupsList`
 
@@ -171,6 +186,7 @@ The **Core Services** subtab manages the bundled services.
 - If domain configured for WickedAFDok in nginx settings, can trigger self-recreation to attach UI container to nginx network with `VIRTUAL_HOST`/`VIRTUAL_PORT` env vars
 - Uses `jwilder/nginx-proxy` style setup
 - Managed compose stored in `core/nginx-proxy/docker-compose.yml`
+- `GET /api/core/nginx-proxy` reports both `exists`/`running` (live Docker state) and `installed`/`composeExists` (compose file on disk). The UI treats `installed` as authoritative so a transient Docker/API failure cannot flip a running nginx-proxy back to "not installed"; failed lookups keep the last known state
 
 **cloudflared (managed):**
 - Create/run/edit Cloudflare Tunnel via UI
@@ -183,6 +199,7 @@ The **Core Services** subtab manages the bundled services.
 - Generated secrets and bootstrap admin email/password are stored in `data/settings.json`
 - Users create Authentik providers/applications from the Authentik admin UI; WickedAFDok exposes the service and launch/edit controls
 - Optional GUI domain stored as `services.authentik.domain`; the managed compose adds `VIRTUAL_HOST`/`VIRTUAL_PORT=9000` to the `server` service only. The manage view has an **Apply domain** action that patches an existing compose and recreates a running service.
+- After launching Authentik (or Authelia), the UI opens a container picker. `POST /api/core/auth/apply` recreates selected containers with `ENABLE_AUTH=true`; app-managed containers are patched in their compose file and re-upped, standalone containers are recreated from their full Docker config. Protected core containers are skipped. `ENABLE_AUTH` vhosts are generated by Authelia; Authentik is an SSO portal and does not consume that flag.
 - Managed compose stored in `core/auth/docker-compose.yml`
 
 **Authelia (managed authentication):**
@@ -213,7 +230,7 @@ The **Core Services** subtab manages the bundled services.
 - **User mode:** cwd `/app/apps`, `external_directory: deny`, and a bash/read allowlist tuned for app work; Docker, system package management, privilege escalation, and WickedAFDok source paths are intended to be off limits
 - Generated configs live at `data/opencode/<mode>/opencode.json`; per-mode `HOME`/XDG directories keep sessions separate, while provider login/auth and caches are shared under `data/opencode/shared`
 - `OPENCODE_DISABLE_PROJECT_CONFIG=1` prevents an app-level `opencode.json` from widening mode permissions
-- Optional `services.opencode` settings (model, provider, API key) preconfigure a provider. If provider is blank, it is inferred from the `provider/model` prefix. The key is passed as `OPENCODE_PROVIDER_API_KEY` and generated configs reference `{env:OPENCODE_PROVIDER_API_KEY}`; it is stored plaintext in `data/settings.json` (mode `600`) or can be added interactively with `/connect`
+- Optional `services.opencode` settings (model, provider, API key) preconfigure a provider. If provider is blank, it is inferred from the `provider/model` prefix. The key is passed as `OPENCODE_PROVIDER_API_KEY` and generated configs reference `{env:OPENCODE_PROVIDER_API_KEY}`; it is encrypted at rest in `data/settings.json` and redacted as `apiKeySet` in API responses. It can also be added interactively with `/connect`
 - The same terminal modal can open a plain bash shell. Admin shell starts in `/app`; the apps shell starts in `apps/`. Shell sessions run as the container user and are not permission-restricted like User-mode OpenCode.
 
 **Logs:**
@@ -243,7 +260,7 @@ The **Core Services** subtab manages the bundled services.
 - `POST /api/system/update-from-git` - Update WickedAFDok from a required git repo; the code root must be writable by the server user
 
 ### Containers
-- `GET /api/containers` - List containers
+- `GET /api/containers` - List containers; each entry includes `project`, `service`, `core`, `protected`, `self`, and `role`
 - `GET /api/containers/:id/inspect` - Inspect container
 - `GET /api/containers/:id/logs` - Get container logs
 - `POST /api/containers/:id/:action(start|stop|restart|pause|unpause)` - Container actions
@@ -251,7 +268,7 @@ The **Core Services** subtab manages the bundled services.
 - `POST /api/containers/:id/update-check` - Check for updates
 - `POST /api/containers/:id/redeploy` - Redeploy container
 - `POST /api/containers/:id/save-to-registry` - Save to apps registry
-- `DELETE /api/containers/:id` - Remove container
+- `DELETE /api/containers/:id` - Remove container; protected containers require `{ "confirmName": "<container name>" }` (otherwise `403`)
 
 ### Images
 - `GET /api/images` - List images
@@ -276,7 +293,7 @@ The **Core Services** subtab manages the bundled services.
 - `GET /api/core/cloudflared` - Get cloudflared status/config
 - `POST /api/core/cloudflared/compose` - Save cloudflared compose
 - `POST /api/core/cloudflared/run` - Start/run cloudflared
-- `GET /api/core/auth` / `POST /api/core/auth/compose` / `POST /api/core/auth/run` / `POST /api/core/auth/domain` - Authentik status, compose, launch, GUI domain
+- `GET /api/core/auth` / `POST /api/core/auth/compose` / `POST /api/core/auth/run` / `POST /api/core/auth/domain` / `POST /api/core/auth/apply` - Authentik status, compose, launch, GUI domain, and apply `ENABLE_AUTH` to selected containers
 - `GET /api/core/authelia` / `POST /api/core/authelia/compose` / `POST /api/core/authelia/run` / `POST /api/core/authelia/domain` / `POST /api/core/authelia/sync` - Authelia status, compose, launch, portal domain, ENABLE_AUTH vhost sync
 - `GET /api/core/dns` / `POST /api/core/dns/compose` / `POST /api/core/dns/run` / `POST /api/core/dns/domain` - Technitium status, compose, launch, GUI domain
 - `GET /api/core/host-helper` / `POST /api/core/host-helper/compose` / `POST /api/core/host-helper/run` - Host helper status, compose, launch
@@ -312,9 +329,17 @@ The **Core Services** subtab manages the bundled services.
 
 ### Apps
 - `GET /api/registry` - List apps in registry
-- `POST /api/registry/:id/deploy` - Deploy/redeploy app from registry
+- `POST /api/registry/:id/deploy` - Quick Deploy: compose up, resolving duplicate container names
 - `POST /api/registry/:id/:action(start|stop|restart)` - App compose lifecycle actions
+- `GET /api/apps/:id/compose` - Read the app's base compose file
+- `POST /api/apps/:id/compose` - Save an edited compose as the new base (`deploy: true` re-deploys; `force: true` saves despite validation issues)
 - `DELETE /api/registry/:id` - Remove from registry
+
+### Designer
+- `GET /api/designer` / `POST /api/designer` - Read or save name, tagline, CSS, and logo state
+- `POST /api/designer/logo` (multipart `logo`) - Upload PNG/JPG/WebP/SVG/ICO
+- `GET /api/designer/logo` - Serve the uploaded logo
+- `GET /api/designer/files` / `GET /api/designer/file?path=` / `POST /api/designer/file` - Browse and edit text files under `core/nginx-proxy`
 
 ### Networks & Settings
 - `GET /api/networks` - List Docker networks
@@ -404,7 +429,7 @@ The **Core Services** subtab manages the bundled services.
 - Upload paths are parsed as an array, traversal/empty destinations are discarded and their temp files removed, and destination parents are checked to stay inside the project after resolving symlinks
 - Git clones and self-update use generic git over any host. TLS verification is enabled by default; `WICKEDAFDOK_GIT_INSECURE=1` opts into `GIT_SSL_NO_VERIFY=true` for trusted self-signed servers.
 - Git connections stored in Dok Settings inject `GIT_ASKPASS` and credential environment variables only for matching HTTPS hosts. Secret values are never placed in the askpass script or command line.
-- Runtime JSON writes use mode `600`, as do managed app/core compose files and backup archives. Registry connection secrets are encrypted at rest; settings, DNS, auth, and Host Helper token values still contain plaintext secrets where applicable.
+- Runtime JSON writes use mode `600`, as do managed app/core compose files and backup archives. Registry/git connection secrets and service secrets in `data/settings.json` are encrypted at rest; other non-secret runtime JSON remains plaintext.
 - `shm_size` values generated from `docker run --shm-size` are normalized to human-readable Compose sizes (`1073741824` becomes `1gb`); the builder displays `shm_size` the same way.
 
 ### Permission Handling
@@ -429,7 +454,7 @@ The **Core Services** subtab manages the bundled services.
 - The Host Helper is optional and privileged. Without it, host paths outside the runtime directories must be writable by the server UID/GID.
 - Authentik is launched as a standalone SSO service. Per-app forward-auth/proxy providers still need to be configured in Authentik and the fronting proxy; WickedAFDok does not automatically enable auth for every app.
 - Self-update requires a writable persistent application code checkout. The default image bakes source into `/app` and runs as non-root in common deployments, so an in-app update is lost on container recreation unless `/app` (with `node_modules`) is bind-mounted; otherwise update on the host with `git pull` and rebuild via `./start.sh`.
-- Settings, DNS, auth, and Host Helper token values are stored plaintext (mode `600`), not encrypted. Registry and git connection secrets use AES-256-GCM with `data/.credentials-key`; losing that key makes the stored secrets unrecoverable (delete and re-enter them).
+- Service secrets in `data/settings.json` (cloudflared token, Authentik and Authelia passwords/keys, Technitium admin password, OpenCode API key) are AES-256-GCM encrypted with `data/.credentials-key`. `readSettings()` decrypts for internal use, `writeSettings()` encrypts, and API responses redact values while exposing `*Set` flags. Legacy plaintext values are encrypted on the first start. Registry and git connection secrets use the same key; losing that key makes the stored secrets unrecoverable (delete and re-enter them).
 - OpenCode is installed during the Docker image build. Existing deployments must rebuild the image to add it, and the build needs network access to `opencode.ai`/GitHub releases. Set `OPENCODE_BIN` to use a local binary during development.
 - User mode is a permission guardrail for the AI agent, not an OS sandbox. It runs as the same container user as Admin mode, so a determined command can still reach files or binaries the Unix user can access. Shell sessions are not restricted at all. Use a separate container/user for hard isolation.
 - The browser terminal and OpenCode sessions are protected only by the same (currently absent) authentication as the rest of the UI. Anyone who can reach the UI can open an Admin shell; keep it behind a trusted network or authenticated reverse proxy. A reverse proxy must forward WebSocket upgrades for `/api/terminal/ws`.
@@ -445,18 +470,21 @@ The **Core Services** subtab manages the bundled services.
 - App Creation (`#tab-appcreation`) - primary deployment interface
 - Sources/Projects (`#tab-sources`)
 - Apps (`#tab-apps`) - deployed apps
-- Settings (`#tab-settings`) - includes `#settings-pane-dok` with Groups and registry connections
+- Settings (`#tab-settings`) - includes `#settings-pane-dok` with Designer, Groups, and registry connections
 
 **Key UI Elements:**
+- Containers: `#containersList`, `#containerSearch`, `#containersOpenApps` (opens the Apps tab), `#refreshContainers`
 - Dashboard: `#dashboardTerminalBtn`, `#dashboardOpencodeBtn`
 - Terminal Modal: `#terminalModal`, `#terminalContainer`, `#terminalModeSelect`, `#terminalShellBtn`, `#terminalOpencodeBtn`, `#terminalStopBtn`, `#terminalStatus`, `#terminalModeBadge`
 - OpenCode Card: `#coreOpencodeCard`, `#opencodeLaunchAdmin`, `#opencodeLaunchUser`, `#opencodeShellAdmin`, `#opencodeShellUser`, `#opencodeStopBtn`, `#opencodeModel`, `#opencodeProvider`, `#opencodeApiKey`, `#opencodeSaveSettings`
 - App Creation: `#runCreateBtn`, `#composeCreateBtn`, `#gitCloneBtn`, `#uploadBtn`
 - App Config Modal: `#appConfigModal`, `#appCfgBuilder`, `#appCfgCompose`, `#appCfgEditCompose`, `#appCfgValidate`, `#appCfgComplete`, `#appCfgCompleteRun`, `#appCfgProgress`
 - Notices: `#appCfgNetworkNotice`, `#appCfgVolumeNotice`, `#appCreationNginxNotice`, `#appCreationNginxNoticeModal`
-- Modals: `#composeEditWarningModal`, `#composeSaveConfirmModal`, `#appOverwriteModal`
+- Modals: `#composeEditWarningModal`, `#composeSaveConfirmModal`, `#appOverwriteModal`, `#authContainersModal`, `#designerModal`
 - Apps List: `#appsList`, `#appsRefresh`
 - Settings: `#tab-settings`, `#settingsSubtabs`, `#settings-pane-core`, `#settings-pane-dok`, `#settings-pane-logs`, `#settings-pane-backups`, `#coreAllStart`, `#coreAllStop`, `#coreAllRestart`, `#nginxNetwork`, `#runNginxProxyCore`, `#authRunBtn`, `#dnsRunBtn`, `#helperRunBtn`
+- Designer: `#openDesigner`, `#designerName`, `#designerTagline`, `#designerCss`, `#designerLogoFile`, `#designerLogoUpload`, `#designerLogoRemove`, `#designerFilePath`, `#designerFileContent`, `#designerFileSave`
+- Auth picker: `#authContainersList`, `#authApplySelected`, `#authSelectAll`, `#authSelectNone`, `#authApplyMsg`
 - Dok Settings: `#groupName`, `#groupContainers`, `#saveGroup`, `#groupsList`, `#registryKind`, `#registryProvider`, `#registryName`, `#registryHost`, `#registryUsername`, `#registrySecret`, `#saveRegistry`, `#cancelRegistryEdit`, `#registriesRefresh`, `#registriesList`
 - Logs: `#serverLogsOutput`, `#serverLogsRefresh`, `#serverLogsClear`, `#appLogsSelect`, `#appLogsRefresh`, `#appLogsOutput`
 - Backups: `#createBackupBtn`, `#backupScope`, `#backupCustomOptions`, `#backupAppsSelect`, `#backupCoreSelect`, `#backupsList`, `#backupRefresh`, `#importBackupFile`, `#importBackupBtn`
@@ -471,6 +499,7 @@ The **Core Services** subtab manages the bundled services.
 - Settings stored as JSON in `data/settings.json`
 - App library stored as JSON array in `data/registry.json`
 - Registry/git connections stored in `data/registries.json`; secrets are AES-256-GCM encrypted with `data/.credentials-key`
+- Service secrets in `data/settings.json` use the same encryption; the API redacts them and reports `*Set` flags. `clearSecrets` on `POST /api/settings` removes a stored secret explicitly
 - Docker runs use a generated `DOCKER_CONFIG` at `data/docker-config` when at least one container-registry connection exists
 - Paste-based docker run commands reject shell operators for security
 - No automated tests or lint script. Verify with syntax/build checks (for example `node --check server/index.js` or a Bun browser/node build when available) and API smoke tests.
@@ -518,6 +547,29 @@ The **Core Services** subtab manages the bundled services.
 
 ##------------------------------------------Your current task--------------------------------------
 
-When I add the nginx server and the wickedafdok container is relaunched, I can no loger communicate with docker. I found this in the nginx log:
-Command failed: docker compose -f /app/core/nginx-proxy/docker-compose.yml -p nginx-proxy logs --no-color --tail 300
-permission denied while trying to connect to the docker API at unix:///var/run/docker.sock
+Running Containers:
+ Add a button to open the apps interface.
+
+Core Services:
+ Authentication:
+  When launching an auth container. After the user hits the launch button open a window with a list of all existing containers for the user to select ones that need to be recreated with auth.
+ Reverse Proxy:
+  For some reason after about 20 minutes wickedafdok reverts back to the Nginx not installed state. The nginx container is still running and appears to still be functioning correctly. But
+In Core Services it reverts back to an install state and App Creation starts displaying the nginx is not installed notification.
+
+Settings:
+ Dok Settings:
+   Add a button called "Designer" that opens an app costomization window.
+     - Set a custom logo
+	 - Set a custom name
+	 - Set a custom Tag Line
+	 - A CSS override field for custom CSS
+	 - Easy access to nginxproxy files for editing error pages etc.. for custom design
+
+Apps:
+ Apps should have a 1 click deploy. If a duplicate container already exists, the new container should be automatically amended in the simplest, most logical and clean way possible to fix conflicts. It should also have an edited deploy where it opens our compose editor and the user can make any changes they want. They should have the option to save a new base config for the app.
+ Lets call the 1 click deploy button Quick Deploy" and for fun lets call the edit button "Alter State"
+ When creating an app, I changed the volume path in the compose editor and it still used the old path. It also said it failed when it just had not finished its install yet.
+
+Ensure that we are managing passwords, secrets etc.. correctly
+Core Service containers need to be segragated from the rest of the container list and Protected from accidental or easy deletion. To start, create a group called Core Services. It should be a built in group that all Core Service Containers go to

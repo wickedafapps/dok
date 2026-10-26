@@ -9,6 +9,7 @@ const state = {
   logsTimer: null,
   logsContainer: null,
   coreNginxRunning: false,
+  coreNginxInstalled: null,
   groups: [],
   editingGroup: null,
   registries: [],
@@ -275,6 +276,36 @@ async function loadContainers() {
   }
 }
 
+function containerItemHtml(c) {
+  const paused = c.state === 'paused';
+  const running = c.state === 'running' || paused;
+  return `
+    <div class="item" data-id="${escapeHtml(c.id)}">
+      <div class="item-header">
+        <div>
+          <div class="item-title">${escapeHtml(c.name || c.shortId)} ${stateChip(c.state)}
+            ${c.core ? badge('Core service', 'type') : ''}${c.protected && !c.core ? badge('Protected', 'type') : ''}
+          </div>
+          <div class="item-sub">${escapeHtml(c.image)} · ${escapeHtml(c.status)}</div>
+          <div class="item-sub mono">${escapeHtml(c.shortId)}</div>
+          ${containerPorts(c.ports) ? `<div class="ports">${containerPorts(c.ports)}</div>` : ''}
+        </div>
+        <div class="item-actions">
+          ${running ? `<button class="btn" data-act="stop">Stop</button>` : `<button class="btn" data-act="start">Start</button>`}
+          <button class="btn" data-act="restart">Restart</button>
+          ${running ? `<button class="btn" data-act="${paused ? 'unpause' : 'pause'}">${paused ? 'Resume' : 'Pause'}</button>` : ''}
+          <button class="btn" data-act="logs">Logs</button>
+          <button class="btn" data-act="exec">Exec</button>
+          ${c.core ? '' : `<button class="btn" data-act="update-check">Update</button>
+          <button class="btn" data-act="save-reg">Save to Apps</button>`}
+          ${c.protected
+            ? `<button class="btn btn-danger" data-act="remove" title="Protected container">Remove…</button>`
+            : `<button class="btn btn-danger" data-act="remove">Remove</button>`}
+        </div>
+      </div>
+    </div>`;
+}
+
 function renderContainers() {
   const list = qs('#containersList');
   const query = (qs('#containerSearch').value || '').trim().toLowerCase();
@@ -289,31 +320,12 @@ function renderContainers() {
     list.innerHTML = '<div class="empty">No containers match that filter.</div>';
     return;
   }
-  list.innerHTML = items.map(c => {
-    const paused = c.state === 'paused';
-    const running = c.state === 'running' || paused;
-    return `
-      <div class="item" data-id="${escapeHtml(c.id)}">
-        <div class="item-header">
-          <div>
-            <div class="item-title">${escapeHtml(c.name || c.shortId)} ${stateChip(c.state)}</div>
-            <div class="item-sub">${escapeHtml(c.image)} · ${escapeHtml(c.status)}</div>
-            <div class="item-sub mono">${escapeHtml(c.shortId)}</div>
-            ${containerPorts(c.ports) ? `<div class="ports">${containerPorts(c.ports)}</div>` : ''}
-          </div>
-          <div class="item-actions">
-            ${running ? `<button class="btn" data-act="stop">Stop</button>` : `<button class="btn" data-act="start">Start</button>`}
-            <button class="btn" data-act="restart">Restart</button>
-            ${running ? `<button class="btn" data-act="${paused ? 'unpause' : 'pause'}">${paused ? 'Resume' : 'Pause'}</button>` : ''}
-            <button class="btn" data-act="logs">Logs</button>
-            <button class="btn" data-act="exec">Exec</button>
-            <button class="btn" data-act="update-check">Update</button>
-            <button class="btn" data-act="save-reg">Save to Apps</button>
-            <button class="btn btn-danger" data-act="remove">Remove</button>
-          </div>
-        </div>
-      </div>`;
-  }).join('');
+  const coreItems = items.filter(c => c.core);
+  const workloadItems = items.filter(c => !c.core);
+  list.innerHTML = `
+    ${coreItems.length ? `<div class="section-heading"><h3>Core Services</h3><span class="muted">Managed by WickedAFDok · protected</span></div>${coreItems.map(containerItemHtml).join('')}` : ''}
+    ${workloadItems.length ? `<div class="section-heading"><h3>Workloads</h3><span class="muted">${workloadItems.length} container${workloadItems.length === 1 ? '' : 's'}</span></div>${workloadItems.map(containerItemHtml).join('')}` : ''}
+  `;
 
   list.querySelectorAll('.item').forEach(item => {
     const id = item.dataset.id;
@@ -322,7 +334,23 @@ function renderContainers() {
       btn.addEventListener('click', async () => {
         const act = btn.dataset.act;
         if (act === 'logs') return openLogs(container);
-        if (act === 'remove' && !confirm(`Remove container "${container.name}"? This cannot be undone.`)) return;
+        let removeBody = null;
+        if (act === 'remove') {
+          if (container.protected) {
+            const typed = prompt(`"${container.name}" is protected. Type the container name to confirm removal:`);
+            if (typed !== container.name) {
+              if (typed !== null) toast('Removal cancelled: the name did not match', true);
+              return;
+            }
+            removeBody = {
+              method: 'DELETE',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ confirmName: container.name })
+            };
+          } else if (!confirm(`Remove container "${container.name}"? This cannot be undone.`)) {
+            return;
+          }
+        }
         if (act === 'stop' && !confirm(`Stop container "${container.name}"?`)) return;
         if (act === 'exec') {
           const c = prompt('Command to run inside container (e.g. sh, /bin/bash, ls -la /)', 'sh');
@@ -374,7 +402,7 @@ function renderContainers() {
         setLoading(btn, true);
         try {
           if (act === 'remove') {
-            await api(`/api/containers/${encodeURIComponent(id)}`, { method: 'DELETE' });
+            await api(`/api/containers/${encodeURIComponent(id)}`, removeBody || { method: 'DELETE' });
             toast(`Removed ${container.name}`);
           } else {
             await api(`/api/containers/${encodeURIComponent(id)}/${act}`, { method: 'POST' });
@@ -393,6 +421,9 @@ function renderContainers() {
 
 qs('#containerSearch').addEventListener('input', renderContainers);
 qs('#refreshContainers').addEventListener('click', loadContainers);
+if (qs('#containersOpenApps')) {
+  qs('#containersOpenApps').addEventListener('click', () => openTab('apps'));
+}
 
 function openLogs(container) {
   state.logsContainer = container;
@@ -1683,6 +1714,9 @@ function openAppConfig(data) {
   updateAppCfgRequired();
   qs('#appCfgBuilderCard')?.classList.remove('hidden');
   loadAppCfgBuilder(initialCompose);
+  // Alter State is about editing the compose file directly, so skip the visual
+  // builder and open the raw editor immediately.
+  if (data.editAppId) setComposeEditable(true);
   const summary = qs('#appCfgSummary');
   if (data.command) {
     summary.textContent = data.command;
@@ -1691,7 +1725,12 @@ function openAppConfig(data) {
     summary.classList.add('hidden');
     summary.textContent = '';
   }
-  qs('#appConfigTitle').textContent = `Configure ${data.appName || 'app'}`;
+  const editing = !!data.editAppId;
+  qs('#appConfigTitle').textContent = editing
+    ? `Alter state: ${data.appName || 'app'}`
+    : `Configure ${data.appName || 'app'}`;
+  if (qs('#appCfgComplete')) qs('#appCfgComplete').textContent = editing ? 'Save base config' : 'Complete Creation';
+  if (qs('#appCfgCompleteRun')) qs('#appCfgCompleteRun').textContent = editing ? 'Save and deploy' : 'Complete Creation and Launch';
   hideAppCfgProgress();
   qs('#appConfigModal').classList.remove('hidden');
   renderAppCfgNetworkNotice();
@@ -1773,12 +1812,16 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
   if (!pendingAppConfig || appCfgCompleting) return;
   appCfgCompleting = true;
   const data = pendingAppConfig;
+  const editing = !!data.editAppId;
   const btn = launchNow ? qs('#appCfgCompleteRun') : qs('#appCfgComplete');
   const otherBtn = launchNow ? qs('#appCfgComplete') : qs('#appCfgCompleteRun');
+  const labels = editing
+    ? { save: 'Save base config', deploy: 'Save and deploy' }
+    : { save: 'Complete Creation', deploy: 'Complete Creation and Launch' };
   const msg = qs('#appCfgMsg');
   const release = () => {
     appCfgCompleting = false;
-    setLoading(btn, false, launchNow ? 'Complete Creation and Launch' : 'Complete Creation');
+    setLoading(btn, false, launchNow ? labels.deploy : labels.save);
     if (otherBtn) otherBtn.disabled = false;
   };
   const fail = () => {
@@ -1797,6 +1840,63 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
   }
   setAppCfgProgress(18, 'Building compose…');
   const compose = qs('#appCfgCompose').value;
+  if (editing) {
+    if (!compose.trim()) {
+      msg.textContent = 'The compose file is empty.';
+      fail();
+      return;
+    }
+    if (!force) {
+      setAppCfgProgress(30, 'Validating compose…');
+      try {
+        const check = await api('/api/compose/validate', jsonBody({ compose, appDir: data.appDir }));
+        if (!check.ok) {
+          showComposeIssues(check.issues, () => doAppComplete(launchNow, true));
+          fail();
+          return;
+        }
+      } catch (e) {
+        toast(e.message, true);
+        fail();
+        return;
+      }
+    }
+    setAppCfgProgress(62, launchNow ? 'Saving and deploying…' : 'Saving base configuration…');
+    setLoading(btn, true, launchNow ? 'Deploying…' : 'Saving…');
+    if (otherBtn) otherBtn.disabled = true;
+    msg.textContent = '';
+    try {
+      const res = await api(`/api/apps/${encodeURIComponent(data.editAppId)}/compose`, jsonBody({
+        compose,
+        deploy: launchNow,
+        force
+      }));
+      finishAppCfgProgress(launchNow ? (res.pending ? 'Starting' : 'Deployed') : 'Saved');
+      await new Promise(resolve => setTimeout(resolve, 600));
+      qs('#appConfigModal').classList.add('hidden');
+      hideAppCfgProgress();
+      pendingAppConfig = null;
+      pendingSaveAction = null;
+      if (res.pending) toast(res.message || `${data.appName} is still starting`);
+      else if (launchNow) toast(`${data.appName} deployed`);
+      else toast(`${data.appName} base configuration saved`);
+      if (Array.isArray(res.issues) && res.issues.length) console.log(res.issues.join('\n'));
+      refreshAll();
+      loadApps();
+    } catch (e) {
+      hideAppCfgProgress();
+      if (e.data && Array.isArray(e.data.issues) && e.data.issues.length) {
+        msg.textContent = e.message;
+        showComposeIssues(e.data.issues, () => doAppComplete(launchNow, true));
+      } else {
+        msg.textContent = e.message;
+        toast(e.message, true);
+      }
+    } finally {
+      release();
+    }
+    return;
+  }
   const network = qs('#appCfgNetwork').value.trim() || 'wicked';
   const quick = appCfgBuilderManual
     ? { ports: '', vhost: '', vhostPort: '' }
@@ -1853,13 +1953,14 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
   setAppCfgProgress(62, launchNow ? 'Creating and launching…' : 'Creating app…');
   try {
     const res = await api('/api/launch/finalize', jsonBody(payload));
-    finishAppCfgProgress(res.launchError ? 'Created (launch failed)' : launchNow ? 'Running' : 'Created');
+    finishAppCfgProgress(res.launchError ? 'Created (launch failed)' : res.launchPending ? 'Starting…' : launchNow ? 'Running' : 'Created');
     await new Promise(resolve => setTimeout(resolve, 700));
     qs('#appConfigModal').classList.add('hidden');
     hideAppCfgProgress();
     pendingAppConfig = null;
     pendingSaveAction = null;
     if (res.launchError) toast(`${payload.appName} created, but launch failed: ${res.launchError}`, true);
+    else if (res.launchPending) toast(res.message || `${payload.appName} is still starting`);
     else if (launchNow) toast(`${payload.appName} is running`);
     else toast(`${payload.appName} created`);
     if (res.stdout) console.log(res.stdout, res.stderr || '');
@@ -2250,7 +2351,8 @@ async function loadRegistry() {
               <div class="item-sub">${meta ? escapeHtml(meta) + ' · ' : ''}Saved ${entry.created ? new Date(entry.created).toLocaleString() : 'unknown'}</div>
             </div>
             <div class="item-actions">
-              <button class="btn btn-primary" data-act="deploy">Redeploy</button>
+              <button class="btn btn-primary" data-act="deploy">Quick Deploy</button>
+              <button class="btn" data-act="alter">Alter State</button>
               <button class="btn" data-act="start">Start</button>
               <button class="btn" data-act="stop">Stop</button>
               <button class="btn" data-act="restart">Restart</button>
@@ -2282,15 +2384,39 @@ async function loadRegistry() {
             openTab('sources');
             return;
           }
+          if (act === 'alter') {
+            setLoading(btn, true, 'Loading…');
+            try {
+              const res = await api(`/api/apps/${encodeURIComponent(entry.id)}/compose`);
+              openAppConfig({
+                appName: entry.name,
+                appDir: res.appDir,
+                compose: res.compose,
+                editAppId: entry.id,
+                network: entry.launch?.network || 'wicked',
+                vhost: entry.launch?.vhost || '',
+                vhostPort: entry.launch?.vhostPort || ''
+              });
+            } catch (e) {
+              toast(e.message, true);
+            } finally {
+              setLoading(btn, false);
+            }
+            return;
+          }
 
           const url = act === 'deploy'
             ? `/api/registry/${encodeURIComponent(entry.id)}/deploy`
             : `/api/registry/${encodeURIComponent(entry.id)}/${act}`;
-          const label = act === 'deploy' ? 'Redeploying…' : `${act[0].toUpperCase()}${act.slice(1)}…`;
+          const label = act === 'deploy' ? 'Deploying…' : `${act[0].toUpperCase()}${act.slice(1)}…`;
           setLoading(btn, true, label);
           try {
-            await api(url, { method: 'POST' });
-            toast(act === 'deploy' ? `${entry.name} redeployed` : `${entry.name}: ${act} requested`);
+            const res = await api(url, { method: 'POST' });
+            if (res.pending) toast(res.message || `${entry.name} is still starting`);
+            else if (res.renamed && res.renamed.length) {
+              const names = res.renamed.map(item => item.to).join(', ');
+              toast(`${entry.name} deployed. Renamed conflicting container${res.renamed.length === 1 ? '' : 's'} to ${names}.`);
+            } else toast(act === 'deploy' ? `${entry.name} deployed` : `${entry.name}: ${act} requested`);
             loadApps();
             refreshAll();
           } catch (e) {
@@ -2461,7 +2587,12 @@ async function loadSettings() {
       qs('#nginxPort').value = v === undefined || v === null ? 80 : v;
     }
     if (qs('#nginxDomain')) qs('#nginxDomain').value = s.services?.nginxProxy?.domain || '';
-    if (qs('#cfToken')) qs('#cfToken').value = s.services?.cloudflared?.token || '';
+    if (qs('#cfToken')) {
+      qs('#cfToken').value = '';
+      qs('#cfToken').placeholder = s.services?.cloudflared?.tokenSet
+        ? 'Token saved (leave blank to keep)'
+        : 'Cloudflare tunnel token';
+    }
     if (qs('#authEmail')) qs('#authEmail').value = s.services?.authentik?.adminEmail || '';
     if (qs('#authPort')) qs('#authPort').value = s.services?.authentik?.port || 9000;
     if (qs('#authDomain')) qs('#authDomain').value = s.services?.authentik?.domain || '';
@@ -2503,11 +2634,12 @@ async function loadCoreNginx() {
     coreNginxData = res;
     const create = qs('#nginxCreateSection');
     const manage = qs('#nginxManageSection');
-    if (res.exists) {
+    const installed = !!(res.installed || res.containerId || res.exists || res.running || res.composeExists);
+    if (installed) {
       if (create) create.classList.add('hidden');
       if (manage) manage.classList.remove('hidden');
       const label = qs('#nginxManageSection .muted');
-      if (label) label.textContent = `nginx-proxy status: ${res.state}`;
+      if (label) label.textContent = `nginx-proxy status: ${res.state || 'created'}`;
     } else {
       if (create) create.classList.remove('hidden');
       if (manage) manage.classList.add('hidden');
@@ -2516,7 +2648,8 @@ async function loadCoreNginx() {
       qs('#nginxComposeEditor').value = res.compose;
     }
     state.coreNginxRunning = !!res.running;
-    const hasNginx = !!(res.containerId || res.exists || res.running);
+    state.coreNginxInstalled = installed;
+    const hasNginx = installed;
     if (qs('#appCreationNginxNotice')) qs('#appCreationNginxNotice').classList.toggle('hidden', hasNginx);
     if (qs('#appCreationNginxNoticeModal')) qs('#appCreationNginxNoticeModal').classList.toggle('hidden', hasNginx);
     updateAppCfgRequired();
@@ -2648,6 +2781,12 @@ async function loadCoreCloudflared() {
     if (qs('#cfComposeEditor') && res.compose) {
       qs('#cfComposeEditor').value = res.compose;
     }
+    if (qs('#cfToken')) {
+      qs('#cfToken').value = '';
+      qs('#cfToken').placeholder = res.settings?.tokenSet
+        ? 'Token saved (leave blank to keep)'
+        : 'Cloudflare tunnel token';
+    }
   } catch { /* ignore */ }
 }
 
@@ -2691,10 +2830,20 @@ if (qs('#runCfCore')) {
     setLoading(btn, true);
     try {
       const token = qs('#cfToken') ? qs('#cfToken').value.trim() : '';
-      await api('/api/settings', jsonBody({ services: { cloudflared: { token } } }));
+      if (!token) {
+        const current = await api('/api/settings').catch(() => null);
+        if (!current?.services?.cloudflared?.tokenSet) {
+          toast('Enter a Cloudflare tunnel token', true);
+          return;
+        }
+      } else {
+        await api('/api/settings', jsonBody({ services: { cloudflared: { token } } }));
+      }
       const res = await api('/api/core/cloudflared/run', jsonBody({ token }));
       toast(res?.message || 'cloudflared launched');
+      if (qs('#cfToken')) qs('#cfToken').value = '';
       loadCoreCloudflared();
+      loadSettings();
       refreshAll();
     } catch (e) {
       toast(e.message, true);
@@ -2749,12 +2898,13 @@ async function loadGroups() {
       <div class="item" data-id="${escapeHtml(g.id)}" data-name="${escapeHtml(g.name)}">
         <div class="item-header">
           <div>
-            <div class="item-title">${escapeHtml(g.name)}</div>
-            <div class="item-sub">${(g.containers||[]).length} container(s)</div>
+            <div class="item-title">${escapeHtml(g.name)} ${g.builtin ? badge('Built-in', 'type') : ''}</div>
+            <div class="item-sub">${(g.containers||[]).length} container(s)${g.builtin ? ' · core services are added automatically' : ''}</div>
           </div>
           <div class="item-actions">
-            <button class="btn" data-act="edit-group">Edit</button>
-            <button class="btn btn-danger" data-act="del-group">Delete</button>
+            ${g.builtin
+              ? '<span class="muted">Protected group</span>'
+              : '<button class="btn" data-act="edit-group">Edit</button><button class="btn btn-danger" data-act="del-group">Delete</button>'}
           </div>
         </div>
       </div>`).join('');
@@ -3439,6 +3589,7 @@ if (qs('#authRunBtn')) {
       if (qs('#authMsg')) qs('#authMsg').textContent = res.message || '';
       toast(res.message || 'Authentik launched', false, 12000);
       await loadCoreAuth();
+      openAuthContainersPicker();
     } catch (e) {
       toast(e.message, true);
     } finally {
@@ -3501,6 +3652,7 @@ if (qs('#autheliaRunBtn')) {
       if (qs('#autheliaMsg')) qs('#autheliaMsg').textContent = `${res.message || ''}${creds}`;
       toast(`${res.message || 'Authelia launched'}${creds}`, false, 20000);
       await loadCoreAuthelia();
+      openAuthContainersPicker();
     } catch (e) {
       toast(e.message, true);
     } finally {
@@ -3981,21 +4133,25 @@ if (qs('#settingsSubtabs')) {
 }
 
 async function checkAppCreationNginxNotice() {
-  try {
-    const res = await api('/api/core/nginx-proxy').catch(() => null);
-    state.coreNginxRunning = !!(res && res.running);
-    const has = !!(res && (res.containerId || res.exists || res.running));
+  const applyNotice = (has) => {
     const notice1 = qs('#appCreationNginxNotice');
     if (notice1) notice1.classList.toggle('hidden', has);
     const notice2 = qs('#appCreationNginxNoticeModal');
     if (notice2) notice2.classList.toggle('hidden', has);
+  };
+  let res = null;
+  try {
+    res = await api('/api/core/nginx-proxy');
   } catch {
-    state.coreNginxRunning = false;
-    const notice1 = qs('#appCreationNginxNotice');
-    if (notice1) notice1.classList.remove('hidden');
-    const notice2 = qs('#appCreationNginxNoticeModal');
-    if (notice2) notice2.classList.remove('hidden');
+    // A transient API or Docker error says nothing about whether nginx-proxy is
+    // installed, so keep the last known state instead of showing "not installed".
+    updateAppCfgRequired();
+    return;
   }
+  const has = !!(res && (res.installed || res.containerId || res.exists || res.running || res.composeExists));
+  state.coreNginxRunning = !!(res && res.running);
+  state.coreNginxInstalled = has;
+  applyNotice(has);
   updateAppCfgRequired();
 }
 
@@ -4101,6 +4257,282 @@ qsa('[data-close]').forEach(el => {
   }
 });
 
+// ---------------- Auth container picker ----------------
+async function openAuthContainersPicker() {
+  const modal = qs('#authContainersModal');
+  const list = qs('#authContainersList');
+  if (!modal || !list) return;
+  if (qs('#authApplyMsg')) qs('#authApplyMsg').textContent = '';
+  list.innerHTML = '<div class="empty">Loading containers…</div>';
+  modal.classList.remove('hidden');
+  try {
+    const containers = await api('/api/containers');
+    const candidates = (containers || []).filter(c => !c.core && !c.self);
+    if (!candidates.length) {
+      list.innerHTML = '<div class="empty">No workload containers found. Deploy an app first, then run this again.</div>';
+      return;
+    }
+    list.innerHTML = candidates.map(c => `
+      <label class="item" style="cursor:pointer">
+        <div class="item-header">
+          <div>
+            <div class="item-title"><input type="checkbox" value="${escapeHtml(c.id)}"> ${escapeHtml(c.name || c.shortId)} ${stateChip(c.state)}</div>
+            <div class="item-sub">${escapeHtml(c.image)}${c.project ? ` · ${escapeHtml(c.project)}` : ''}</div>
+            ${containerPorts(c.ports) ? `<div class="ports">${containerPorts(c.ports)}</div>` : ''}
+          </div>
+        </div>
+      </label>`).join('');
+  } catch (e) {
+    list.innerHTML = `<div class="empty">Unable to load containers: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function authPickerInputs() {
+  return Array.from(qsa('#authContainersList input[type="checkbox"]'));
+}
+
+if (qs('#authSelectAll')) {
+  qs('#authSelectAll').addEventListener('click', () => authPickerInputs().forEach(input => { input.checked = true; }));
+}
+if (qs('#authSelectNone')) {
+  qs('#authSelectNone').addEventListener('click', () => authPickerInputs().forEach(input => { input.checked = false; }));
+}
+if (qs('#authApplySelected')) {
+  qs('#authApplySelected').addEventListener('click', async () => {
+    const ids = authPickerInputs().filter(input => input.checked).map(input => input.value);
+    const msg = qs('#authApplyMsg');
+    if (!ids.length) {
+      if (msg) msg.textContent = 'Select at least one container.';
+      return;
+    }
+    const btn = qs('#authApplySelected');
+    setLoading(btn, true, 'Applying…');
+    if (msg) msg.textContent = 'Recreating selected containers with auth…';
+    try {
+      const res = await api('/api/core/auth/apply', jsonBody({ ids }));
+      const failed = Array.isArray(res.results) ? res.results.filter(item => !item.ok && !item.skipped) : [];
+      if (msg) {
+        msg.textContent = failed.length
+          ? `${res.message} ${failed.length} failed: ${failed.map(item => `${item.name}: ${item.error || item.reason}`).join('; ')}`
+          : (res.message || 'Done.');
+      }
+      toast(res.message || 'Auth updated', failed.length > 0);
+      if (!failed.length) {
+        await new Promise(resolve => setTimeout(resolve, 800));
+        qs('#authContainersModal')?.classList.add('hidden');
+      }
+      loadContainers();
+      loadApps();
+    } catch (e) {
+      if (msg) msg.textContent = e.message;
+      toast(e.message, true);
+    } finally {
+      setLoading(btn, false, 'Enable auth on selected');
+    }
+  });
+}
+
+// ---------------- Designer ----------------
+function applyDesignerBranding(designer) {
+  const data = designer || {};
+  const name = String(data.name || 'WickedAFDok').trim() || 'WickedAFDok';
+  const tagline = data.tagline === undefined ? 'Server & Docker control room' : String(data.tagline || '');
+  const brandName = qs('#brandName');
+  if (brandName) {
+    if (name !== 'WickedAFDok' && name.length > 5 && name.slice(-5) === 'AFDok') {
+      brandName.innerHTML = `${escapeHtml(name.slice(0, -5))}<span>AFDok</span>`;
+    } else if (name === 'WickedAFDok') {
+      brandName.innerHTML = 'Wicked<span>AFDok</span>';
+    } else {
+      brandName.textContent = name;
+    }
+  }
+  if (qs('#brandTagline')) {
+    qs('#brandTagline').textContent = tagline;
+    qs('#brandTagline').classList.toggle('hidden', !tagline);
+  }
+  const logoUrl = data.logoUrl || '';
+  if (qs('#brandLogo')) {
+    if (logoUrl) {
+      qs('#brandLogo').src = logoUrl;
+      qs('#brandLogo').classList.remove('hidden');
+      qs('#brandDefaultMark')?.classList.add('hidden');
+    } else {
+      qs('#brandLogo').classList.add('hidden');
+      qs('#brandLogo').removeAttribute('src');
+      qs('#brandDefaultMark')?.classList.remove('hidden');
+    }
+  }
+  let style = qs('#designerCssStyle');
+  if (!style) {
+    style = document.createElement('style');
+    style.id = 'designerCssStyle';
+    document.head.appendChild(style);
+  }
+  style.textContent = String(data.css || '');
+  document.title = name;
+}
+
+async function loadDesignerBranding() {
+  try {
+    const res = await api('/api/designer');
+    applyDesignerBranding(res);
+    return res;
+  } catch {
+    return null;
+  }
+}
+
+let designerData = null;
+
+async function loadDesignerFiles() {
+  const select = qs('#designerFilePath');
+  if (!select) return;
+  try {
+    const res = await api('/api/designer/files');
+    const files = (res.items || []).filter(item => item.type === 'file');
+    const current = select.value;
+    select.innerHTML = files.length
+      ? files.map(item => `<option value="${escapeHtml(item.rel)}">${escapeHtml(item.rel)}</option>`).join('')
+      : '<option value="">No editable files found</option>';
+    if (current && files.some(item => item.rel === current)) select.value = current;
+    if (qs('#designerFilePath') && select.value) await loadDesignerFile(select.value);
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+async function loadDesignerFile(path) {
+  const rel = path || qs('#designerFilePath')?.value || '';
+  if (!rel) return;
+  try {
+    const res = await api(`/api/designer/file?path=${encodeURIComponent(rel)}`);
+    qs('#designerFileContent').value = res.content || '';
+    qs('#designerFileMsg').textContent = rel;
+  } catch (e) {
+    qs('#designerFileContent').value = '';
+    qs('#designerFileMsg').textContent = e.message;
+    toast(e.message, true);
+  }
+}
+
+async function openDesigner() {
+  const modal = qs('#designerModal');
+  if (!modal) return;
+  modal.classList.remove('hidden');
+  const res = await loadDesignerBranding();
+  designerData = res;
+  if (qs('#designerName')) qs('#designerName').value = res?.name || 'WickedAFDok';
+  if (qs('#designerTagline')) qs('#designerTagline').value = res?.tagline ?? 'Server & Docker control room';
+  if (qs('#designerCss')) qs('#designerCss').value = res?.css || '';
+  const preview = qs('#designerLogoPreview');
+  if (preview) {
+    if (res?.logoUrl) {
+      preview.src = res.logoUrl;
+      preview.classList.remove('hidden');
+    } else {
+      preview.classList.add('hidden');
+      preview.removeAttribute('src');
+    }
+  }
+  loadDesignerFiles();
+}
+
+if (qs('#openDesigner')) qs('#openDesigner').addEventListener('click', openDesigner);
+if (qs('#settingsDesignerBtn')) qs('#settingsDesignerBtn').addEventListener('click', openDesigner);
+
+if (qs('#designerSave')) {
+  qs('#designerSave').addEventListener('click', async () => {
+    const btn = qs('#designerSave');
+    setLoading(btn, true, 'Saving…');
+    try {
+      const res = await api('/api/designer', jsonBody({
+        name: qs('#designerName').value,
+        tagline: qs('#designerTagline').value,
+        css: qs('#designerCss').value
+      }));
+      applyDesignerBranding({ ...(res.designer || {}), css: qs('#designerCss').value });
+      qs('#designerMsg').textContent = 'Design saved.';
+      toast('Design saved');
+    } catch (e) {
+      qs('#designerMsg').textContent = e.message;
+      toast(e.message, true);
+    } finally {
+      setLoading(btn, false, 'Save design');
+    }
+  });
+}
+
+if (qs('#designerLogoUpload')) {
+  qs('#designerLogoUpload').addEventListener('click', async () => {
+    const input = qs('#designerLogoFile');
+    if (!input?.files?.length) return toast('Choose an image file first', true);
+    const btn = qs('#designerLogoUpload');
+    setLoading(btn, true, 'Uploading…');
+    try {
+      const form = new FormData();
+      form.append('logo', input.files[0]);
+      const res = await fetch('/api/designer/logo', { method: 'POST', body: form });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Upload failed');
+      const preview = qs('#designerLogoPreview');
+      if (preview) {
+        preview.src = data.logoUrl;
+        preview.classList.remove('hidden');
+      }
+      if (qs('#brandLogo')) {
+        qs('#brandLogo').src = data.logoUrl;
+        qs('#brandLogo').classList.remove('hidden');
+        qs('#brandDefaultMark')?.classList.add('hidden');
+      }
+      input.value = '';
+      toast('Logo updated');
+    } catch (e) {
+      toast(e.message, true);
+    } finally {
+      setLoading(btn, false, 'Upload logo');
+    }
+  });
+}
+
+if (qs('#designerLogoRemove')) {
+  qs('#designerLogoRemove').addEventListener('click', async () => {
+    if (!confirm('Remove the custom logo?')) return;
+    try {
+      const res = await api('/api/designer', jsonBody({ removeLogo: true }));
+      applyDesignerBranding(res.designer || {});
+      qs('#designerLogoPreview')?.classList.add('hidden');
+      toast('Logo removed');
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+}
+
+if (qs('#designerFileRefresh')) qs('#designerFileRefresh').addEventListener('click', loadDesignerFiles);
+if (qs('#designerFilePath')) qs('#designerFilePath').addEventListener('change', () => loadDesignerFile());
+if (qs('#designerFileSave')) {
+  qs('#designerFileSave').addEventListener('click', async () => {
+    const rel = qs('#designerFilePath')?.value || '';
+    if (!rel) return toast('Select a file first', true);
+    const btn = qs('#designerFileSave');
+    setLoading(btn, true, 'Saving…');
+    try {
+      const res = await api('/api/designer/file', jsonBody({
+        path: rel,
+        content: qs('#designerFileContent').value
+      }));
+      qs('#designerFileMsg').textContent = res.message || 'Saved';
+      toast('File saved');
+    } catch (e) {
+      qs('#designerFileMsg').textContent = e.message;
+      toast(e.message, true);
+    } finally {
+      setLoading(btn, false, 'Save file');
+    }
+  });
+}
+
 function refreshAll() {
   loadStats();
   loadContainers();
@@ -4118,4 +4550,5 @@ setInterval(() => {
 
 loadContainers();
 loadSettings();
+loadDesignerBranding();
 checkAppCreationNginxNotice();
