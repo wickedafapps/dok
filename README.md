@@ -59,20 +59,19 @@ For GitHub Container Registry (`ghcr.io`), use your GitHub username and a token 
 
 WickedAFDok can self-update from any git remote. To manage the app through a GitHub repository:
 
-1. Create the repository under your WickedAF account (private is fine) and push this checkout to it. The default branch is usually `main`.
+1. Create a repository (private is fine) and push this checkout to it. The default branch is usually `main`.
 2. Decide how the app will authenticate:
-   - **HTTPS + token (recommended):** create a fine-grained PAT for the repository with **Contents: Read**, then add a **Git host** connection for `github.com` in Dok Settings.
+   - **HTTPS + token (recommended):** create a fine-grained PAT for the repository with **Contents: Read**, then add a **Git host** connection for `github.com` in Dok Settings. Add **Contents: Read and write** only if the same token will also push commits; WickedAFDok itself only pulls.
    - **SSH deploy key:** add a read-only deploy key to the repository and mount the matching private key for the container user. No Dok Settings git connection is needed.
-3. Open **Settings → Backups & Updates**, enter the repository URL, for example `https://github.com/<account>/wickedafdok.git`, and the branch (`main`), then click **Update from Git**.
+3. Open **Settings → Backups & Updates**, enter the repository URL, for example `https://github.com/wickedafapps/dok.git`, and the branch (`main`), then click **Update from Git**.
 4. The application code directory must be writable by the container user, and it must persist across container recreation. The default image bakes the source into `/app`, so an in-app update changes only the running container and is lost on the next rebuild/recreate. For persistent in-app updates, bind-mount a writable checkout at `/app` (and make sure `node_modules` is available there) or run updates on the host with `git pull && ./start.sh` instead.
 
-What is needed from you before this can be tested end to end:
+Before updating, check:
 
 - The repository URL and default branch.
-- Whether updates use a PAT or an SSH deploy key.
-- For a PAT: the token value (entered in Dok Settings, never in a URL).
-- For SSH: a deploy key added to the repository and the private key available to the container user.
-- A writable source checkout (bind mount or root container) if you want in-app self-update.
+- For a PAT: the token is entered in Dok Settings, never in a URL.
+- For SSH: a deploy key is added to the repository and the private key is available to the container user.
+- The source checkout is writable (bind mount or root container) if you want in-app self-update.
 
 The included `.gitignore` keeps `data/`, `apps/`, `core/`, `sources/`, `uploads/`, and `node_modules/` out of the repository. A first push looks like this:
 
