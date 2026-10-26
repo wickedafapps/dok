@@ -656,12 +656,13 @@
       <div id="settings-pane-backups" class="settings-pane">
         <div class="card">
           <h3>Application updates</h3>
-          <p class="muted">Pull updates from a git repository. The application code directory must be writable by the server user.</p>
+          <p class="muted">Pull from GitHub, rebuild the WickedAFDok image, and recreate the container. Running from a source checkout pulls the code and asks for a restart.</p>
           <div class="row">
             <input id="updateRepo" class="input flex" placeholder="Git repo URL">
             <input id="updateBranch" class="input" placeholder="Branch (optional)">
-            <button id="tempUpdateBtn" class="btn btn-primary">Update from Git</button>
+            <button id="updateFromGitBtn" class="btn btn-primary">Update from Git</button>
           </div>
+          <p id="updateMeta" class="muted"></p>
           <pre id="updateOutput" class="output hidden"></pre>
         </div>
         <div class="card">

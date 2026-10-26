@@ -13,6 +13,9 @@ services:
       - ./uploads:/app/uploads
       - ./apps:/app/apps
       - ./core:/app/core
+      # Host checkout used by in-app Git updates. The updater pulls here and
+      # rebuilds the image, so changes survive container recreation.
+      - ./:/app/host-source
     environment:
       - PORT=8080
     privileged: false

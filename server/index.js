@@ -447,6 +447,43 @@ function gitEnvironment(repo) {
   return env;
 }
 
+function updateSourceDir() {
+  const hostSource = path.join(root, 'host-source');
+  try {
+    if (fs.existsSync(path.join(hostSource, 'Dockerfile')) &&
+        fs.existsSync(path.join(hostSource, 'server', 'index.js'))) {
+      return hostSource;
+    }
+  } catch {}
+  return root;
+}
+
+function updateImageTag(value) {
+  const text = String(value || '').trim();
+  if (!text || text === '<none>' || text.startsWith('sha256:')) return 'wickedafdok:latest';
+  return text;
+}
+
+function tailText(value, limit = 50000) {
+  const text = String(value || '').replace(/\x1b\[[0-9;]*m/g, '');
+  return text.length > limit ? text.slice(-limit) : text;
+}
+
+function appendUpdateLog(text) {
+  if (!text) return;
+  try {
+    fs.mkdirSync(dataDir, { recursive: true });
+    const logPath = path.join(dataDir, 'update.log');
+    fs.appendFileSync(logPath, text);
+    try { fs.chmodSync(logPath, 0o600); } catch {}
+  } catch {}
+}
+
+async function gitText(args, cwd, env = process.env) {
+  const { stdout } = await run('git', args, { cwd, env });
+  return String(stdout || '').trim();
+}
+
 function run(cmd, args, opts = {}) {
   return new Promise((resolve, reject) => {
     const env = opts.env || (cmd === 'docker' ? dockerEnvironment() : process.env);
@@ -7534,76 +7571,307 @@ app.post('/api/backups/import', upload.single('file'), async (req, res) => {
   }
 });
 
+let updateJob = {
+  running: false,
+  phase: 'idle',
+  repo: '',
+  branch: '',
+  previousCommit: '',
+  commit: '',
+  image: '',
+  started: '',
+  error: '',
+  log: ''
+};
+
+function beginDockerUpdate({ sourceDir, repo, branch, previousCommit, commit }) {
+  updateJob = {
+    running: true,
+    phase: 'building',
+    repo,
+    branch,
+    previousCommit,
+    commit,
+    image: '',
+    started: new Date().toISOString(),
+    error: '',
+    log: ''
+  };
+  const record = (text) => {
+    if (!text) return;
+    updateJob.log = tailText(updateJob.log + text);
+    appendUpdateLog(text);
+  };
+  record(`\n--- ${updateJob.started} updating WickedAFDok to ${commit || 'latest'} ---\n`);
+  record(`Repository: ${repo} (${branch})\nSource: ${sourceDir}\n`);
+
+  (async () => {
+    try {
+      const info = await selfContainerInfo();
+      const image = updateImageTag(info?.Config?.Image || info?.Image || process.env.WICKEDAFDOK_IMAGE || '');
+      updateJob.image = image;
+      record(`Rebuilding image ${image}...\n`);
+      const build = await run('docker', ['build', '--progress=plain', '-t', image, sourceDir], {
+        cwd: sourceDir,
+        env: dockerEnvironment()
+      });
+      record(build.stdout);
+      record(build.stderr);
+      record(`\nImage rebuilt. Scheduling container recreation...\n`);
+
+      const settings = readSettings();
+      const nginx = settings.services?.nginxProxy || {};
+      const domain = nginx.enabled ? normalizeDomain(nginx.domain) : '';
+      let network = '';
+      if (domain) {
+        network = nginx.network || 'wicked';
+      } else {
+        const networks = Object.keys(info?.NetworkSettings?.Networks || {});
+        network = networks.find(name => !['bridge', 'host', 'none'].includes(name)) || networks[0] || '';
+      }
+
+      updateJob.phase = 'recreating';
+      const restart = await scheduleSelfRecreate(domain, network);
+      if (!restart.scheduled) {
+        throw new Error(restart.reason || restart.error || 'Container recreation was not scheduled');
+      }
+      record('Container recreation scheduled. WickedAFDok will reconnect shortly.\n');
+      updateJob.running = false;
+      updateJob.phase = 'recreating';
+    } catch (e) {
+      const details = `${e.message || 'Update failed'}\n${e.stdout || ''}${e.stderr || ''}`;
+      record(`\nUpdate failed: ${details}\n`);
+      updateJob.running = false;
+      updateJob.phase = 'error';
+      updateJob.error = e.message || 'Update failed';
+      updateJob.log = tailText(`${updateJob.log}\n${e.stdout || ''}${e.stderr || ''}`);
+      appendServerLog('ERROR', `WickedAFDok update failed: ${e.message || e}`);
+    }
+  })();
+
+  return updateJob;
+}
+
+app.get('/api/system/update-info', async (req, res) => {
+  const sourceDir = updateSourceDir();
+  const settings = readSettings();
+  const saved = settings.updates || {};
+  const info = {
+    source: sourceDir === root ? 'image' : 'checkout',
+    docker: fs.existsSync('/.dockerenv'),
+    repo: saved.repo || '',
+    branch: saved.branch || '',
+    commit: '',
+    subject: '',
+    dirty: false,
+    running: updateJob.running,
+    phase: updateJob.phase
+  };
+  try {
+    info.repo = info.repo || await gitText(['remote', 'get-url', 'origin'], sourceDir);
+    info.branch = info.branch || await gitText(['rev-parse', '--abbrev-ref', 'HEAD'], sourceDir);
+    info.commit = await gitText(['rev-parse', '--short', 'HEAD'], sourceDir);
+    info.subject = await gitText(['log', '-1', '--pretty=%s'], sourceDir);
+    info.dirty = !!await gitText(['status', '--porcelain'], sourceDir);
+  } catch {}
+  res.json(info);
+});
+
+app.get('/api/system/update-status', (req, res) => {
+  res.json({
+    running: updateJob.running,
+    phase: updateJob.phase,
+    repo: updateJob.repo,
+    branch: updateJob.branch,
+    previousCommit: updateJob.previousCommit,
+    commit: updateJob.commit,
+    image: updateJob.image,
+    started: updateJob.started,
+    error: updateJob.error,
+    log: updateJob.log
+  });
+});
+
 app.post('/api/system/update-from-git', async (req, res) => {
   try {
-    const repo = String(req.body?.repo || '').trim();
-    const branch = req.body?.branch || null;
+    if (updateJob.running) {
+      return res.status(409).json({ error: 'An update is already running', phase: updateJob.phase });
+    }
+    const settings = readSettings();
+    const saved = settings.updates || {};
+    const sourceDir = updateSourceDir();
+    const requestedRepo = String(req.body?.repo || '').trim();
+    const requestedBranch = String(req.body?.branch || '').trim();
+    const force = req.body?.force === true;
+
+    let repo = requestedRepo || saved.repo || '';
+    if (!repo) {
+      try { repo = await gitText(['remote', 'get-url', 'origin'], sourceDir); } catch {}
+    }
     if (!repo) return res.status(400).json({ error: 'repo required' });
     if (!/^(https?:\/\/|git:\/\/|ssh:\/\/|git@)[^\s]+$/.test(repo)) {
       return res.status(400).json({ error: 'Repo must be an http(s), git, ssh, or git@ URL' });
     }
-    if (branch && !/^[A-Za-z0-9_][A-Za-z0-9._/-]*$/.test(branch)) {
+
+    let branch = requestedBranch || saved.branch || '';
+    if (!branch) {
+      try { branch = await gitText(['rev-parse', '--abbrev-ref', 'HEAD'], sourceDir); } catch {}
+      if (!branch || branch === 'HEAD') {
+        try {
+          const remote = await run('git', ['ls-remote', '--symref', repo, 'HEAD'], { env: gitEnvironment(repo) });
+          branch = String(remote.stdout || '').match(/ref: refs\/heads\/([^\s]+)\s+HEAD/)?.[1] || '';
+        } catch {}
+      }
+    }
+    if (!branch) branch = 'main';
+    if (!/^[A-Za-z0-9_][A-Za-z0-9._/-]*$/.test(branch)) {
       return res.status(400).json({ error: 'Invalid branch name' });
     }
+
     try {
-      fs.accessSync(root, fs.constants.W_OK);
+      fs.accessSync(sourceDir, fs.constants.W_OK);
     } catch {
       throw httpError(403,
-        `The application directory ${root} is not writable by UID/GID ${processIdentity()}. ` +
+        `The application code directory ${sourceDir} is not writable by UID/GID ${processIdentity()}. ` +
         'Self-update requires a writable code checkout, for example when running as root or from a writable bind mount.'
       );
     }
+
+    let previousCommit = '';
+    try { previousCommit = await gitText(['rev-parse', '--short', 'HEAD'], sourceDir); } catch {}
+    let dirty = '';
+    try { dirty = await gitText(['status', '--porcelain'], sourceDir); } catch {}
+    if (dirty && !force) {
+      return res.status(409).json({
+        error: 'The source checkout has local changes. Commit or discard them, or confirm the overwrite.',
+        dirty: true
+      });
+    }
+
     // Ensure the checkout exists and points at the requested repo.
     try {
-      await run('git', ['rev-parse', '--git-dir'], { cwd: root });
+      await run('git', ['rev-parse', '--git-dir'], { cwd: sourceDir });
     } catch {
-      try { await run('git', ['init'], { cwd: root }); } catch {}
+      try { await run('git', ['init'], { cwd: sourceDir }); } catch {}
     }
     try {
-      await run('git', ['remote', 'set-url', 'origin', repo], { cwd: root });
+      await run('git', ['remote', 'set-url', 'origin', repo], { cwd: sourceDir });
     } catch {
-      try { await run('git', ['remote', 'add', 'origin', repo], { cwd: root }); } catch {}
+      try { await run('git', ['remote', 'add', 'origin', repo], { cwd: sourceDir }); } catch {}
     }
-    const runGit = (args, opts = {}) => run('git', args, {
-      cwd: root,
-      env: gitEnvironment(repo),
-      ...opts
-    });
 
-    if (branch) {
-      try { await runGit(['fetch', 'origin', branch]); } catch {}
+    const gitEnv = gitEnvironment(repo);
+    let stdout = '';
+    let stderr = '';
+    let method = 'reset';
+    let fetched = false;
+    try {
+      const out = await run('git', ['fetch', 'origin', branch], { cwd: sourceDir, env: gitEnv });
+      stdout += out.stdout;
+      stderr += out.stderr;
+      fetched = true;
+    } catch (e) {
+      stdout += e.stdout || '';
+      stderr += e.stderr || '';
+    }
+    if (!fetched) {
       try {
-        const { stdout, stderr } = await runGit(['reset', '--hard', `origin/${branch}`]);
-        return res.json({ ok: true, stdout, stderr, method: 'reset', repo, branch });
-      } catch {
-        try { await runGit(['fetch', '--all']); } catch {}
-        try {
-          const { stdout, stderr } = await runGit(['reset', '--hard', `origin/${branch}`]);
-          return res.json({ ok: true, stdout, stderr, method: 'reset', repo, branch });
-        } catch {
-          const { stdout, stderr } = await runGit(['reset', '--hard', branch]);
-          return res.json({ ok: true, stdout, stderr, method: 'reset-local', repo, branch });
-        }
+        const out = await run('git', ['fetch', '--all', '--prune'], { cwd: sourceDir, env: gitEnv });
+        stdout += out.stdout;
+        stderr += out.stderr;
+        method = 'fetch-all';
+        fetched = true;
+      } catch (e) {
+        stdout += e.stdout || '';
+        stderr += e.stderr || '';
       }
+    }
+    if (!fetched) {
+      throw httpError(502, `Unable to fetch ${repo}: ${String(stderr || 'git fetch failed').trim()}`);
     }
 
     try {
-      const { stdout, stderr } = await runGit(['pull', '--rebase=false']);
-      return res.json({ ok: true, stdout, stderr, method: 'pull', repo, branch });
-    } catch {
-      try { await runGit(['fetch', '--all']); } catch {}
-      const candidates = ['origin/HEAD', 'origin/main', 'origin/master', 'main', 'master'];
-      for (const candidate of candidates) {
-        try {
-          const { stdout, stderr } = await runGit(['reset', '--hard', candidate]);
-          return res.json({ ok: true, stdout, stderr, method: `reset-${candidate.replace('origin/', '')}`, repo, branch });
-        } catch {}
+      const out = await run('git', ['reset', '--hard', `origin/${branch}`], { cwd: sourceDir });
+      stdout += out.stdout;
+      stderr += out.stderr;
+    } catch (e) {
+      try {
+        const out = await run('git', ['reset', '--hard', branch], { cwd: sourceDir });
+        stdout += out.stdout;
+        stderr += out.stderr;
+        method = 'reset-local';
+      } catch {
+        throw httpError(502, `Fetched ${repo}, but could not check out ${branch}: ${String(e.stderr || e.message).trim()}`);
       }
-      const { stdout, stderr } = await runGit(['pull']);
-      return res.json({ ok: true, stdout, stderr, method: 'pull2', repo, branch });
     }
+
+    const commit = await gitText(['rev-parse', '--short', 'HEAD'], sourceDir);
+    const subject = await gitText(['log', '-1', '--pretty=%s'], sourceDir).catch(() => '');
+    const nextSettings = readSettings();
+    nextSettings.updates = { repo, branch };
+    writeSettings(nextSettings);
+
+    const changed = !previousCommit || previousCommit !== commit;
+    const dockerRuntime = fs.existsSync('/.dockerenv');
+    if (!changed) {
+      return res.json({
+        ok: true,
+        upToDate: true,
+        repo,
+        branch,
+        previousCommit,
+        commit,
+        subject,
+        changed: false,
+        method,
+        stdout: tailText(stdout, 20000),
+        stderr: tailText(stderr, 20000),
+        message: `Already up to date at ${commit}.`
+      });
+    }
+
+    if (dockerRuntime) {
+      const job = beginDockerUpdate({ sourceDir, repo, branch, previousCommit, commit });
+      return res.json({
+        ok: true,
+        running: true,
+        repo,
+        branch,
+        previousCommit,
+        commit,
+        subject,
+        changed,
+        method,
+        stdout: tailText(stdout, 20000),
+        stderr: tailText(stderr, 20000),
+        update: {
+          running: job.running,
+          phase: job.phase
+        },
+        message: `Pulled ${commit}. Rebuilding the image and recreating WickedAFDok.`
+      });
+    }
+
+    return res.json({
+      ok: true,
+      repo,
+      branch,
+      previousCommit,
+      commit,
+      subject,
+      changed,
+      method,
+      stdout: tailText(stdout, 20000),
+      stderr: tailText(stderr, 20000),
+      restartRequired: true,
+      message: `Pulled ${commit}. Restart WickedAFDok to apply the new code.`
+    });
   } catch (e) {
-    res.status(500).json({ error: e.message, stdout: e.stdout, stderr: e.stderr });
+    res.status(e.status || 500).json({
+      error: e.message,
+      stdout: tailText(e.stdout, 20000),
+      stderr: tailText(e.stderr, 20000)
+    });
   }
 });
 

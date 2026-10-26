@@ -63,15 +63,19 @@ WickedAFDok can self-update from any git remote. To manage the app through a Git
 2. Decide how the app will authenticate:
    - **HTTPS + token (recommended):** create a fine-grained PAT for the repository with **Contents: Read**, then add a **Git host** connection for `github.com` in Dok Settings. Add **Contents: Read and write** only if the same token will also push commits; WickedAFDok itself only pulls.
    - **SSH deploy key:** add a read-only deploy key to the repository and mount the matching private key for the container user. No Dok Settings git connection is needed.
-3. Open **Settings → Backups & Updates**, enter the repository URL, for example `https://github.com/wickedafapps/dok.git`, and the branch (`main`), then click **Update from Git**.
-4. The application code directory must be writable by the container user, and it must persist across container recreation. The default image bakes the source into `/app`, so an in-app update changes only the running container and is lost on the next rebuild/recreate. For persistent in-app updates, bind-mount a writable checkout at `/app` (and make sure `node_modules` is available there) or run updates on the host with `git pull && ./start.sh` instead.
+3. Open **Settings → Backups & Updates**, enter the repository URL, for example `https://github.com/wickedafapps/dok.git`, and the branch (`main`), then click **Update & Restart**.
+4. In Docker, WickedAFDok pulls the checkout, rebuilds its image from the updated source, and recreates the container with that image. The included compose file mounts the host checkout at `/app/host-source`, so the pull updates the host files and survives container recreation. If your container was created before that mount existed, run `./start.sh` once on the host to recreate it with the new mount.
+5. Running from a source checkout without Docker pulls the code and reports that a restart is required. Restart the server process to apply it.
+
+The repository URL and branch are remembered after the first successful update. The updater refuses to overwrite uncommitted local changes unless you confirm the overwrite in the UI.
 
 Before updating, check:
 
 - The repository URL and default branch.
 - For a PAT: the token is entered in Dok Settings, never in a URL.
 - For SSH: a deploy key is added to the repository and the private key is available to the container user.
-- The source checkout is writable (bind mount or root container) if you want in-app self-update.
+- The source checkout is writable by the container user (the included compose uses root inside the container).
+- Docker access is available if you want the in-app updater to rebuild and recreate the container.
 
 The included `.gitignore` keeps `data/`, `apps/`, `core/`, `sources/`, `uploads/`, and `node_modules/` out of the repository. A first push looks like this:
 

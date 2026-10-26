@@ -2314,6 +2314,141 @@ if (qs('#appsRefresh')) qs('#appsRefresh').addEventListener('click', loadApps);
 
 // ---------------- Settings ----------------
 let coreCfData = null;
+let updateWatcher = null;
+
+async function loadUpdateInfo() {
+  try {
+    const info = await api('/api/system/update-info');
+    const repo = qs('#updateRepo');
+    const branch = qs('#updateBranch');
+    const meta = qs('#updateMeta');
+    const btn = qs('#updateFromGitBtn');
+    if (repo && !repo.value) repo.value = info.repo || '';
+    if (branch && !branch.value) branch.value = info.branch || 'main';
+    if (btn) {
+      const label = info.docker ? 'Update & Restart' : 'Update from Git';
+      btn.dataset.label = label;
+      if (!btn.disabled) btn.textContent = label;
+    }
+    if (meta) {
+      if (info.commit) {
+        meta.textContent = `Current ${info.branch || 'HEAD'} ${info.commit}` +
+          (info.subject ? ` · ${info.subject}` : '') +
+          (info.dirty ? ' · local changes' : '');
+      } else {
+        meta.textContent = info.repo
+          ? 'No local checkout yet; the first update initializes it.'
+          : 'No repository configured.';
+      }
+    }
+    if (info.running && !updateWatcher) watchUpdateJob();
+  } catch {
+    // Settings still work when git is not available.
+  }
+}
+
+async function watchUpdateJob() {
+  const btn = qs('#updateFromGitBtn');
+  const out = qs('#updateOutput');
+  if (!btn) return;
+  if (updateWatcher) return updateWatcher;
+  updateWatcher = true;
+  setLoading(btn, true, 'Updating…');
+  if (out) {
+    out.classList.remove('hidden');
+    if (!out.textContent.trim()) out.textContent = 'Starting update…';
+  }
+  const started = Date.now();
+  try {
+    while (Date.now() - started < 15 * 60 * 1000) {
+      await new Promise(resolve => setTimeout(resolve, 3000));
+      let status;
+      try {
+        status = await api('/api/system/update-status');
+      } catch {
+        if (out) out.textContent += '\n\nWickedAFDok is restarting. Waiting for it to come back…';
+        await waitForReconnect(5 * 60 * 1000, 6000);
+        return;
+      }
+      if (out) {
+        out.textContent = `Update ${status.commit || ''} · ${status.phase || 'working'}\n\n${status.log || ''}`;
+        out.scrollTop = out.scrollHeight;
+      }
+      if (status.phase === 'error') {
+        toast(`Update failed: ${status.error || 'see the log'}`, true, 9000);
+        setLoading(btn, false, btn.dataset.label || 'Update from Git');
+        return;
+      }
+      if (status.phase === 'recreating' && !status.running) {
+        if (out) out.textContent += '\n\nContainer restarting. Waiting for WickedAFDok…';
+        await waitForReconnect(5 * 60 * 1000, 6000);
+        return;
+      }
+      if (!status.running && status.phase === 'idle') {
+        toast('Update finished');
+        setLoading(btn, false, btn.dataset.label || 'Update from Git');
+        return;
+      }
+    }
+    toast('Update is taking longer than expected', true, 9000);
+    setLoading(btn, false, btn.dataset.label || 'Update from Git');
+  } finally {
+    updateWatcher = null;
+  }
+}
+
+async function runGitUpdate(force = false) {
+  const btn = qs('#updateFromGitBtn');
+  const out = qs('#updateOutput');
+  setLoading(btn, true, 'Updating…');
+  if (out) {
+    out.textContent = 'Fetching from the repository…';
+    out.classList.remove('hidden');
+  }
+  try {
+    const res = await api('/api/system/update-from-git', jsonBody({
+      repo: qs('#updateRepo') ? qs('#updateRepo').value.trim() : '',
+      branch: qs('#updateBranch') ? qs('#updateBranch').value.trim() : '',
+      force
+    }));
+    const lines = [
+      res.upToDate
+        ? `Already up to date at ${res.commit}`
+        : `Updated ${res.previousCommit ? `${res.previousCommit} → ` : ''}${res.commit} (${res.branch})`,
+      res.subject || '',
+      '',
+      res.stdout || '',
+      res.stderr || '',
+      res.message || ''
+    ].filter(line => line !== '');
+    if (out) {
+      out.textContent = lines.join('\n');
+      out.scrollTop = out.scrollHeight;
+    }
+    if (res.running) {
+      watchUpdateJob();
+      return;
+    }
+    setLoading(btn, false, btn.dataset.label || 'Update from Git');
+    toast(res.message || 'Update complete', false, res.restartRequired ? 8000 : 3800);
+    loadUpdateInfo();
+  } catch (e) {
+    if (e.status === 409 && e.data?.dirty && !force) {
+      setLoading(btn, false, btn.dataset.label || 'Update from Git');
+      if (confirm('The source checkout has local changes. Overwrite them and continue?')) {
+        return runGitUpdate(true);
+      }
+      if (out) out.textContent = e.message;
+      return;
+    }
+    setLoading(btn, false, btn.dataset.label || 'Update from Git');
+    if (out) {
+      out.textContent = e.message + '\n' + (e.stdout || '') + (e.stderr || '');
+      out.classList.remove('hidden');
+    }
+    toast(e.message, true, 8000);
+  }
+}
 
 async function loadSettings() {
   try {
@@ -2346,6 +2481,7 @@ async function loadSettings() {
     loadAppLogChoices();
     loadGroups();
     loadRegistries();
+    loadUpdateInfo();
   } catch (e) {
     toast(e.message, true);
   }
@@ -2353,26 +2489,8 @@ async function loadSettings() {
 
 qs('#settingsRefresh').addEventListener('click', loadSettings);
 
-if (qs('#tempUpdateBtn')) {
-  qs('#tempUpdateBtn').addEventListener('click', async () => {
-    const btn = qs('#tempUpdateBtn');
-    const out = qs('#updateOutput');
-    setLoading(btn, true, 'Updating…');
-    if (out) { out.textContent = 'Updating...'; out.classList.remove('hidden'); }
-    try {
-      const res = await api('/api/system/update-from-git', jsonBody({
-        repo: qs('#updateRepo') ? qs('#updateRepo').value.trim() : '',
-        branch: qs('#updateBranch') ? qs('#updateBranch').value.trim() : null
-      }));
-      if (out) out.textContent = (res.stdout || '') + (res.stderr || '');
-      toast('Update pulled');
-    } catch (e) {
-      if (out) out.textContent = e.message + '\n' + (e.stdout || '') + (e.stderr || '');
-      toast(e.message, true);
-    } finally {
-      setLoading(btn, false, 'Update from Git');
-    }
-  });
+if (qs('#updateFromGitBtn')) {
+  qs('#updateFromGitBtn').addEventListener('click', () => runGitUpdate(false));
 }
 
 let coreNginxData = null;
