@@ -2607,6 +2607,7 @@ async function loadSettings() {
     loadCoreCloudflared();
     loadCoreAuth();
     loadCoreAuthelia();
+    loadCoreMail();
     loadCoreDns();
     loadCoreHelper();
     loadCoreOpencode();
@@ -3142,6 +3143,7 @@ if (qs('#registryKind')) {
 let coreAuthData = null;
 let coreAutheliaData = null;
 let coreDnsData = null;
+let coreMailData = null;
 let coreHelperData = null;
 let serverLogsTimer = null;
 let appLogsTimer = null;
@@ -3192,6 +3194,42 @@ async function loadCoreAuthelia() {
       qs('#autheliaProtected').textContent = `Protected apps: ${hosts.length ? hosts.join(', ') : 'none'}`;
     }
     if (qs('#autheliaComposeEditor') && res.compose) qs('#autheliaComposeEditor').value = res.compose;
+  } catch {}
+}
+
+async function loadCoreMail() {
+  try {
+    const res = await api('/api/core/mail');
+    coreMailData = res;
+    const smtp = res.smtp || {};
+    if (qs('#mailSmtpHost')) qs('#mailSmtpHost').value = smtp.host || '';
+    if (qs('#mailSmtpPort')) qs('#mailSmtpPort').value = smtp.port || 587;
+    if (qs('#mailSmtpTls')) qs('#mailSmtpTls').value = smtp.tls || 'starttls';
+    if (qs('#mailSmtpUser')) qs('#mailSmtpUser').value = smtp.username || '';
+    if (qs('#mailSmtpSender')) qs('#mailSmtpSender').value = smtp.sender || '';
+    if (qs('#mailSmtpPassword')) {
+      qs('#mailSmtpPassword').value = '';
+      qs('#mailSmtpPassword').placeholder = smtp.passwordSet
+        ? 'Password saved (leave blank to keep)'
+        : 'Password (stored encrypted)';
+    }
+    if (qs('#mailStatus')) {
+      const target = smtp.host
+        ? `${smtp.host}:${smtp.port} (${smtp.tls === 'none' ? 'no TLS' : smtp.tls === 'tls' ? 'TLS' : 'STARTTLS'})`
+        : '';
+      const authelia = res.authelia?.installed ? 'Authelia notifications use it.' : 'Launch Authelia to use it.';
+      qs('#mailStatus').textContent = smtp.host
+        ? `SMTP: ${target}${smtp.passwordSet ? ' · password saved' : ''} · ${authelia}`
+        : 'SMTP: not configured · Authelia writes notifications to /config/notifications.txt';
+    }
+    setCoreSections('mailpit', res.exists);
+    if (qs('#mailpitStatus')) qs('#mailpitStatus').textContent = `Mailpit status: ${res.state || (res.running ? 'running' : 'stopped')}`;
+    if (qs('#mailpitSmtpPort')) qs('#mailpitSmtpPort').value = res.settings?.smtpPort || 1025;
+    if (qs('#mailpitWebPort')) qs('#mailpitWebPort').value = res.settings?.webPort || 8025;
+    if (qs('#mailpitMaxMessages')) qs('#mailpitMaxMessages').value = res.settings?.maxMessages || 500;
+    if (qs('#mailpitDomain')) qs('#mailpitDomain').value = res.settings?.domain || '';
+    if (qs('#mailpitDomainManage')) qs('#mailpitDomainManage').value = res.settings?.domain || '';
+    if (qs('#mailpitComposeEditor') && res.compose) qs('#mailpitComposeEditor').value = res.compose;
   } catch {}
 }
 
@@ -3711,6 +3749,114 @@ if (qs('#autheliaSyncBtn')) {
       toast(e.message, true);
     } finally {
       setLoading(btn, false);
+    }
+  });
+}
+
+if (qs('#mailSmtpTls')) {
+  // Keep the port in step with the transport unless the user typed a custom one.
+  qs('#mailSmtpTls').addEventListener('change', () => {
+    const port = qs('#mailSmtpPort');
+    if (!port || ![587, 465, 1025].includes(Number(port.value))) return;
+    const mode = qs('#mailSmtpTls').value;
+    port.value = mode === 'tls' ? 465 : mode === 'none' ? 1025 : 587;
+  });
+}
+
+if (qs('#mailSaveSmtp')) {
+  qs('#mailSaveSmtp').addEventListener('click', async () => {
+    const btn = qs('#mailSaveSmtp');
+    setLoading(btn, true);
+    try {
+      const res = await api('/api/core/mail/smtp', jsonBody({
+        host: qs('#mailSmtpHost')?.value.trim() || '',
+        port: Number(qs('#mailSmtpPort')?.value || 587),
+        tls: qs('#mailSmtpTls')?.value || 'starttls',
+        username: qs('#mailSmtpUser')?.value.trim() || '',
+        password: qs('#mailSmtpPassword')?.value || '',
+        sender: qs('#mailSmtpSender')?.value.trim() || ''
+      }));
+      if (qs('#mailMsg')) qs('#mailMsg').textContent = res.message || '';
+      toast(res.message || 'SMTP settings saved', false, 12000);
+      await loadCoreMail();
+    } catch (e) {
+      toast(e.message, true);
+    } finally {
+      setLoading(btn, false, 'Save SMTP');
+    }
+  });
+}
+
+if (qs('#mailUseMailpit')) {
+  qs('#mailUseMailpit').addEventListener('click', async () => {
+    const btn = qs('#mailUseMailpit');
+    setLoading(btn, true);
+    try {
+      const res = await api('/api/core/mail/use-mailpit', { method: 'POST' });
+      if (qs('#mailMsg')) qs('#mailMsg').textContent = res.message || '';
+      toast(res.message || 'Mailpit started', false, 12000);
+      await loadCoreMail();
+    } catch (e) {
+      toast(e.message, true);
+    } finally {
+      setLoading(btn, false, 'Use Mailpit');
+    }
+  });
+}
+
+if (qs('#mailpitRunBtn')) {
+  qs('#mailpitRunBtn').addEventListener('click', async () => {
+    const btn = qs('#mailpitRunBtn');
+    setLoading(btn, true);
+    try {
+      const res = await api('/api/core/mailpit/run', jsonBody({
+        smtpPort: Number(qs('#mailpitSmtpPort')?.value || 1025),
+        webPort: Number(qs('#mailpitWebPort')?.value || 8025),
+        maxMessages: Number(qs('#mailpitMaxMessages')?.value || 500),
+        domain: qs('#mailpitDomain')?.value.trim() || ''
+      }));
+      if (qs('#mailpitMsg')) qs('#mailpitMsg').textContent = res.message || '';
+      toast(res.message || 'Mailpit launched', false, 12000);
+      await loadCoreMail();
+    } catch (e) {
+      toast(e.message, true);
+    } finally {
+      setLoading(btn, false, 'Launch Mailpit');
+    }
+  });
+}
+if (qs('#mailpitEditCompose')) qs('#mailpitEditCompose').addEventListener('click', () => { qs('#mailpitComposeEditor').classList.remove('hidden'); qs('#mailpitEditorActions').classList.remove('hidden'); });
+if (qs('#mailpitEditComposeManage')) qs('#mailpitEditComposeManage').addEventListener('click', () => { qs('#mailpitComposeEditor').classList.remove('hidden'); qs('#mailpitEditorActions').classList.remove('hidden'); });
+if (qs('#mailpitCancelCompose')) qs('#mailpitCancelCompose').addEventListener('click', () => { qs('#mailpitComposeEditor').classList.add('hidden'); qs('#mailpitEditorActions').classList.add('hidden'); });
+if (qs('#mailpitSaveCompose')) {
+  qs('#mailpitSaveCompose').addEventListener('click', async () => {
+    try {
+      await api('/api/core/mailpit/compose', jsonBody({ compose: qs('#mailpitComposeEditor').value }));
+      qs('#mailpitComposeEditor').classList.add('hidden');
+      qs('#mailpitEditorActions').classList.add('hidden');
+      toast('Mailpit compose saved');
+    } catch (e) { toast(e.message, true); }
+  });
+}
+if (qs('#mailpitStartBtn')) qs('#mailpitStartBtn').addEventListener('click', () => coreServiceAction('mailpit', 'start', qs('#mailpitStartBtn'), loadCoreMail));
+if (qs('#mailpitStopBtn')) qs('#mailpitStopBtn').addEventListener('click', () => coreServiceAction('mailpit', 'stop', qs('#mailpitStopBtn'), loadCoreMail));
+if (qs('#mailpitRestartBtn')) qs('#mailpitRestartBtn').addEventListener('click', () => coreServiceAction('mailpit', 'restart', qs('#mailpitRestartBtn'), loadCoreMail));
+if (qs('#mailpitOpenBtn')) qs('#mailpitOpenBtn').addEventListener('click', () => window.open(coreMailData?.url || 'http://localhost:8025', '_blank'));
+if (qs('#mailpitApplyDomain')) {
+  qs('#mailpitApplyDomain').addEventListener('click', async () => {
+    const btn = qs('#mailpitApplyDomain');
+    const msg = qs('#mailpitDomainMsg');
+    setLoading(btn, true, 'Applying…');
+    try {
+      const res = await api('/api/core/mailpit/domain', jsonBody({ domain: qs('#mailpitDomainManage')?.value.trim() || '' }));
+      if (msg) msg.textContent = res.domain ? `Applied ${res.domain}${res.restarted ? ' · container recreated' : ' · restart to apply'}` : 'Domain cleared';
+      toast(res.domain ? `Mailpit domain set to ${res.domain}` : 'Mailpit domain cleared');
+      await loadCoreMail();
+    } catch (e) {
+      if (msg) msg.textContent = e.message;
+      toast(e.message, true);
+    } finally {
+      setLoading(btn, false, 'Apply domain');
     }
   });
 }

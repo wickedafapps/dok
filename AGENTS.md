@@ -32,7 +32,8 @@ docker run -d --name wickedafdok -p 8080:8080 \
 ```
 
 **Notes on startup:**
-- `start.sh` prefers the managed compose at `data/wickedafdok/docker-compose.yml` if it exists; otherwise uses root `docker-compose.yml`. It ignores legacy managed files whose bind sources are container-local `/app/...` paths
+- `start.sh` prefers the managed compose at `data/wickedafdok/docker-compose.yml` if it exists; otherwise uses root `docker-compose.yml`. It ignores legacy managed files whose bind sources are container-local `/app/...` paths. In the managed-compose path it rebuilds the referenced image from the checkout when a `Dockerfile` is present (the generated compose has no build context), so `git pull` still reaches a self-recreated container
+- The Compose project is pinned to `wickedafdok` (top-level `name:` plus `-p wickedafdok` in `start.sh`) so a checkout directory such as `Dok` cannot create a separate `dok` project for the same container. `wickedafdok` remains the internal container/image/managed-data identifier for compatibility with existing installs even when the product is called Dok
 - `start.sh` generates a small `docker-compose.socket-gid.yml` override from the live Docker socket GID on every start and passes it with `-f`, so a changed socket group does not leave the container unable to reach Docker. The self-recreate helper does the same before recreating the container.
 - Root `docker-compose.yml` declares the `wicked` network as external. `setup.sh` creates it, and `start.sh` also creates it when missing, so `docker compose up` directly requires setup first
 - `start.sh` honors a custom `DOCKER_SOCK` by exporting `DOCKER_HOST=unix://...` when `DOCKER_HOST` is not already set
@@ -56,7 +57,7 @@ docker run -d --name wickedafdok -p 8080:8080 \
 │   ├── css/style.css    # Styles
 │   └── js/app.js        # Frontend logic
 ├── apps/                # Deployed apps (each app in its own subdirectory with compose)
-├── core/                # Core services (nginx-proxy, cloudflared, authentik, dns, host-helper)
+├── core/                # Core services (nginx-proxy, cloudflared, authentik, authelia, dns, mailpit, host-helper)
 ├── data/                # Persistent data (registry, settings, backups, logs, managed compose)
 │   ├── registries.json  # Encrypted registry and git connection credentials
 │   ├── .credentials-key # 0600 AES-256-GCM key used for registry and settings secrets
@@ -189,7 +190,7 @@ The **Core Services** subtab manages the bundled services.
 - Uses `jwilder/nginx-proxy` style setup
 - Managed compose stored in `core/nginx-proxy/docker-compose.yml`
 - `GET /api/core/nginx-proxy` reports both `exists`/`running` (live Docker state) and `installed`/`composeExists` (compose file on disk). Reading status never creates the compose file, so a fresh install stays "not created" until the user launches nginx-proxy. The UI treats `installed` as authoritative so a transient Docker/API failure cannot flip a running nginx-proxy back to "not installed"; failed lookups keep the last known state
-- Compose reads are capped at 2 MB. A managed nginx-proxy compose that grows past the cap is renamed to `docker-compose.yml.corrupt-<timestamp>` and regenerated from saved settings, so status/sync/launch recover instead of failing with `Invalid string length`
+- Compose reads are capped at 2 MB. A managed core-service compose that grows past the cap is renamed to `<name>.corrupt-<timestamp>` and treated as absent, so status/sync/launch recover and regenerate it from saved settings instead of failing with `Invalid string length`. `readManagedCompose()` applies this to nginx-proxy, cloudflared, Authentik, Authelia, Technitium, and Mailpit
 
 **cloudflared (managed):**
 - Create/run/edit Cloudflare Tunnel via UI
@@ -219,6 +220,16 @@ The **Core Services** subtab manages the bundled services.
 - Admin password is generated when blank
 - Optional GUI domain stored as `services.technitium.domain`; the managed compose adds `VIRTUAL_HOST`/`VIRTUAL_PORT=5380`. The manage view exposes the same **Apply domain** action as Authentik.
 - Managed compose stored in `core/dns/docker-compose.yml`
+
+**Email / Mailpit (managed):**
+- One card covers outgoing SMTP (`services.mail`) and the optional Mailpit capture sink (`services.mailpit`)
+- `services.mail` is provider-agnostic: `host`, `port`, `tls` (`none` | `starttls` | `tls`), `username`, `password`, `sender`, `identifier`. A blank `host` disables SMTP and leaves Authelia on the filesystem notifier
+- The password is AES-256-GCM encrypted in `data/settings.json`, redacted as `passwordSet`, and a blank password field keeps the saved one
+- Authelia's generated `configuration.yml` emits `notifier.smtp` from these settings: `tls` maps to the `submissions://` (implicit TLS), `submission://` (STARTTLS), or `smtp://` scheme, and `none` adds `disable_require_tls` (not `disable_starttls`, which Authelia flags as a plaintext warning). With `host: mailpit`, `disable_startup_check` is on so a stopped test sink cannot stop Authelia (and every protected app) from starting
+- `services.mailpit`: `smtpPort` (default `1025`), `webPort` (default `8025`), `maxMessages` (default `500`), optional `domain`. The managed compose publishes both ports, mounts `core/mailpit/data`, and runs on `wicked`; a domain adds `VIRTUAL_HOST`/`VIRTUAL_PORT=8025`
+- Mailpit is a capture sink only. It stores messages for inspection in its web UI and never delivers or receives internet mail; it is not a mailbox server
+- **Use Mailpit** launches the sink and points `services.mail` at `mailpit:1025` with no TLS in one step
+- Managed compose stored in `core/mailpit/docker-compose.yml`; settings are applied to Authelia immediately (config written, restart only if the content changed)
 
 **Host Helper (optional):**
 - Privileged companion container running `server/host-agent.js`
@@ -299,6 +310,10 @@ The **Core Services** subtab manages the bundled services.
 - `GET /api/core/auth` / `POST /api/core/auth/compose` / `POST /api/core/auth/run` / `POST /api/core/auth/domain` / `POST /api/core/auth/apply` - Authentik status, compose, launch, GUI domain, and apply `ENABLE_AUTH` to selected containers
 - `GET /api/core/authelia` / `POST /api/core/authelia/compose` / `POST /api/core/authelia/run` / `POST /api/core/authelia/domain` / `POST /api/core/authelia/sync` - Authelia status, compose, launch, portal domain, ENABLE_AUTH vhost sync
 - `GET /api/core/dns` / `POST /api/core/dns/compose` / `POST /api/core/dns/run` / `POST /api/core/dns/domain` - Technitium status, compose, launch, GUI domain
+- `GET /api/core/mail` - SMTP settings (redacted), Mailpit status/compose, and the resolved Authelia notifier address
+- `POST /api/core/mail/smtp` - Save SMTP delivery settings and apply them to Authelia
+- `POST /api/core/mail/use-mailpit` - Launch Mailpit and point notifications at `mailpit:1025`
+- `GET /api/core/mailpit` / `POST /api/core/mailpit/compose` / `POST /api/core/mailpit/run` / `POST /api/core/mailpit/domain` - Mailpit status, compose, launch, GUI domain
 - `GET /api/core/host-helper` / `POST /api/core/host-helper/compose` / `POST /api/core/host-helper/run` - Host helper status, compose, launch
 - `POST /api/core/all/:action(start|stop|restart)` - Apply an action to every created core service
 - `POST /api/core/:service/:action(start|stop|restart)` - Apply an action to one core service
@@ -410,7 +425,7 @@ The **Core Services** subtab manages the bundled services.
 - `syncAuthVhosts()` writes `<host>` (server scope: `location = /authelia` proxying to `http://authelia:9091/api/authz/auth-request` with `X-Original-URL`/`X-Forwarded-*`) and `<host>_location` (`auth_request /authelia`, forwards `Remote-User`, `Remote-Groups`, `Remote-Name`, `Remote-Email`, `Remote-Status`, and `error_page 401 =302 https://<portal>/?rd=$target_url`). Only files starting with `# managed-by: wickedafdok:authelia` are pruned
 - Protected hosts must share the portal's cookie domain (`app.example.com` and `auth.example.com` → `example.com`); hosts under a different parent are skipped (`skippedHosts` in the state file, plus a server warning) because the portal cannot set a session cookie for another parent. Cookie domains use the last two labels, so multi-level public suffixes such as `co.uk` are not handled specially
 - Wildcard/regexp `VIRTUAL_HOST` patterns are skipped: nginx-proxy uses different file naming for its server and location scopes, so pattern hosts have no reliable per-vhost hook. List the literal hostnames on the container instead
-- The protected-host set and cookie domains are cached in `core/nginx-proxy/vhost.d/.wickedafdok-auth.json`. Stale host files are removed, nginx-proxy is restarted when the files change (docker-gen only re-renders on container events and checks vhost files at render time, so a plain reload would miss newly protected hosts), and Authelia's `configuration.yml` is rewritten only when the cookie-domain set changes; a restart follows only when the file content actually changed
+- The protected-host set and cookie domains are cached in `core/nginx-proxy/vhost.d/.wickedafdok-auth.json`. Stale host files are removed, nginx-proxy is restarted when the files change (docker-gen only re-renders on container events and checks vhost files at render time, so a plain reload would miss newly protected hosts), and Authelia's `configuration.yml` is rewritten only when the cookie-domain set or the mail-settings fingerprint changes (the fingerprint is stored in the same state file); a restart follows only when the file content actually changed. SMTP settings are therefore never lost on a 60 s sync, and changing them takes effect without waiting for a cookie-domain change
 - Sync runs on server start, every 60 s (unref'd timer), after app deploy/start/stop/restart, after `POST /api/core/nginx-proxy/run`, and from the Authelia run/domain/sync routes
 - nginx-proxy's managed compose mounts the host-resolved core directory (`selfMountSource('/app/core')`, then `nginx-proxy/vhost.d` and `nginx-proxy/certs:ro`), and Authelia mounts the host-resolved `authelia/config`. Relative bind sources would be resolved on the Docker daemon host (e.g. `/app/core/...`) and silently mount empty directories; existing managed composes are patched in place with `setMountSource()`. `ensureNginxProxyCompose()` upgrades older composes on `GET /api/core/nginx-proxy` and during sync, and recreates a live nginx-proxy once if its container is missing either mount. Without the certs, the https server blocks fail their TLS handshake and never reach the auth check
 - Authelia 4.39 schema traps: `identity_validation.reset_password.jwt_secret` is required (and `.disable` is rejected); `session.cookies[].secure` is rejected; `authelia_url` must be https; a cookie `domain` needs a dot or an IP; the top-level `default_redirection_url` cannot be combined with `session.cookies`, so it is emitted per cookie; `authelia hash-password` is gone in favor of `authelia crypto hash generate argon2`
@@ -458,7 +473,7 @@ The **Core Services** subtab manages the bundled services.
 - The Host Helper is optional and privileged. Without it, host paths outside the runtime directories must be writable by the server UID/GID.
 - Authentik is launched as a standalone SSO service. Per-app forward-auth/proxy providers still need to be configured in Authentik and the fronting proxy; WickedAFDok does not automatically enable auth for every app.
 - Self-update requires a writable persistent application code checkout. The default image bakes source into `/app` and runs as non-root in common deployments, so an in-app update is lost on container recreation unless `/app` (with `node_modules`) is bind-mounted; otherwise update on the host with `git pull` and rebuild via `./start.sh`.
-- Service secrets in `data/settings.json` (cloudflared token, Authentik and Authelia passwords/keys, Technitium admin password, OpenCode API key) are AES-256-GCM encrypted with `data/.credentials-key`. `readSettings()` decrypts for internal use, `writeSettings()` encrypts, and API responses redact values while exposing `*Set` flags. Legacy plaintext values are encrypted on the first start. Registry and git connection secrets use the same key; losing that key makes the stored secrets unrecoverable (delete and re-enter them).
+- Service secrets in `data/settings.json` (cloudflared token, Authentik and Authelia passwords/keys, Technitium admin password, SMTP password, OpenCode API key) are AES-256-GCM encrypted with `data/.credentials-key`. `readSettings()` decrypts for internal use, `writeSettings()` encrypts, and API responses redact values while exposing `*Set` flags. Legacy plaintext values are encrypted on the first start. Registry and git connection secrets use the same key; losing that key makes the stored secrets unrecoverable (delete and re-enter them).
 - OpenCode is installed during the Docker image build. Existing deployments must rebuild the image to add it, and the build needs network access to `opencode.ai`/GitHub releases. Set `OPENCODE_BIN` to use a local binary during development.
 - User mode is a permission guardrail for the AI agent, not an OS sandbox. It runs as the same container user as Admin mode, so a determined command can still reach files or binaries the Unix user can access. Shell sessions are not restricted at all. Use a separate container/user for hard isolation.
 - The browser terminal and OpenCode sessions are protected only by the same (currently absent) authentication as the rest of the UI. Anyone who can reach the UI can open an Admin shell; keep it behind a trusted network or authenticated reverse proxy. A reverse proxy must forward WebSocket upgrades for `/api/terminal/ws`.
@@ -486,7 +501,7 @@ The **Core Services** subtab manages the bundled services.
 - Notices: `#appCfgNetworkNotice`, `#appCfgVolumeNotice`, `#appCreationNginxNotice`, `#appCreationNginxNoticeModal`
 - Modals: `#composeEditWarningModal`, `#composeSaveConfirmModal`, `#appOverwriteModal`, `#authContainersModal`, `#designerModal`
 - Apps List: `#appsList`, `#appsRefresh`
-- Settings: `#tab-settings`, `#settingsSubtabs`, `#settings-pane-core`, `#settings-pane-dok`, `#settings-pane-logs`, `#settings-pane-backups`, `#coreAllStart`, `#coreAllStop`, `#coreAllRestart`, `#nginxNetwork`, `#runNginxProxyCore`, `#authRunBtn`, `#dnsRunBtn`, `#helperRunBtn`
+- Settings: `#tab-settings`, `#settingsSubtabs`, `#settings-pane-core`, `#settings-pane-dok`, `#settings-pane-logs`, `#settings-pane-backups`, `#coreAllStart`, `#coreAllStop`, `#coreAllRestart`, `#nginxNetwork`, `#runNginxProxyCore`, `#authRunBtn`, `#dnsRunBtn`, `#mailSmtpHost`, `#mailSmtpPort`, `#mailSmtpTls`, `#mailSmtpUser`, `#mailSmtpPassword`, `#mailSmtpSender`, `#mailSaveSmtp`, `#mailUseMailpit`, `#mailStatus`, `#mailpitRunBtn`, `#mailpitStatus`, `#mailpitOpenBtn`, `#helperRunBtn`
 - Designer: `#openDesigner`, `#designerName`, `#designerTagline`, `#designerCss`, `#designerLogoFile`, `#designerLogoUpload`, `#designerLogoRemove`, `#designerFilePath`, `#designerFileContent`, `#designerFileSave`
 - Auth picker: `#authContainersList`, `#authApplySelected`, `#authSelectAll`, `#authSelectNone`, `#authApplyMsg`
 - Dok Settings: `#groupName`, `#groupContainers`, `#saveGroup`, `#groupsList`, `#registryKind`, `#registryProvider`, `#registryName`, `#registryHost`, `#registryUsername`, `#registrySecret`, `#saveRegistry`, `#cancelRegistryEdit`, `#registriesRefresh`, `#registriesList`

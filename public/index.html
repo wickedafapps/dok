@@ -456,6 +456,69 @@
           </div>
         </div>
 
+        <div class="card" id="coreMailCard">
+          <h3>Email <span class="muted">(SMTP + Mailpit)</span></h3>
+          <p class="muted">Outgoing mail for Authelia notifications. Point it at a real SMTP provider, or launch the built-in Mailpit sink to capture reset and alert mail locally. Mailpit only stores messages for inspection; it never delivers them and is not a mailbox server.</p>
+          <div class="row">
+            <input id="mailSmtpHost" class="input flex" placeholder="SMTP host, e.g. smtp.example.com or mailpit">
+            <input id="mailSmtpPort" class="input" type="number" min="1" max="65535" placeholder="Port" value="587">
+            <select id="mailSmtpTls" class="input">
+              <option value="starttls">STARTTLS</option>
+              <option value="tls">TLS (port 465)</option>
+              <option value="none">No TLS</option>
+            </select>
+          </div>
+          <div class="row">
+            <input id="mailSmtpUser" class="input" placeholder="Username (optional)">
+            <input id="mailSmtpPassword" class="input" type="password" placeholder="Password (stored encrypted)">
+            <input id="mailSmtpSender" class="input flex" type="email" placeholder="From address, e.g. dok@example.com">
+          </div>
+          <div class="row">
+            <button id="mailSaveSmtp" class="btn btn-primary">Save SMTP</button>
+            <button id="mailUseMailpit" class="btn">Use Mailpit</button>
+            <span id="mailMsg" class="muted"></span>
+          </div>
+          <p class="muted" id="mailStatus">SMTP: not configured · Authelia writes notifications to /config/notifications.txt</p>
+
+          <div class="row" style="margin-top:18px">
+            <strong>Mailpit</strong>
+            <span class="muted">local test sink · SMTP <code>mailpit:1025</code></span>
+          </div>
+          <div id="mailpitCreateSection">
+            <div class="row">
+              <input id="mailpitSmtpPort" class="input" type="number" min="1" max="65535" placeholder="SMTP port" value="1025">
+              <input id="mailpitWebPort" class="input" type="number" min="1" max="65535" placeholder="Web port" value="8025">
+              <input id="mailpitMaxMessages" class="input" type="number" min="50" max="50000" placeholder="Max messages" value="500">
+              <input id="mailpitDomain" class="input flex" placeholder="GUI domain, e.g. mail.example.com (optional)">
+            </div>
+            <div class="row">
+              <button id="mailpitEditCompose" class="btn">Edit compose</button>
+              <button id="mailpitRunBtn" class="btn btn-primary">Launch Mailpit</button>
+              <span id="mailpitMsg" class="muted"></span>
+            </div>
+          </div>
+          <div id="mailpitManageSection" class="hidden">
+            <div class="row">
+              <span class="muted" id="mailpitStatus">Mailpit status: —</span>
+              <button id="mailpitStartBtn" class="btn">Start</button>
+              <button id="mailpitStopBtn" class="btn">Stop</button>
+              <button id="mailpitRestartBtn" class="btn">Restart</button>
+              <button id="mailpitEditComposeManage" class="btn">Edit compose</button>
+              <button id="mailpitOpenBtn" class="btn">Open Mailpit</button>
+            </div>
+            <div class="row">
+              <input id="mailpitDomainManage" class="input flex" placeholder="GUI domain, e.g. mail.example.com">
+              <button id="mailpitApplyDomain" class="btn">Apply domain</button>
+              <span id="mailpitDomainMsg" class="muted"></span>
+            </div>
+          </div>
+          <textarea id="mailpitComposeEditor" class="textarea code tall hidden"></textarea>
+          <div class="row hidden" id="mailpitEditorActions">
+            <button id="mailpitSaveCompose" class="btn btn-primary">Save compose</button>
+            <button id="mailpitCancelCompose" class="btn">Cancel</button>
+          </div>
+        </div>
+
         <div class="card" id="coreDnsCard">
           <h3>DNS <span class="muted">(Technitium DNS)</span></h3>
           <p class="muted">Optional local DNS and ad blocking. Technitium provides a web console for zones, records, and blocklists.</p>

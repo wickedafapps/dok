@@ -24,6 +24,8 @@ Or with docker compose:
 docker compose up -d --build
 ```
 
+The Compose project name is pinned to the existing internal identifier `wickedafdok`, so the checkout directory does not matter (a clone in `Dok/` still uses that project). Run Compose commands from the checkout without `-p dok`.
+
 Open `http://localhost:8080`. The UI has no built-in login — put it behind a reverse proxy if exposed. The optional Authelia core service protects apps behind nginx-proxy; it does not gate the WickedAFDok UI itself.
 
 ## Highlights
@@ -83,11 +85,11 @@ Before updating, check:
 The included `.gitignore` keeps `data/`, `apps/`, `core/`, `sources/`, `uploads/`, and `node_modules/` out of the repository. A first push looks like this:
 
 ```bash
-cd wickedafdok
+cd Dok
 git init -b main
 git add .
-git commit -m "Initial WickedAFDok"
-git remote add origin https://github.com/<account>/wickedafdok.git
+git commit -m "Initial commit"
+git remote add origin https://github.com/<account>/dok.git
 git push -u origin main
 ```
 
@@ -107,7 +109,18 @@ The Authelia card also lists the protected hosts, allows changing the portal dom
 
 The session cookie is scoped to the shared parent domain (for example `example.com`), so keep the portal and protected apps under the same parent and always reach them over HTTPS. Apps under an unrelated parent are skipped (the sync result names them) because the portal cannot set a cookie for them.
 
-WickedAFDok generates `core/authelia/config/configuration.yml` and `users.yml` from the portal domain and the protected hosts. The periodic sync leaves manual edits alone unless the cookie-domain set changes; **Launch Authelia** and **Apply domain** regenerate the files, so put persistent customizations in the managed compose or back up those files first.
+WickedAFDok generates `core/authelia/config/configuration.yml` and `users.yml` from the portal domain, the protected hosts, and the Email card's SMTP settings. The periodic sync leaves manual edits alone unless one of those inputs changes; **Launch Authelia** and **Apply domain** regenerate the files, so put persistent customizations in the managed compose or back up those files first.
+
+## Email notifications
+
+Settings → Core Services has an **Email** card. It controls outgoing mail for Authelia (password resets and alerts) and can run Mailpit, a local capture sink.
+
+- **Mailpit** (recommended first step): click **Use Mailpit**. Dok launches one small container (`axllent/mailpit`), publishes SMTP on `1025` and the web UI on `8025`, and points Authelia at `mailpit:1025`. Messages are captured, not delivered, so open the Mailpit UI to read them. It is a testing tool, not a mailbox server, and it cannot receive internet mail.
+- **Real delivery**: enter your provider's SMTP host, port, TLS mode, username, password, and a From address, then **Save SMTP**. Authelia's `notifier.smtp` is regenerated from these settings, and the container restarts only when the config actually changed. The password is encrypted in `data/settings.json`; leaving the field blank keeps the saved one.
+
+Other containers reach Mailpit at `mailpit:1025` on the `wicked` network; the published ports are for host tools and the browser. Set a GUI domain on the Mailpit block to serve its UI through nginx-proxy, or leave it on the LAN.
+
+Running a real mail server for your own mailboxes needs inbound port 25, a static IP, and reverse DNS, which most residential connections do not provide. Use a hosted mailbox provider for real inboxes and keep Mailpit for testing; Dok's SMTP settings work the same either way.
 
 ## Browser terminal and OpenCode
 
