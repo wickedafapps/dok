@@ -4395,8 +4395,13 @@ async function loadDesignerFiles() {
     select.innerHTML = files.length
       ? files.map(item => `<option value="${escapeHtml(item.rel)}">${escapeHtml(item.rel)}</option>`).join('')
       : '<option value="">No editable files found</option>';
+    // Open a customizable error page by default instead of the compose file.
+    const preferred = files.find(item => item.rel === 'html/404.html')?.rel ||
+      files.find(item => item.rel.startsWith('html/'))?.rel ||
+      files[0]?.rel || '';
     if (current && files.some(item => item.rel === current)) select.value = current;
-    if (qs('#designerFilePath') && select.value) await loadDesignerFile(select.value);
+    else if (preferred) select.value = preferred;
+    if (select.value) await loadDesignerFile(select.value);
   } catch (e) {
     toast(e.message, true);
   }

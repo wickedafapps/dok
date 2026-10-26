@@ -158,6 +158,8 @@ Settings is split into four subtabs: **Core Services**, **Dok Settings**, **Logs
 - Stores `designer.name`, `designer.tagline`, `designer.css`, and `designer.logo` in `data/settings.json`; uploaded logos live under `data/designer/`
 - `GET/POST /api/designer`, `POST /api/designer/logo`, `GET /api/designer/logo`
 - Name, tagline, and CSS are applied live to the header; the CSS override is injected as a `<style>` element
+- Bundled error pages live in `core/nginx-proxy/html/` (`html/404.html`, `html/403.html`, `html/errors/50x.html`) and are mounted at `/usr/share/nginx/html` in nginx-proxy. `core/nginx-proxy/vhost.d/default` (created only when absent) sets `proxy_intercept_errors`/`error_page` to those files. Existing pages and configs are never overwritten
+- The file picker opens `html/404.html` by default and lists error pages before vhost snippets and the compose file
 - `GET /api/designer/files`, `GET /api/designer/file?path=`, and `POST /api/designer/file` expose editable text files under `core/nginx-proxy` (error pages, vhost snippets, configs); dotfiles and private key/`.pem` files are excluded
 
 **Groups:**
@@ -186,7 +188,7 @@ The **Core Services** subtab manages the bundled services.
 - If domain configured for WickedAFDok in nginx settings, can trigger self-recreation to attach UI container to nginx network with `VIRTUAL_HOST`/`VIRTUAL_PORT` env vars
 - Uses `jwilder/nginx-proxy` style setup
 - Managed compose stored in `core/nginx-proxy/docker-compose.yml`
-- `GET /api/core/nginx-proxy` reports both `exists`/`running` (live Docker state) and `installed`/`composeExists` (compose file on disk). The UI treats `installed` as authoritative so a transient Docker/API failure cannot flip a running nginx-proxy back to "not installed"; failed lookups keep the last known state
+- `GET /api/core/nginx-proxy` reports both `exists`/`running` (live Docker state) and `installed`/`composeExists` (compose file on disk). Reading status never creates the compose file, so a fresh install stays "not created" until the user launches nginx-proxy. The UI treats `installed` as authoritative so a transient Docker/API failure cannot flip a running nginx-proxy back to "not installed"; failed lookups keep the last known state
 
 **cloudflared (managed):**
 - Create/run/edit Cloudflare Tunnel via UI

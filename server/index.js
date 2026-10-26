@@ -3051,6 +3051,7 @@ services:
       - /var/run/docker.sock:/tmp/docker.sock:ro
       - ${yamlScalar(`${base}vhost.d:/etc/nginx/vhost.d`)}
       - ${yamlScalar(`${base}certs:/etc/nginx/certs:ro`)}
+      - ${yamlScalar(`${base}html:/usr/share/nginx/html:ro`)}
 ${host ? `    environment:
       - ${yamlScalar(`DEFAULT_HOST=${host}`)}
 ` : ''}    restart: unless-stopped
@@ -3062,6 +3063,111 @@ networks:
     external: true
     name: ${yamlScalar(network)}
 `;
+}
+
+const NGINX_ERROR_PAGES_MARKER = '# managed-by: wickedafdok:error-pages';
+
+function nginxErrorPageHtml(code, heading, message) {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${code} — ${heading}</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: grid; place-items: center;
+    padding: 24px; color: #e8ecf4;
+    background: radial-gradient(1200px 600px at 20% -10%, #23324d 0%, transparent 60%),
+                radial-gradient(900px 500px at 110% 20%, #342347 0%, transparent 55%),
+                #0b0f17;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  }
+  main {
+    width: min(620px, 100%); padding: 40px; border: 1px solid rgba(255,255,255,.12);
+    border-radius: 20px; background: rgba(15,21,33,.82);
+    box-shadow: 0 24px 70px rgba(0,0,0,.45); text-align: center;
+  }
+  .code {
+    margin: 0 0 8px; font-size: clamp(48px, 12vw, 96px); line-height: 1;
+    font-weight: 800; letter-spacing: -.04em;
+    background: linear-gradient(135deg, #7dd3fc, #a78bfa 55%, #f472b6);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  h1 { margin: 0 0 12px; font-size: clamp(22px, 4vw, 30px); }
+  p { margin: 0; color: #a9b4c7; line-height: 1.6; }
+  .hint { margin-top: 24px; font-size: 13px; color: #78859b; }
+</style>
+</head>
+<body>
+<main>
+  <p class="code">${code}</p>
+  <h1>${heading}</h1>
+  <p>${message}</p>
+  <p class="hint">You can customize this page in WickedAFDok → Settings → Dok Settings → Designer.</p>
+</main>
+</body>
+</html>
+`;
+}
+
+// Seed editable error pages and the vhost snippet that tells nginx to use them.
+// Existing files are never overwritten, so user edits survive restarts.
+function ensureNginxErrorPages() {
+  const nginxDir = path.join(coreDir, 'nginx-proxy');
+  const htmlDir = path.join(nginxDir, 'html');
+  const errorsDir = path.join(htmlDir, 'errors');
+  const vhostDir = path.join(nginxDir, 'vhost.d');
+  for (const dir of [htmlDir, errorsDir, vhostDir]) {
+    try { fs.mkdirSync(dir, { recursive: true, mode: 0o755 }); } catch {}
+  }
+  const pages = [
+    ['404.html', nginxErrorPageHtml(404, 'Page not found', 'The page you requested does not exist or has moved.')],
+    ['403.html', nginxErrorPageHtml(403, 'Access denied', 'You do not have permission to view this page.')],
+    ['errors/50x.html', nginxErrorPageHtml('50x', 'Service unavailable', 'The service is temporarily unavailable. Please try again in a moment.')]
+  ];
+  for (const [rel, content] of pages) {
+    const target = path.join(htmlDir, rel);
+    if (fs.existsSync(target)) {
+      try { fs.chmodSync(target, 0o644); } catch {}
+      continue;
+    }
+    try {
+      fs.writeFileSync(target, content, { mode: 0o644 });
+      try { fs.chmodSync(target, 0o644); } catch {}
+    } catch {}
+  }
+  const defaultConfig = path.join(vhostDir, 'default');
+  if (fs.existsSync(defaultConfig)) {
+    try { fs.chmodSync(defaultConfig, 0o644); } catch {}
+  } else {
+    const config = `${NGINX_ERROR_PAGES_MARKER}
+# Edit the pages under html/ in Settings → Dok Settings → Designer.
+proxy_intercept_errors on;
+error_page 403 /403.html;
+error_page 404 /404.html;
+error_page 500 502 503 504 /50x.html;
+
+location = /403.html {
+    root /usr/share/nginx/html;
+    internal;
+}
+location = /404.html {
+    root /usr/share/nginx/html;
+    internal;
+}
+location = /50x.html {
+    root /usr/share/nginx/html/errors;
+    internal;
+}
+`;
+    try {
+      fs.writeFileSync(defaultConfig, config, { mode: 0o644 });
+      try { fs.chmodSync(defaultConfig, 0o644); } catch {}
+    } catch {}
+  }
 }
 
 function shellQuote(value) {
@@ -3822,6 +3928,7 @@ async function ensureNginxProxyCompose({ recreate = false } = {}) {
     fs.mkdirSync(path.join(dir, 'vhost.d'), { recursive: true });
     fs.mkdirSync(path.join(dir, 'certs'), { recursive: true });
   } catch {}
+  ensureNginxErrorPages();
   const composePath = path.join(dir, 'docker-compose.yml');
   let compose = '';
   try { compose = fs.readFileSync(composePath, 'utf-8'); } catch {}
@@ -3831,8 +3938,10 @@ async function ensureNginxProxyCompose({ recreate = false } = {}) {
   const nginxHostDir = path.join(coreHostDir, 'nginx-proxy');
   let next = setMountSource(compose, '/etc/nginx/vhost.d', path.join(nginxHostDir, 'vhost.d'));
   next = setMountSource(next, '/etc/nginx/certs', path.join(nginxHostDir, 'certs'));
-  if (!next.includes('/etc/nginx/vhost.d') || !next.includes('/etc/nginx/certs')) {
-    // Older managed composes have no vhost/certs volumes at all; regenerate
+  next = setMountSource(next, '/usr/share/nginx/html', path.join(nginxHostDir, 'html'));
+  if (!next.includes('/etc/nginx/vhost.d') || !next.includes('/etc/nginx/certs') ||
+      !next.includes('/usr/share/nginx/html')) {
+    // Older managed composes have no vhost/certs/error-page volumes; regenerate
     // the whole file from the saved nginx-proxy settings.
     const configured = readSettings().services?.nginxProxy || {};
     next = nginxProxyCompose(configured.network || 'wicked', configured.domain || '', nginxHostDir);
@@ -3843,18 +3952,21 @@ async function ensureNginxProxyCompose({ recreate = false } = {}) {
   if (recreate) {
     // Compose changes only take effect when the container is recreated. Patch
     // the compose silently on page loads, but fix a live old container here so
-    // existing installs pick up the vhost/certs mounts without user action.
+    // existing installs pick up the vhost/certs/error-page mounts without user
+    // action.
     try {
       const containers = await docker.listContainers({ all: false });
       const running = containers.some(c => (c.Names || []).some(n => n.replace(/^\//, '') === 'nginx-proxy'));
       if (running) {
         const info = await docker.getContainer('nginx-proxy').inspect();
         const destinations = (info.Mounts || []).map(m => m.Destination);
-        const missing = !destinations.includes('/etc/nginx/vhost.d') || !destinations.includes('/etc/nginx/certs');
+        const missing = !destinations.includes('/etc/nginx/vhost.d') ||
+          !destinations.includes('/etc/nginx/certs') ||
+          !destinations.includes('/usr/share/nginx/html');
         if (changed || missing) {
           await run('docker', ['compose', '-f', composePath, '-p', 'nginx-proxy', 'up', '-d', '--remove-orphans'], { cwd: dir });
           recreated = true;
-          appendServerLog('INFO', 'nginx-proxy recreated to mount the Authelia vhost and certificate directories');
+          appendServerLog('INFO', 'nginx-proxy recreated to mount the vhost, certificate, and error-page directories');
         }
       }
     } catch (e) {
@@ -6330,7 +6442,25 @@ app.get('/api/designer/files', (req, res) => {
       }
     };
     walk(base);
-    items.sort((a, b) => (a.type === b.type ? a.rel.localeCompare(b.rel) : a.type === 'dir' ? -1 : 1));
+    // Error pages come first so the Designer opens a page, not the compose
+    // file. Other files keep the existing alphabetical order.
+    const fileRank = (rel) => {
+      if (rel === 'html/404.html') return 0;
+      if (rel === 'html/403.html') return 1;
+      if (rel === 'html/errors/50x.html') return 2;
+      if (rel.startsWith('html/')) return 3;
+      if (rel.startsWith('vhost.d/')) return 4;
+      if (rel === 'docker-compose.yml' || rel === 'docker-compose.yaml') return 9;
+      return 5;
+    };
+    items.sort((a, b) => {
+      if (a.type !== b.type) return a.type === 'dir' ? -1 : 1;
+      if (a.type === 'file') {
+        const rank = fileRank(a.rel) - fileRank(b.rel);
+        if (rank) return rank;
+      }
+      return a.rel.localeCompare(b.rel);
+    });
     res.json({ root: 'core/nginx-proxy', items });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -6370,8 +6500,11 @@ app.post('/api/designer/file', (req, res) => {
       return res.status(400).json({ error: 'Only text configuration, HTML, CSS, JavaScript, JSON, and log files can be edited' });
     }
     fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.writeFileSync(target, content, { mode: 0o600 });
-    try { fs.chmodSync(target, 0o600); } catch {}
+    // nginx workers serve HTML and read vhost configs as a non-root user, so
+    // these files must stay world-readable. Paths are sandboxed above and
+    // private key files are rejected, so 0644 is safe here.
+    fs.writeFileSync(target, content, { mode: 0o644 });
+    try { fs.chmodSync(target, 0o644); } catch {}
     res.json({ ok: true, path: rel, message: 'File saved. Restart nginx-proxy to reload configuration changes.' });
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message });
@@ -6641,24 +6774,15 @@ app.get('/api/core/nginx-proxy', async (req, res) => {
     const settings = readSettings();
     const nginxDir = path.join(coreDir, 'nginx-proxy');
     if (!fs.existsSync(nginxDir)) fs.mkdirSync(nginxDir, { recursive: true });
+    ensureNginxErrorPages();
     const composePath = path.join(nginxDir, 'docker-compose.yml');
-    const existingCompose = fs.existsSync(composePath) ? fs.readFileSync(composePath, 'utf-8') : '';
-    if (!existingCompose) {
+    // Never create the compose file just by reading status: a generated file
+    // would make a fresh install look "installed" before the user ever
+    // launched nginx-proxy. Only an existing file counts as installed.
+    const existingCompose = fs.existsSync(composePath);
+    if (existingCompose) {
       try {
-        const network = settings.services?.nginxProxy?.network || 'wicked';
-        const domain = settings.services?.nginxProxy?.domain || '';
-        const coreHostDir = await selfMountSource('/app/core');
-        writePrivateFile(composePath, nginxProxyCompose(
-          network,
-          domain,
-          coreHostDir ? path.join(coreHostDir, 'nginx-proxy') : ''
-        ));
-      } catch (e) {
-        appendServerLog('WARN', `nginx-proxy compose preparation failed: ${e.message}`);
-      }
-    } else {
-      try {
-        await ensureNginxProxyCompose();
+        await ensureNginxProxyCompose({ recreate: true });
       } catch (e) {
         appendServerLog('WARN', `nginx-proxy compose check failed: ${e.message}`);
       }
@@ -6718,6 +6842,7 @@ app.post('/api/core/nginx-proxy/run', async (req, res) => {
     if (!fs.existsSync(nginxDir)) fs.mkdirSync(nginxDir, { recursive: true });
     fs.mkdirSync(path.join(nginxDir, 'vhost.d'), { recursive: true });
     fs.mkdirSync(path.join(nginxDir, 'certs'), { recursive: true });
+    ensureNginxErrorPages();
     const composePath = path.join(nginxDir, 'docker-compose.yml');
     const existingCompose = fs.existsSync(composePath) ? fs.readFileSync(composePath, 'utf-8') : '';
     const managedCompose = existingCompose.startsWith('# managed-by: wickedafdok');
@@ -6731,7 +6856,8 @@ app.post('/api/core/nginx-proxy/run', async (req, res) => {
         ? !existingCompose.includes(hostLine) && !existingCompose.includes(quotedHostLine)
         : existingCompose.includes('DEFAULT_HOST=')) ||
       !existingCompose.includes('/etc/nginx/vhost.d') ||
-      !existingCompose.includes('/etc/nginx/certs')
+      !existingCompose.includes('/etc/nginx/certs') ||
+      !existingCompose.includes('/usr/share/nginx/html')
     );
     // Docker resolves bind sources on the daemon's side, so a compose file in
     // the app container must name host paths. A relative ./vhost.d would point
@@ -6743,6 +6869,7 @@ app.post('/api/core/nginx-proxy/run', async (req, res) => {
     if (managedCompose && nginxHostDir) {
       nextCompose = setMountSource(nextCompose, '/etc/nginx/vhost.d', path.join(nginxHostDir, 'vhost.d'));
       nextCompose = setMountSource(nextCompose, '/etc/nginx/certs', path.join(nginxHostDir, 'certs'));
+      nextCompose = setMountSource(nextCompose, '/usr/share/nginx/html', path.join(nginxHostDir, 'html'));
     }
     if (!nextCompose || staleCompose) {
       nextCompose = nginxProxyCompose(network, domain, nginxHostDir);
@@ -8728,6 +8855,14 @@ try {
   writeSettings(readSettings());
 } catch (e) {
   appendServerLog('WARN', `settings secret migration failed: ${e.message}`);
+}
+
+// Ship editable error-page templates with every installation. Existing user
+// edits are left untouched.
+try {
+  ensureNginxErrorPages();
+} catch (e) {
+  appendServerLog('WARN', `nginx error page preparation failed: ${e.message}`);
 }
 
 const port = process.env.PORT || 8080;

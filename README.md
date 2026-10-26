@@ -42,7 +42,7 @@ Open `http://localhost:8080`. The UI has no built-in login — put it behind a r
 
 **Settings → Dok Settings** holds the app's own management options:
 
-- **Designer** changes the logo, name, tagline, and CSS override, and opens the nginx-proxy files under `core/nginx-proxy` for editing error pages and vhost snippets. Uploaded logos are stored in `data/designer/`; private key files are not exposed.
+- **Designer** changes the logo, name, tagline, and CSS override, and opens the nginx-proxy files under `core/nginx-proxy` for editing. Bundled `html/404.html`, `html/403.html`, and `html/errors/50x.html` pages are mounted into nginx-proxy and used for custom error responses; edit them in Designer and restart nginx-proxy. Uploaded logos are stored in `data/designer/`; private key files are not exposed.
 - **Container Groups** groups running containers for easier management. Groups are stored in `data/groups.json`. The **Core Services** group is built in and computed from the running core containers, so it cannot be edited or deleted.
 - **Registry connections** stores credentials for container registries and git hosts. Presets cover Docker Hub, GitHub Container Registry (`ghcr.io`), GitLab Container Registry, Quay.io, GitHub, GitLab, Gitea/Forgejo, and custom hosts.
 
