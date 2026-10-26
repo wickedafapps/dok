@@ -2368,6 +2368,7 @@ async function watchUpdateJob() {
       } catch {
         if (out) out.textContent += '\n\nWickedAFDok is restarting. Waiting for it to come back…';
         await waitForReconnect(5 * 60 * 1000, 6000);
+        setLoading(btn, false, btn.dataset.label || 'Update from Git');
         return;
       }
       if (out) {
@@ -2382,6 +2383,7 @@ async function watchUpdateJob() {
       if (status.phase === 'recreating' && !status.running) {
         if (out) out.textContent += '\n\nContainer restarting. Waiting for WickedAFDok…';
         await waitForReconnect(5 * 60 * 1000, 6000);
+        setLoading(btn, false, btn.dataset.label || 'Update from Git');
         return;
       }
       if (!status.running && status.phase === 'idle') {

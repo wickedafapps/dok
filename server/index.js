@@ -3117,7 +3117,7 @@ async function ensureHostDirectory(target, { label = 'host path', action = 'crea
   }
 }
 
-function buildWadCompose(info, { network, domain, port, serviceName = 'app' }) {
+function buildWadCompose(info, { network, domain, port, serviceName = 'app', extraVolumes = [] }) {
   const name = info.Name.replace(/^\//, '');
   const image = info.Config?.Image && info.Config.Image !== '<none>' ? info.Config.Image : info.Image;
   if (!image) throw new Error('WickedAFDok container has no image');
@@ -3151,6 +3151,9 @@ function buildWadCompose(info, { network, domain, port, serviceName = 'app' }) {
       const vol = `${m.Name}:${m.Destination}${m.RW === false ? ':ro' : ''}`;
       if (!volumes.some(v => v.includes(m.Destination))) volumes.push(vol);
     }
+  }
+  for (const volume of Array.isArray(extraVolumes) ? extraVolumes : []) {
+    if (volume && !volumes.includes(volume)) volumes.push(volume);
   }
 
   const restart = info.HostConfig?.RestartPolicy?.Name || 'unless-stopped';
@@ -3248,14 +3251,23 @@ async function scheduleSelfRecreate(domain, network) {
   const wadDir = path.join(dataDir, 'wickedafdok');
   if (!fs.existsSync(wadDir)) fs.mkdirSync(wadDir, { recursive: true });
   const composePath = path.join(wadDir, 'docker-compose.yml');
-  writePrivateFile(composePath, buildWadCompose(info, { network, domain: normalizeDomain(domain), port, serviceName: 'wickedafdok' }));
-
 
   const helperImage = info.Image || info.Config?.Image;
   if (!helperImage) throw new Error('Unable to determine the WickedAFDok image for self-recreation');
 
   const dataMount = (info.Mounts || []).find(m => m.Destination === '/app/data');
   const hostDataDir = dataMount?.Type === 'bind' && dataMount.Source ? dataMount.Source : null;
+  const hostCheckout = hostDataDir && path.basename(hostDataDir) === 'data' ? path.dirname(hostDataDir) : '';
+  const extraVolumes = hostCheckout && hostCheckout !== path.parse(hostCheckout).root
+    ? [`${hostCheckout}:/app/host-source`]
+    : [];
+  writePrivateFile(composePath, buildWadCompose(info, {
+    network,
+    domain: normalizeDomain(domain),
+    port,
+    serviceName: 'wickedafdok',
+    extraVolumes
+  }));
 
   const script = ['set -u'];
   if (hostDataDir) {
