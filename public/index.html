@@ -149,6 +149,7 @@
         <button class="subtab-btn" data-subtab="compose">Docker compose</button>
         <button class="subtab-btn" data-subtab="git">Git Clone</button>
         <button class="subtab-btn" data-subtab="upload">Local upload</button>
+        <button class="subtab-btn" data-subtab="assist">OC Assist</button>
       </div>
 
       <div id="subtab-run" class="subtab-pane active">
@@ -208,6 +209,24 @@
             <button id="uploadOpenBtn" class="btn hidden">Open project →</button>
           </div>
           <pre id="uploadOutput" class="output hidden"></pre>
+        </div>
+      </div>
+
+      <div id="subtab-assist" class="subtab-pane">
+        <div class="card">
+          <h3>OC Assist</h3>
+          <p class="muted">Describe what you want. OC Assist opens an OpenCode session with your instructions and pasted data, asks any follow-up questions in the chat, then builds and registers the app. The app appears in Apps when it is ready.</p>
+          <label class="muted" for="assistPrompt">App instructions (required)</label>
+          <textarea id="assistPrompt" class="textarea tall" placeholder="Build a self-hosted recipe manager with a web UI and persistent storage. Expose it at recipes.example.com."></textarea>
+          <label class="muted" for="assistData">Paste docker run, compose, a repository link, or notes (optional)</label>
+          <textarea id="assistData" class="textarea code tall" placeholder="https://github.com/user/repo&#10;or paste a compose file / docker run command"></textarea>
+          <div class="row">
+            <input id="assistName" class="input" placeholder="App name (optional)">
+            <label class="file-label">Files<input type="file" id="assistFiles" multiple></label>
+            <label class="file-label">Folder<input type="file" id="assistFolder" webkitdirectory multiple></label>
+            <button id="assistStartBtn" class="btn btn-primary">Create App with OC Assist</button>
+          </div>
+          <pre id="assistOutput" class="output hidden"></pre>
         </div>
       </div>
     </section>
@@ -436,7 +455,12 @@
               <button id="autheliaStopBtn" class="btn">Stop</button>
               <button id="autheliaRestartBtn" class="btn">Restart</button>
               <button id="autheliaEditComposeManage" class="btn">Edit compose</button>
+              <button id="autheliaManageBtn" class="btn btn-primary">Manage Authelia</button>
               <button id="autheliaOpenBtn" class="btn">Open Authelia</button>
+            </div>
+            <div class="row">
+              <label class="checkbox"><input type="checkbox" id="autheliaProtectDok"> Require login for the Dok UI</label>
+              <span id="autheliaProtectDokMsg" class="muted"></span>
             </div>
             <div class="row">
               <input id="autheliaDomainManage" class="input flex" placeholder="Portal domain, e.g. auth.example.com">
@@ -642,6 +666,45 @@
       </div>
 
       <div id="settings-pane-dok" class="settings-pane">
+        <div class="card" id="defaultsCard">
+          <div class="row" style="margin-top:0; justify-content:space-between">
+            <div>
+              <h3 style="margin:0">Default settings</h3>
+              <p class="muted">Fallbacks used when creating apps and core services. Domains and admin credentials are prefilled; app data can be kept in one host location.</p>
+            </div>
+            <button id="defaultsRefresh" class="btn">Refresh</button>
+          </div>
+          <div class="row">
+            <input id="defaultsPrimaryDomain" class="input flex" placeholder="Primary domain, e.g. example.com">
+            <input id="defaultsDokDomain" class="input flex" placeholder="Dok domain, e.g. dok.example.com">
+          </div>
+          <div class="row">
+            <input id="defaultsDataLocation" class="input flex" placeholder="App data location on the host, e.g. /srv/dok-data">
+            <input id="defaultsDataMode" class="input" style="max-width:110px" placeholder="0775" aria-label="Data directory permissions">
+            <button id="defaultsApplyData" class="btn">Create and apply</button>
+          </div>
+          <div class="row">
+            <label class="checkbox"><input type="checkbox" id="defaultsAllowOutsideData"> Allow app volume paths outside the data location</label>
+            <label class="checkbox"><input type="checkbox" id="defaultsAutoAppData" checked> Create and use app data folders automatically</label>
+          </div>
+          <p class="muted" style="margin-top:0">App data is stored as <code>&lt;data location&gt;/apps/&lt;app&gt;/data</code>. Allowing outside paths also permits that path to be created; these paths may need sudo or the Host Helper.</p>
+          <div class="row">
+            <input id="defaultsAdminUser" class="input" placeholder="Default admin user">
+            <input id="defaultsAdminEmail" class="input flex" placeholder="Default admin email">
+            <input id="defaultsAdminPassword" class="input" type="password" placeholder="Default admin password (leave blank to keep)">
+            <input id="defaultsNetwork" class="input" placeholder="Default network, e.g. wicked">
+          </div>
+          <div class="row">
+            <label class="checkbox"><input type="checkbox" id="defaultsClearAdminPassword"> Clear stored default password</label>
+            <label class="checkbox"><input type="checkbox" id="defaultsProtectDok"> Require Authelia login for the Dok UI (Dok must already route through nginx-proxy)</label>
+          </div>
+          <div class="row">
+            <button id="saveDefaults" class="btn btn-primary">Save defaults</button>
+            <span id="defaultsMsg" class="muted"></span>
+          </div>
+          <p id="defaultsPasswordState" class="muted"></p>
+        </div>
+
         <div class="card">
           <div class="row" style="margin-top:0; justify-content:space-between">
             <div>
@@ -956,6 +1019,49 @@
         <button id="authSelectAll" class="btn">Select all</button>
         <button id="authSelectNone" class="btn">Clear</button>
         <span id="authApplyMsg" class="muted"></span>
+      </div>
+    </div>
+  </div>
+
+  <div id="autheliaUsersModal" class="modal hidden">
+    <div class="modal-backdrop" data-close="autheliaUsersModal"></div>
+    <div class="modal-card" style="max-width:880px">
+      <div class="modal-header">
+        <div>
+          <h3>Authelia management</h3>
+          <p id="autheliaUsersHint" class="muted" style="margin:4px 0 0">Manage the local Authelia user database. Provider and application policies are configured in the Authelia portal.</p>
+        </div>
+        <button class="btn" data-close="autheliaUsersModal">Close</button>
+      </div>
+      <div class="card" style="margin:0 0 14px">
+        <div class="row" style="margin-top:0; justify-content:space-between">
+          <strong>Admin account</strong>
+          <span id="autheliaAdminState" class="muted"></span>
+        </div>
+        <div class="row">
+          <input id="autheliaAdminUser" class="input" placeholder="Admin username">
+          <input id="autheliaAdminEmail" class="input flex" type="email" placeholder="Admin email">
+          <input id="autheliaAdminPassword" class="input" type="password" placeholder="New admin password (optional)">
+          <button id="autheliaAdminSave" class="btn btn-primary">Save admin</button>
+        </div>
+        <p class="muted" style="margin:0">Changing the admin password restarts Authelia and applies the new Argon2id hash to <code>users.yml</code>.</p>
+      </div>
+      <div class="row" style="justify-content:space-between">
+        <strong>Users</strong>
+        <button id="autheliaUsersRefresh" class="btn">Refresh</button>
+      </div>
+      <div class="row">
+        <input id="autheliaUserName" class="input" placeholder="Username">
+        <input id="autheliaUserDisplay" class="input" placeholder="Display name">
+        <input id="autheliaUserEmail" class="input flex" type="email" placeholder="Email (optional)">
+        <input id="autheliaUserPassword" class="input" type="password" placeholder="Password (required for new users)">
+        <button id="autheliaUserSave" class="btn btn-primary">Add user</button>
+        <button id="autheliaUserCancel" class="btn hidden">Cancel edit</button>
+      </div>
+      <label class="checkbox"><input type="checkbox" id="autheliaUserDisabled"> Disabled</label>
+      <div id="autheliaUsersList" class="list" style="max-height:320px;overflow:auto"></div>
+      <div class="row">
+        <span id="autheliaUsersMsg" class="muted"></span>
       </div>
     </div>
   </div>

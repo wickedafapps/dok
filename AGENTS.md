@@ -52,6 +52,7 @@ docker run -d --name wickedafdok -p 8080:8080 \
 ├── .gitignore           # Keeps runtime data, node_modules, and generated files out of git
 ├── server/index.js      # Main server with all API routes and business logic
 ├── server/host-agent.js # Optional privileged helper socket for host directory creation
+├── server/assist-register.mjs # OC Assist helper that registers/deploys an app via finalize API
 ├── public/              # Frontend
 │   ├── index.html       # UI structure
 │   ├── css/style.css    # Styles
@@ -108,6 +109,7 @@ The unified way to deploy applications. Every app is stored in `apps/<name>/` wi
 2. **Docker Compose** - Paste `docker-compose.yml`/`compose.yaml` content. Stored in the app's own managed compose file and opened in App Configuration modal.
 3. **Git Clone** - Provide any git URL (generic git, not limited to GitHub API). If repo contains `docker-compose.yml`/`compose.yaml` or `Dockerfile`, files are copied to `apps/<name>` and opened in App Configuration modal; Dockerfile-only projects get a generated compose file. If no compose/Dockerfile found, routed to **Projects**.
 4. **Local Upload** - Upload files/folders via multipart form. If compose or Dockerfile present, files are copied to `apps/<name>` and opened in App Configuration modal; Dockerfile-only uploads get a generated compose file. Otherwise routed to **Projects**.
+5. **OC Assist** - Describe the app in a required prompt, optionally paste data (docker run, compose, repository/page URL) and upload files. WickedAFDok writes a private brief plus the uploads under `sources/oc-assist-<stamp>/`, starts an Admin OpenCode session with that brief, and the agent creates the compose, registers the app through `server/assist-register.mjs`, and deploys it. Use `#assistPrompt`, `#assistData`, `#assistName`, `#assistFiles`, `#assistFolder`, `#assistStartBtn`, and `#assistOutput`.
 
 **App Configuration Modal:**
 - Opens with a visual Compose builder (`#appCfgBuilder`) populated from the managed compose via `/api/compose/parse`
@@ -152,7 +154,18 @@ The unified way to deploy applications. Every app is stored in `apps/<name>/` wi
 
 ### Dok Settings
 
-Settings is split into four subtabs: **Core Services**, **Dok Settings**, **Logs**, and **Backups & Updates**. Dok Settings contains the app's own management options: Designer, Groups, and registry connections.
+Settings is split into four subtabs: **Core Services**, **Dok Settings**, **Logs**, and **Backups & Updates**. Dok Settings contains the app's own management options: Default settings, Designer, Groups, and registry connections.
+
+**Default settings:**
+- `#defaultsCard` stores fallback values in `settings.defaults` and exposes `GET/POST /api/settings/defaults`, plus `POST /api/settings/defaults/apply`
+- `primaryDomain` is used to suggest `auth.<domain>`, `sso.<domain>`, `dns.<domain>`, and `mail.<domain>` in the core-service forms
+- `dokDomain` is used for the Dok UI and falls back to `services.nginxProxy.domain`; saving a Dok domain also fills a blank nginx domain
+- `dataLocation` (absolute host path) and `dataMode` (octal, default `0775`) create `<dataLocation>/apps`; app data defaults to `<dataLocation>/apps/<app>/data` and missing relative bind mounts are mapped beneath that folder
+- `autoAppData` controls automatic app data folders; `allowOutsideData` permits creating/using bind paths outside the data location (otherwise finalize rejects missing outside paths). Creation goes through the Host Helper when direct access is denied
+- `adminUser`, `adminEmail`, and `adminPassword` prefill/seed Authelia, Authentik, and Technitium installs; the password is encrypted and exposed only as `adminPasswordSet`
+- `defaultNetwork` is used by app creation and may be auto-created on first use
+- `protectDok` adds the Dok host to the Authelia protected set without recreating the Dok container; the Dok domain must already route through nginx-proxy for the protection to take effect
+- Saving defaults creates the configured data location and apps folder, validates domains/modes, and triggers Authelia vhost sync when `protectDok` changes
 
 **Designer:**
 - `#openDesigner` in Dok Settings opens `#designerModal`
@@ -180,7 +193,7 @@ Settings is split into four subtabs: **Core Services**, **Dok Settings**, **Logs
 
 ### Settings / Core Services
 
-The **Core Services** subtab manages the bundled services.
+The **Core Services** subtab manages the bundled services. Each created service card keeps an **Edit compose** action for manual changes, and the running WickedAFDok container is reported as a protected core service (`role: Dok`) so it appears in the Core Services group.
 
 **nginx-proxy (managed):**
 - Only one nginx-proxy managed from Core Services UI
@@ -212,7 +225,10 @@ The **Core Services** subtab manages the bundled services.
 - HTTPS is required: Authelia rejects non-https target URLs and marks session cookies Secure, and nginx-proxy refuses TLS for hosts without a certificate. Put `core/nginx-proxy/certs/<host>.crt` and `<host>.key` in place for the portal and every protected host before nginx-proxy loads them
 - Portal domain stored as `services.authelia.domain`; cookie domains are derived from the registrable-looking parent of the portal and of each protected host (`auth.example.com`/`app.example.com` → `example.com`) and regenerated when the protected set changes
 - Managed compose pins `authelia/authelia:4.39`, sets `PUID`/`PGID` to the WickedAFDok uid/gid (the image entrypoint runs `chown -R` on `/config`), and lives in `core/authelia/docker-compose.yml` with config under `core/authelia/config`
-- Admin password is hashed with `authelia crypto hash generate argon2`; the plaintext is only shown once in the UI. The manage card also has **Apply domain** and **Sync protected apps**
+- Admin password is hashed with `authelia crypto hash generate argon2`; the plaintext is only shown once in the UI. The manage card also has **Apply domain**, **Sync protected apps**, **Manage users**, and **Require login for the Dok UI**
+- Managed users live in `settings.services.authelia.users` with encrypted `passwordHashEnc` values and are rendered into `core/authelia/config/users.yml` together with the admin account. `GET/POST /api/core/authelia/users`, `DELETE /api/core/authelia/users/:username`, and `POST /api/core/authelia/admin` manage them; changes rewrite the file and restart Authelia only when the content changed
+- The Authelia card's **Manage users** button opens `#autheliaUsersModal` (admin account, add/edit/delete local users). The **Open** button opens the portal for provider/application administration
+- The auth container picker lists every running container (not just apps), disables Dok itself with a pointer to Dok protection, and notes protected core services
 
 **Technitium DNS (managed):**
 - Optional DNS and ad-blocking core service with a web console
@@ -295,7 +311,8 @@ The **Core Services** subtab manages the bundled services.
 - `POST /api/launch/git` - Clone git repo and process
 - `POST /api/launch/upload` - Upload files and process
 - `POST /api/launch/source` - Deploy from sources directory
-- `POST /api/launch/finalize` - Complete creation (save to apps dir, update registry, optionally launch)
+- `POST /api/assist/start` - Upload optional files, write the OC Assist brief, and start an Admin OpenCode session (`prompt`, optional `data`, `name`, `files`, `paths`)
+- `POST /api/launch/finalize` - Complete creation (save to apps dir, update registry, optionally launch); a per-app lock returns `409 alreadyFinalizing` and failures after the registry write return `created: true`
 - `POST /api/compose/validate` - Validate compose file content
 - `POST /api/compose/parse` - Parse a compose file into editable builder fields
 - `POST /api/compose/build` - Generate compose from builder fields and return field-level issues
@@ -309,6 +326,8 @@ The **Core Services** subtab manages the bundled services.
 - `POST /api/core/cloudflared/run` - Start/run cloudflared
 - `GET /api/core/auth` / `POST /api/core/auth/compose` / `POST /api/core/auth/run` / `POST /api/core/auth/domain` / `POST /api/core/auth/apply` - Authentik status, compose, launch, GUI domain, and apply `ENABLE_AUTH` to selected containers
 - `GET /api/core/authelia` / `POST /api/core/authelia/compose` / `POST /api/core/authelia/run` / `POST /api/core/authelia/domain` / `POST /api/core/authelia/sync` - Authelia status, compose, launch, portal domain, ENABLE_AUTH vhost sync
+- `GET /api/core/authelia/users` / `POST /api/core/authelia/users` / `DELETE /api/core/authelia/users/:username` / `POST /api/core/authelia/admin` - Manage local Authelia users and the admin account
+- `POST /api/core/authelia/dok-protection` - Toggle Authelia protection for the Dok UI
 - `GET /api/core/dns` / `POST /api/core/dns/compose` / `POST /api/core/dns/run` / `POST /api/core/dns/domain` - Technitium status, compose, launch, GUI domain
 - `GET /api/core/mail` - SMTP settings (redacted), Mailpit status/compose, and the resolved Authelia notifier address
 - `POST /api/core/mail/smtp` - Save SMTP delivery settings and apply them to Authelia
@@ -364,6 +383,7 @@ The **Core Services** subtab manages the bundled services.
 - `POST /api/networks/create` - Create network
 - `GET /api/settings` - Get settings
 - `POST /api/settings` - Save settings
+- `GET /api/settings/defaults` / `POST /api/settings/defaults` / `POST /api/settings/defaults/apply` - Read, save, and re-apply default settings (domains, data location/mode, admin fallbacks, network, Dok protection)
 
 ### Groups, Registries, DNS, Auth
 - `GET /api/groups` / `POST /api/groups` / `DELETE /api/groups/:id` - Container groups
@@ -386,6 +406,18 @@ The **Core Services** subtab manages the bundled services.
 4. Launch routes return analysis from `analyzeCompose()`: existing/missing external networks, missing bind sources, prefilled vhost data, and compose issues
 5. On finalize (`/api/launch/finalize`) the server resolves `networkChoices`/`volumeChoices`, validates the base compose plus generated override, saves to the registry, and optionally launches via docker compose in `apps/<name>/`. A renamed staged app is removed only after the final compose and registry entry are written successfully.
 6. New apps preview directly in `apps/<name>/`. If that directory already exists and is not empty, the preview is staged in a hidden `apps/.preview-<name>-.../` directory and copied to the target only on finalize. Stale previews older than 24 hours are cleaned up. Finalizing into a non-empty existing app name returns `409` with `needsOverwrite`/`appName`; the UI asks for confirmation and resubmits with `overwrite: true`.
+7. `finalizeLocks` (keyed by sanitized app name) rejects concurrent finalizes with `409 alreadyFinalizing`. Once the registry entry is written, later failures return `created: true` with the app name, so the UI closes and refreshes instead of prompting a duplicate install.
+
+### Defaults and App Data
+- `defaultsDefaults()` owns `settings.defaults`; `configuredDefaults()` normalizes it, `defaultsForClient()` redacts the admin password as `adminPasswordSet`, and `defaultsPatch()` validates/saves input. `POST /api/settings/defaults` also applies the data location and syncs Authelia vhosts when Dok protection is enabled.
+- `appDefaultDataDir(name)` returns `<dataLocation>/apps/<app>/data` unless `autoAppData` is false. Every new app gets this directory (mode from `dataMode`) and the path is stored as `dataPath` in the registry and returned as `appDataPath`.
+- Missing relative bind sources are auto-mapped by `defaultVolumeSource()` beneath the app data directory (`<app>/data` for the `data` target, otherwise `<app>/data/<target-slug>`). Absolute/outside sources are only created when `allowOutsideData` is true; otherwise finalize returns the missing volume with an explanatory `reason`.
+- `POST /api/settings/defaults/apply` re-creates the data location and `<dataLocation>/apps` through `ensureHostDirectory()` (direct or Host Helper), applying the octal mode.
+
+### OC Assist
+- `POST /api/assist/start` validates the prompt/name, rejects concurrent starts for the same app name, saves uploads under `sources/oc-assist-<stamp>/` (traversal-checked), writes a private brief at `data/opencode/assist/<stamp>/brief.md`, and starts an Admin OpenCode session with `--prompt` and title `OC Assist · <app>`.
+- The brief includes instructions, pasted data, uploaded file paths, and default admin username/email (never the password).
+- The agent registers/deploys through `server/assist-register.mjs --name <app> --dir /app/apps/<app> --launch`, which posts to `/api/launch/finalize` with `overwrite: true`; `--launch` is opt-in so a dry registration is possible.
 
 ### Compose Management
 - All apps use docker compose from their own directory
@@ -395,7 +427,7 @@ The **Core Services** subtab manages the bundled services.
 - `buildComposeOverride()` adds selected networks, network mappings, vhost changes, extra ports, and volume replacements
 - Missing input networks require `networkChoices` (`__create__` or an existing name); missing bind sources require `volumeChoices` (`source` plus optional `create`)
 - Replacing a missing bind source preserves its read-only flag (`:ro`); sources containing `:` or CR/LF/NUL are rejected for short volume syntax
-- Form network creation is explicit (`createNetwork`/`#appCfgCreateNetwork`); only `wicked` is auto-created
+- Form network creation is explicit (`createNetwork`/`#appCfgCreateNetwork`); `wicked` and the configured default network are auto-created, other input networks require a choice
 - Compose validation via `/api/compose/validate`; final combined validation also checks port conflicts and unresolved networks/volumes
 - Compose builder parsing uses `docker compose config --format json` when available and a block-YAML subset reader when not; building normalizes the field model to YAML and validates conflicts server-side
 - Compose input explicitly provided as empty is rejected with `Compose file is empty`
@@ -421,7 +453,8 @@ The **Core Services** subtab manages the bundled services.
 - Authentik's compose pins `AUTHENTIK_IMAGE_VERSION` (currently `2026.8.5`). ghcr.io publishes no `latest` tag for `goauthentik/server`, so a `:latest` reference fails with `not found`; upgrade by bumping the constant and keep it aligned with the database migrations. `services.authentik.version` overrides it per install
 
 ### Authelia and ENABLE_AUTH vhosts
-- `listAuthProtectedHosts()` inspects every running container (the `listContainers` summary omits `Env`), accepts `ENABLE_AUTH=1|true|yes|on` case-insensitively, and splits `VIRTUAL_HOST` on commas
+- `listAuthProtectedHosts()` inspects every running container (the `listContainers` summary omits `Env`), accepts `ENABLE_AUTH=1|true|yes|on` case-insensitively, and splits `VIRTUAL_HOST` on commas. When `defaults.protectDok` is set it also adds the Dok host, so Dok itself never needs an `ENABLE_AUTH` env or a self-recreate
+- Authelia users are stored in `settings.services.authelia.users` with encrypted `passwordHashEnc` values; `autheliaConfiguration()` renders the admin plus those users into `users.yml`, and `refreshAutheliaConfig()` rewrites/restarts only when the file content changes
 - `syncAuthVhosts()` writes `<host>` (server scope: `location = /authelia` proxying to `http://authelia:9091/api/authz/auth-request` with `X-Original-URL`/`X-Forwarded-*`) and `<host>_location` (`auth_request /authelia`, forwards `Remote-User`, `Remote-Groups`, `Remote-Name`, `Remote-Email`, `Remote-Status`, and `error_page 401 =302 https://<portal>/?rd=$target_url`). Only files starting with `# managed-by: wickedafdok:authelia` are pruned
 - Protected hosts must share the portal's cookie domain (`app.example.com` and `auth.example.com` → `example.com`); hosts under a different parent are skipped (`skippedHosts` in the state file, plus a server warning) because the portal cannot set a session cookie for another parent. Cookie domains use the last two labels, so multi-level public suffixes such as `co.uk` are not handled specially
 - Wildcard/regexp `VIRTUAL_HOST` patterns are skipped: nginx-proxy uses different file naming for its server and location scopes, so pattern hosts have no reliable per-vhost hook. List the literal hostnames on the container instead
@@ -489,22 +522,23 @@ The **Core Services** subtab manages the bundled services.
 - App Creation (`#tab-appcreation`) - primary deployment interface
 - Sources/Projects (`#tab-sources`)
 - Apps (`#tab-apps`) - deployed apps
-- Settings (`#tab-settings`) - includes `#settings-pane-dok` with Designer, Groups, and registry connections
+- Settings (`#tab-settings`) - includes `#settings-pane-dok` with Default settings, Designer, Groups, and registry connections
 
 **Key UI Elements:**
 - Containers: `#containersList`, `#containerSearch`, `#containersOpenApps` (opens the Apps tab), `#refreshContainers`
 - Dashboard: `#dashboardTerminalBtn`, `#dashboardOpencodeBtn`
 - Terminal Modal: `#terminalModal`, `#terminalContainer`, `#terminalModeSelect`, `#terminalShellBtn`, `#terminalOpencodeBtn`, `#terminalStopBtn`, `#terminalStatus`, `#terminalModeBadge`
 - OpenCode Card: `#coreOpencodeCard`, `#opencodeLaunchAdmin`, `#opencodeLaunchUser`, `#opencodeShellAdmin`, `#opencodeShellUser`, `#opencodeStopBtn`, `#opencodeModel`, `#opencodeProvider`, `#opencodeApiKey`, `#opencodeSaveSettings`
-- App Creation: `#runCreateBtn`, `#composeCreateBtn`, `#gitCloneBtn`, `#uploadBtn`
+- App Creation: `#runCreateBtn`, `#composeCreateBtn`, `#gitCloneBtn`, `#uploadBtn`, OC Assist (`#assistPrompt`, `#assistData`, `#assistName`, `#assistFiles`, `#assistFolder`, `#assistStartBtn`, `#assistOutput`)
 - App Config Modal: `#appConfigModal`, `#appCfgBuilder`, `#appCfgCompose`, `#appCfgEditCompose`, `#appCfgValidate`, `#appCfgComplete`, `#appCfgCompleteRun`, `#appCfgProgress`
 - Notices: `#appCfgNetworkNotice`, `#appCfgVolumeNotice`, `#appCreationNginxNotice`, `#appCreationNginxNoticeModal`
-- Modals: `#composeEditWarningModal`, `#composeSaveConfirmModal`, `#appOverwriteModal`, `#authContainersModal`, `#designerModal`
+- Modals: `#composeEditWarningModal`, `#composeSaveConfirmModal`, `#appOverwriteModal`, `#authContainersModal`, `#autheliaUsersModal`, `#designerModal`
 - Apps List: `#appsList`, `#appsRefresh`
 - Settings: `#tab-settings`, `#settingsSubtabs`, `#settings-pane-core`, `#settings-pane-dok`, `#settings-pane-logs`, `#settings-pane-backups`, `#coreAllStart`, `#coreAllStop`, `#coreAllRestart`, `#nginxNetwork`, `#runNginxProxyCore`, `#authRunBtn`, `#dnsRunBtn`, `#mailSmtpHost`, `#mailSmtpPort`, `#mailSmtpTls`, `#mailSmtpUser`, `#mailSmtpPassword`, `#mailSmtpSender`, `#mailSaveSmtp`, `#mailUseMailpit`, `#mailStatus`, `#mailpitRunBtn`, `#mailpitStatus`, `#mailpitOpenBtn`, `#helperRunBtn`
 - Designer: `#openDesigner`, `#designerName`, `#designerTagline`, `#designerCss`, `#designerLogoFile`, `#designerLogoUpload`, `#designerLogoRemove`, `#designerFilePath`, `#designerFileContent`, `#designerFileSave`
 - Auth picker: `#authContainersList`, `#authApplySelected`, `#authSelectAll`, `#authSelectNone`, `#authApplyMsg`
-- Dok Settings: `#groupName`, `#groupContainers`, `#saveGroup`, `#groupsList`, `#registryKind`, `#registryProvider`, `#registryName`, `#registryHost`, `#registryUsername`, `#registrySecret`, `#saveRegistry`, `#cancelRegistryEdit`, `#registriesRefresh`, `#registriesList`
+- Dok Settings: `#defaultsCard`, `#defaultsPrimaryDomain`, `#defaultsDokDomain`, `#defaultsDataLocation`, `#defaultsDataMode`, `#defaultsAllowOutsideData`, `#defaultsAutoAppData`, `#defaultsAdminUser`, `#defaultsAdminEmail`, `#defaultsAdminPassword`, `#defaultsClearAdminPassword`, `#defaultsNetwork`, `#defaultsProtectDok`, `#saveDefaults`, `#defaultsApplyData`, `#defaultsRefresh`, `#groupName`, `#groupContainers`, `#saveGroup`, `#groupsList`, `#registryKind`, `#registryProvider`, `#registryName`, `#registryHost`, `#registryUsername`, `#registrySecret`, `#saveRegistry`, `#cancelRegistryEdit`, `#registriesRefresh`, `#registriesList`
+- Authelia management: `#autheliaManageBtn`, `#autheliaOpenBtn`, `#autheliaProtectDok`, `#autheliaUsersModal`, `#autheliaAdminUser`, `#autheliaAdminEmail`, `#autheliaAdminPassword`, `#autheliaAdminSave`, `#autheliaUserName`, `#autheliaUserDisplay`, `#autheliaUserEmail`, `#autheliaUserPassword`, `#autheliaUserDisabled`, `#autheliaUserSave`, `#autheliaUserCancel`, `#autheliaUsersList`, `#autheliaUsersRefresh`
 - Logs: `#serverLogsOutput`, `#serverLogsRefresh`, `#serverLogsClear`, `#appLogsSelect`, `#appLogsRefresh`, `#appLogsOutput`
 - Backups: `#createBackupBtn`, `#backupScope`, `#backupCustomOptions`, `#backupAppsSelect`, `#backupCoreSelect`, `#backupsList`, `#backupRefresh`, `#importBackupFile`, `#importBackupBtn`
 
@@ -566,6 +600,33 @@ The **Core Services** subtab manages the bundled services.
 
 ##------------------------------------------Your current task--------------------------------------
 
-Core Services:
- Reverse Proxy:
-  Got error: Invalid string length when launching nginx. So it fails. nginx-proxy compose check failed: Invalid string length
+To hopefully simplify things create a new section for the user to define default/fallback settings and anything you think should be set to make everything function smoother.
+When launching the auth service it didn't find any of the containers that were running to list for selection so the wickedafdok is still without auth.
+Still showing failures on apps that install successfully leaving the window open. It's confusing and the app gets installed over and over when it was successful in the first place.
+
+Settings:
+ Dok Settings:
+  Add a section for the user to define default/fallback settings.
+   1. set a Primary Domain
+   2. set doks domain - autofilled if set with nginx first
+   3. Set a data location and its permissions - User defined app storage location. This becomes the default as /user/defined/path/apps/appname/data.
+   4. Choose if volume paths can be set outside the data location. Allowing paths outside the data location allows creation and setting permissions with sudo.
+   5. Set default admin creds and email - when set autofills admin info for apps and services
+If there is anything you think should be set here to make everything function smoother, suggest it so we can add it.
+
+ Core Services:
+  Add an edit button to each service after its created that opens the compose editor to manually update changes if needed like adding auth etc..
+  Group the wickedafdok container with core services
+
+ Authentication:
+   Create a management interface for Authelia for administration, user management, and configuration. Add a button to access it.
+
+ App Creator:
+  Create a new section called "OC Assist". This will be the most versitile and cool creation option.
+  It will have a required prompt field to state your app instructions.
+  It will have an optional data input field to paste whatever you need, such as docker run, compose, link to repository or web page whatever
+  Optional local upload
+  A Create App button
+The Create App button launches open code and passes the prompt, data and local upload info if any. Opencode and the user use the chat to go over any other details and Opencode creates your app and adds it to the Apps Section.
+
+Push to github

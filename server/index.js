@@ -194,6 +194,7 @@ function readSettings() {
           hostHelper: { enabled: false, image: '' },
           opencode: { model: '', provider: '', apiKey: '' }
         },
+        defaults: defaultsDefaults(),
         backups: { includeLogs: false },
         logs: { tail: 500 },
         designer: { name: 'WickedAFDok', tagline: 'Server & Docker control room', css: '', logo: '' }
@@ -223,6 +224,7 @@ function readSettings() {
     cur.services.mailpit = mailpitDefaults(cur.services.mailpit || {});
     cur.services.hostHelper = { enabled: false, image: '', ...(cur.services.hostHelper || {}) };
     cur.services.opencode = { model: '', provider: '', apiKey: '', ...(cur.services.opencode || {}) };
+    cur.defaults = defaultsDefaults(cur.defaults || {});
     cur.backups = { includeLogs: false, ...(cur.backups || {}) };
     cur.logs = { tail: 500, ...(cur.logs || {}) };
     cur.designer = {
@@ -244,6 +246,7 @@ function readSettings() {
         hostHelper: { enabled: false, image: '' },
         opencode: { model: '', provider: '', apiKey: '' }
       },
+      defaults: defaultsDefaults(),
       backups: { includeLogs: false },
       logs: { tail: 500 },
       designer: { name: 'WickedAFDok', tagline: 'Server & Docker control room', css: '', logo: '' }
@@ -266,7 +269,8 @@ const SETTINGS_SECRET_PATHS = [
   ['services', 'authelia', 'jwtSecret'],
   ['services', 'technitium', 'adminPassword'],
   ['services', 'mail', 'password'],
-  ['services', 'opencode', 'apiKey']
+  ['services', 'opencode', 'apiKey'],
+  ['defaults', 'adminPassword']
 ];
 
 function isStoredSecret(value) {
@@ -3141,7 +3145,8 @@ function containerToCompose(info, { serviceName = 'app', network = '', networks 
 }
 
 function nginxProxyCompose(network, domain, hostDir = '') {
-  const host = normalizeDomain(domain);
+  let host = normalizeDomain(domain);
+  if (!host) host = normalizeDomain(configuredDefaults().dokDomain || '');
   const base = String(hostDir || '').trim() ? String(hostDir).replace(/[/\\]+$/, '') + '/' : './';
   return `# managed-by: wickedafdok
 services:
@@ -3404,12 +3409,17 @@ function ensureWritableDirectory(target, { label = 'directory', action = 'creati
   return dir;
 }
 
-async function ensureHostDirectory(target, { label = 'host path', action = 'creating' } = {}) {
+async function ensureHostDirectory(target, { label = 'host path', action = 'creating', mode } = {}) {
   const dir = path.resolve(String(target || ''));
   if (!target) throw httpError(400, `${label} is empty`);
+  const applyMode = () => {
+    if (!Number.isInteger(mode)) return;
+    try { fs.chmodSync(dir, mode); } catch {}
+  };
   if (fs.existsSync(dir)) {
     try {
       if (!fs.statSync(dir).isDirectory()) throw httpError(400, `${label} is not a directory: ${dir}`);
+      applyMode();
       return dir;
     } catch (e) {
       if (e.status) throw e;
@@ -3418,12 +3428,13 @@ async function ensureHostDirectory(target, { label = 'host path', action = 'crea
   }
   try {
     fs.mkdirSync(dir, { recursive: true });
+    applyMode();
     return dir;
   } catch (e) {
     if (!['EACCES', 'EPERM', 'EROFS'].includes(e.code)) throw e;
   }
   try {
-    await hostMkdir(dir);
+    await hostMkdir(dir, { mode });
     return dir;
   } catch {
     throw permissionDenied(dir, action);
@@ -3795,6 +3806,29 @@ function autheliaDefaults(raw = {}) {
     encryptionKey: '',
     jwtSecret: '',
     theme: 'auto',
+    users: [],
+    ...settings
+  };
+}
+
+// Installation-wide defaults used to prefill new services and apps. These are
+// deliberately conservative: an empty data location keeps the previous
+// behaviour, and outside paths stay allowed until the user opts in.
+function defaultsDefaults(raw = {}) {
+  const settings = raw && typeof raw === 'object' && !Array.isArray(raw) ? { ...raw } : {};
+  delete settings.timezone;
+  return {
+    primaryDomain: '',
+    dokDomain: '',
+    dataLocation: '',
+    dataMode: '0775',
+    allowOutsideData: true,
+    autoAppData: true,
+    adminUser: 'admin',
+    adminEmail: '',
+    adminPassword: '',
+    defaultNetwork: 'wicked',
+    protectDok: false,
     ...settings
   };
 }
@@ -4105,11 +4139,34 @@ ${cookieLines}storage:
   local:
     path: '/config/db.sqlite3'
 ${notifier}`;
-  const users = `users:
-  ${user}:
-    displayname: ${JSON.stringify(user)}
-    password: ${JSON.stringify(hash)}
-${email ? `    email: ${JSON.stringify(email)}\n` : ''}`;
+  const userLines = [];
+  const seenUsers = new Set();
+  const appendUser = (username, entry = {}) => {
+    const name = String(username || '').trim();
+    if (!name || seenUsers.has(name)) return;
+    const storedHash = String(entry.passwordHash || '').trim();
+    if (!storedHash) return;
+    seenUsers.add(name);
+    const displayname = String(entry.displayname || name).trim() || name;
+    const lineEmail = String(entry.email || '').trim();
+    let line = '  ' + name + ':\n';
+    line += '    displayname: ' + JSON.stringify(displayname) + '\n';
+    line += '    password: ' + JSON.stringify(storedHash) + '\n';
+    if (lineEmail) line += '    email: ' + JSON.stringify(lineEmail) + '\n';
+    line += '    disabled: ' + (entry.disabled ? 'true' : 'false');
+    userLines.push(line);
+  };
+  appendUser(user, { displayname: user, passwordHash: hash, email });
+  for (const entry of Array.isArray(s.users) ? s.users : []) {
+    const name = String(entry?.username || '').trim();
+    if (!name || !/^[A-Za-z0-9][A-Za-z0-9._@-]*$/.test(name)) continue;
+    let storedHash = String(entry.passwordHash || '');
+    if (entry.passwordHashEnc) {
+      try { storedHash = decryptSecret(String(entry.passwordHashEnc)); } catch { storedHash = ''; }
+    }
+    appendUser(name, { ...entry, passwordHash: storedHash });
+  }
+  const users = 'users:\n' + userLines.join('\n') + '\n';
   return { config, users, cookieDomains: cookieSet };
 }
 
@@ -4159,6 +4216,14 @@ async function listAuthProtectedHosts() {
       const clean = normalizeDomain(host).toLowerCase();
       if (clean && !/[*~]/.test(clean)) hosts.add(clean);
     }
+  }
+  // The Dok container cannot recreate itself just to receive ENABLE_AUTH, so
+  // opt it in through settings instead. Its nginx vhost is still generated by
+  // the normal sync path, which performs the auth_request check.
+  const defaults = configuredDefaults();
+  if (defaults.protectDok) {
+    const dokHost = normalizeDomain(defaults.dokDomain || readSettings().services?.nginxProxy?.domain || '');
+    if (dokHost && !/[*~]/.test(dokHost)) hosts.add(dokHost);
   }
   return [...hosts];
 }
@@ -4362,6 +4427,7 @@ async function syncAuthVhosts() {
     persistedCookieDomains = cookieDomains;
     const composePath = path.join(coreServiceDir('authelia'), 'docker-compose.yml');
     const configPath = path.join(coreServiceDir('authelia'), 'config', 'configuration.yml');
+    const usersPath = path.join(coreServiceDir('authelia'), 'config', 'users.yml');
     const previousCookies = (Array.isArray(state.cookieDomains) ? state.cookieDomains : []).join(',');
     const nextCookies = cookieDomains.join(',');
     // Rewrite the generated Authelia config only when an input changes (or the
@@ -4369,7 +4435,7 @@ async function syncAuthVhosts() {
     // 60s sync while still picking up a new cookie-domain set or SMTP settings.
     smtpFingerprint = autheliaNotifierFingerprint(settings.services?.mail || {});
     if (fs.existsSync(composePath) && authelia.adminPasswordHash &&
-        (previousCookies !== nextCookies || smtpFingerprint !== String(state.smtpFingerprint || '') || !fs.existsSync(configPath))) {
+        (previousCookies !== nextCookies || smtpFingerprint !== String(state.smtpFingerprint || '') || !fs.existsSync(configPath) || !fs.existsSync(usersPath))) {
       try {
         const written = await writeAutheliaConfig(authelia, cookieDomains);
         if (written.changed) {
@@ -4648,7 +4714,7 @@ function coreContainerInfo(container) {
   const project = labels['com.docker.compose.project'] || '';
   const selfName = /^wickedafdok(-|$)/.test(name) && !/updater|helper/.test(name);
   if (selfName || project === 'wickedafdok') {
-    return { core: false, protected: true, self: true, role: 'WickedAFDok' };
+    return { core: true, protected: true, self: true, role: 'Dok' };
   }
   if (CORE_COMPOSE_PROJECTS.has(project) || CORE_CONTAINER_NAMES.includes(name)) {
     return { core: true, protected: true, self: false, role: project || 'Core service' };
@@ -5984,13 +6050,163 @@ app.post('/api/launch/source', async (req, res) => {
   }
 });
 
-// Finalize creation: everything is written into apps/<name> and managed by compose from there.
-app.post('/api/launch/finalize', async (req, res) => {
+
+const assistStarts = new Set();
+
+app.post('/api/assist/start', upload.array('files', 100), async (req, res) => {
+  const tempFiles = (req.files || []).map(file => file.path);
+  let started = false;
+  let lockedName = '';
   try {
-    const body = req.body || {};
+    const prompt = String(req.body?.prompt || '').trim();
+    if (!prompt) throw httpError(400, 'Describe the app you want OC Assist to create');
+    if (prompt.length > 20000) throw httpError(400, 'The prompt is too long (max 20000 characters)');
+    const data = String(req.body?.data || '').trim();
+    if (data.length > 200000) throw httpError(400, 'The pasted data is too long (max 200 KB)');
+    const requestedName = String(req.body?.name || '').trim();
+    if (requestedName && !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(requestedName)) {
+      throw httpError(400, 'App names may only contain letters, numbers, dots, underscores, and hyphens');
+    }
+    const info = await getOpencodeInfo();
+    if (!info.installed) throw httpError(503, 'OpenCode is not installed in this container. Rebuild the WickedAFDok image and try again.');
+    const stamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14);
+    const defaultName = 'oc-app-' + stamp;
+    const appName = projectName(requestedName || defaultName, 'app');
+    if (assistStarts.has(appName)) throw httpError(409, 'OC Assist is already preparing that app name');
+    assistStarts.add(appName);
+    lockedName = appName;
+    const assistDir = path.join(opencodeDir, 'assist', stamp);
+    fs.mkdirSync(assistDir, { recursive: true });
+    try { fs.chmodSync(assistDir, 0o700); } catch {}
+    const uploadDir = path.join(sourcesDir, 'oc-assist-' + stamp);
+    const savedFiles = [];
+    const files = Array.isArray(req.files) ? req.files : [];
+    const paths = (() => {
+      const raw = req.body?.paths;
+      if (!raw) return [];
+      try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed.map(String) : [String(raw)];
+      } catch {
+        return [String(raw)];
+      }
+    })();
+    if (files.length) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const rel = String(paths[i] || file.originalname || path.basename(file.path)).replace(/^[/\\]+/, '');
+        if (!rel || rel.includes('\0') || rel.split('/').includes('..')) {
+          fs.rmSync(file.path, { force: true });
+          continue;
+        }
+        const dest = path.resolve(uploadDir, rel);
+        if (dest !== uploadDir && !dest.startsWith(uploadDir + path.sep)) {
+          fs.rmSync(file.path, { force: true });
+          continue;
+        }
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        try {
+          fs.renameSync(file.path, dest);
+        } catch (err) {
+          if (err.code !== 'EXDEV') throw err;
+          fs.copyFileSync(file.path, dest);
+          fs.rmSync(file.path, { force: true });
+        }
+        tempFiles[i] = dest;
+        savedFiles.push(dest);
+      }
+    }
+    const briefPath = path.join(assistDir, 'brief.md');
+    const defaultsCfg = configuredDefaults();
+    const brief = [
+      '# OC Assist app request',
+      '',
+      'App name: ' + appName,
+      'Created: ' + new Date().toISOString(),
+      '',
+      '## Instructions',
+      '',
+      prompt,
+      '',
+      '## Default admin account',
+      '',
+      'Username: ' + (defaultsCfg.adminUser || 'admin'),
+      'Email: ' + (defaultsCfg.adminEmail || '_(not set)_'),
+      'Password: use the default admin password from Dok Settings; ask the user if it is needed and never print it in chat.',
+      '',
+      '## Pasted data',
+      '',
+      data || '_(none)_',
+      '',
+      '## Uploaded files',
+      '',
+      savedFiles.length ? savedFiles.map(file => '- ' + file).join('\n') : '_(none)_',
+      ''
+    ].join('\n');
+    writePrivateFile(briefPath, brief);
+    const register = path.join(root, 'server', 'assist-register.mjs');
+    const startPrompt = [
+      'You are OC Assist, the app builder inside WickedAFDok.',
+      'Read the brief at ' + briefPath + ' and any uploaded files it lists before doing anything else.',
+      'Build a working app for ' + appName + ' in ' + path.join(appsDir, appName) + ' with a valid docker-compose.yml. Use the ' + (defaultsCfg.defaultNetwork || 'wicked') + ' network by default.',
+      'Ask the user only for details you genuinely need, then create the app files and launch it.',
+      'When the compose file is ready, register and deploy it by running:',
+      'node ' + register + ' --name ' + appName + ' --dir ' + path.join(appsDir, appName) + ' --launch',
+      'If registration fails, read the error, fix the compose, and retry once.',
+      'Finish by telling the user the app is in the Apps tab. Do not modify WickedAFDok source files.'
+    ].join('\n');
+    const session = await createTerminalSession({
+      mode: 'admin',
+      app: 'opencode',
+      prompt: startPrompt,
+      title: 'OC Assist · ' + appName
+    });
+    started = true;
+    res.json({ ok: true, session, appName, briefPath, uploadDir: savedFiles.length ? uploadDir : '' });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  } finally {
+    if (!started) {
+      for (const file of tempFiles) {
+        try { fs.rmSync(file, { force: true }); } catch {}
+      }
+    }
+    // The name lock only prevents two simultaneous starts; the session itself
+    // owns the app from here.
+    if (lockedName) assistStarts.delete(lockedName);
+  }
+});
+
+// Finalize creation: everything is written into apps/<name> and managed by compose from there.
+const finalizeLocks = new Map();
+
+app.post('/api/launch/finalize', async (req, res) => {
+  const body = req.body || {};
+  const composeHint = String(body.compose || body.yaml || body.generatedCompose || '');
+  const lockName = projectName(
+    body.appName || body.name || body.launch?.name ||
+    (composeHint ? serviceNamesFromCompose(composeHint)[0] : '') || 'app'
+  );
+  if (finalizeLocks.has(lockName)) {
+    return res.status(409).json({
+      error: `${lockName} is already being created. Wait for the current request to finish instead of starting it again.`,
+      alreadyFinalizing: true,
+      appName: lockName
+    });
+  }
+  finalizeLocks.set(lockName, Date.now());
+  const releaseLock = () => finalizeLocks.delete(lockName);
+  res.once('finish', releaseLock);
+  res.once('close', releaseLock);
+  const lockTimer = setTimeout(releaseLock, 30 * 60 * 1000);
+  lockTimer.unref?.();
+  let finalizedAppName = '';
+  let registrySaved = false;
+  try {
     const {
       type = 'compose', appName, appDir: rawAppDir, path: sourcePath, command = '',
-      compose: composeYaml, network = 'wicked', ports = '', vhost = '', vhostPort = '',
+      compose: composeYaml, network = '', ports = '', vhost = '', vhostPort = '',
       mode = 'auto', sourceRel = '', launchNow = true, force = false, composeEdited = false,
       networkChoices = {}, volumeChoices = {}, vhostTouched = false,
       vhostService = '', createNetwork = false, overwrite = false
@@ -6005,6 +6221,7 @@ app.post('/api/launch/finalize', async (req, res) => {
     const servicesFromBody = composeBody ? serviceNamesFromCompose(composeBody) : [];
     const fallbackName = sourcePath ? path.basename(sourcePath) : (servicesFromBody[0] || 'app');
     const name = projectName(appName || fallbackName, 'app');
+    finalizedAppName = name;
     const targetDir = path.join(appsDir, name);
     if (isSymlink(targetDir)) throw httpError(400, 'Invalid app directory');
     if (rawAppDir && isSymlink(rawAppDir)) throw httpError(400, 'Invalid app directory');
@@ -6024,7 +6241,8 @@ app.post('/api/launch/finalize', async (req, res) => {
       throw err;
     }
 
-    const netName = String(network || '').trim();
+    const defaultsCfg = configuredDefaults();
+    const netName = String(network || defaultsCfg.defaultNetwork || 'wicked').trim();
     if (['host', 'none', 'bridge', 'default'].includes(netName) || netName.startsWith('container:') || netName.startsWith('service:')) {
       throw httpError(400, 'Choose a named Docker network. Use network_mode in the compose file for host, none, bridge, or container networks.');
     }
@@ -6056,7 +6274,7 @@ app.post('/api/launch/finalize', async (req, res) => {
       } catch {}
     }
     if (useNetwork && !networkNames.includes(useNetwork)) {
-      if (useNetwork === 'wicked' || createNetwork === true) {
+      if (useNetwork === 'wicked' || useNetwork === defaultsCfg.defaultNetwork || createNetwork === true) {
         await createNetworkStrict(useNetwork);
         networkNames.push(useNetwork);
       } else {
@@ -6095,6 +6313,12 @@ app.post('/api/launch/finalize', async (req, res) => {
     }
     ensureWritableDirectory(targetDir, { label: 'app directory' });
     if (!isInsideApps(targetDir)) throw httpError(400, 'Invalid app directory');
+    let appDataPath = '';
+    try {
+      appDataPath = await ensureAppDataDirectory(name);
+    } catch (e) {
+      throw e.status ? e : httpError(400, `Could not prepare the app data directory: ${e.message}`);
+    }
 
     let finalCompose = composeBody;
     if (runMode) {
@@ -6191,7 +6415,21 @@ app.post('/api/launch/finalize', async (req, res) => {
     for (const volume of analysis.missingVolumes || []) {
       const choice = (volumeChoices || {})[volume.key] || {};
       let source = String(choice.source || volume.source || '').trim();
-      const create = choice.create === true;
+      let create = choice.create === true;
+      if (!choice.source && defaultsCfg.dataLocation && defaultsCfg.autoAppData !== false) {
+        // Missing relative bind mounts (for example ./data) are project-local
+        // paths that were never checked in. Put them under the configured data
+        // location so app state survives updates and re-creation.
+        const resolvedOriginal = path.resolve(String(volume.source || ''));
+        const resolvedProject = path.resolve(targetDir);
+        const projectLocal = resolvedOriginal === resolvedProject ||
+          resolvedOriginal.startsWith(resolvedProject + path.sep);
+        const autoSource = defaultVolumeSource(name, volume.target, defaultsCfg);
+        if (projectLocal && autoSource) {
+          source = autoSource;
+          create = true;
+        }
+      }
       if (!source) {
         unresolvedVolumes.push(volume);
         continue;
@@ -6205,13 +6443,25 @@ app.post('/api/launch/finalize', async (req, res) => {
         continue;
       }
       if (!fs.existsSync(source)) {
+        if (defaultsCfg.dataLocation && defaultsCfg.allowOutsideData === false && !dataLocationContains(source, defaultsCfg)) {
+          unresolvedVolumes.push({
+            ...volume,
+            source,
+            reason: `Outside the configured data location (${defaultsCfg.dataLocation}). Enable outside paths in Dok Settings or choose a path inside it.`
+          });
+          continue;
+        }
         if (!create) {
           unresolvedVolumes.push({ ...volume, source });
           continue;
         }
         const safe = safeHostPath(source);
         try {
-          await ensureHostDirectory(safe, { label: 'host path', action: 'creating' });
+          await ensureHostDirectory(safe, {
+            label: 'host path',
+            action: 'creating',
+            mode: dataModeValue(defaultsCfg.dataMode)
+          });
         } catch (e) {
           if (e.status) throw e;
           throw httpError(400, `Could not create host path ${safe}: ${e.message}`);
@@ -6314,6 +6564,7 @@ app.post('/api/launch/finalize', async (req, res) => {
       appDir: targetDir,
       composeFile: 'docker-compose.yml',
       command: command || '',
+      dataPath: appDataPath,
       launch: {
         mode: type === 'run' ? 'compose' : mode,
         name,
@@ -6327,6 +6578,7 @@ app.post('/api/launch/finalize', async (req, res) => {
       }
     });
 
+    registrySaved = true;
     if (stagedToRemove) {
       try {
         fs.rmSync(stagedToRemove, { recursive: true, force: true });
@@ -6362,7 +6614,7 @@ app.post('/api/launch/finalize', async (req, res) => {
     }
 
     res.json({
-      ok: true, appDir: targetDir, appName: name, ...result,
+      ok: true, appDir: targetDir, appName: name, appDataPath, ...result,
       issues: [...new Set([...validationIssues, ...combinedIssues])], launchError,
       launchPending,
       message: launchPending ? `${name} is still starting.` : ''
@@ -6370,7 +6622,8 @@ app.post('/api/launch/finalize', async (req, res) => {
   } catch (e) {
     res.status(e.status || 500).json({
       error: e.message, stdout: e.stdout, stderr: e.stderr,
-      needsOverwrite: !!e.needsOverwrite, appName: e.appName
+      needsOverwrite: !!e.needsOverwrite, appName: e.appName || (registrySaved ? finalizedAppName : undefined),
+      created: registrySaved
     });
   }
 });
@@ -6630,6 +6883,172 @@ app.post('/api/settings', (req, res) => {
     res.json(redactSettingsSecrets(next));
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+function dataModeValue(value) {
+  const text = String(value ?? '').trim().replace(/^0o/i, '').replace(/^0+/, '') || '775';
+  if (!/^[0-7]{3,4}$/.test(text)) throw httpError(400, 'Data directory permissions must be an octal mode such as 775 or 0775');
+  const mode = parseInt(text, 8);
+  if (mode < 0o700) throw httpError(400, 'Data directory permissions must allow the owner to read, write, and enter the directory (at least 700)');
+  return mode;
+}
+
+function storedDataMode(value) {
+  return '0' + dataModeValue(value).toString(8).padStart(3, '0');
+}
+
+function defaultsForClient(settings) {
+  const source = settings || readSettings();
+  const defaults = defaultsDefaults(source.defaults || {});
+  if (!defaults.dokDomain) defaults.dokDomain = normalizeDomain(source.services?.nginxProxy?.domain || '');
+  const redacted = redactSettingsSecrets({ defaults }).defaults;
+  redacted.adminPasswordSet = !!defaults.adminPassword;
+  return redacted;
+}
+
+function validateDefaultDomain(value, label) {
+  const domain = normalizeDomain(value);
+  if (domain && !/^[A-Za-z0-9*][A-Za-z0-9*._-]*$/.test(domain)) {
+    throw httpError(400, `Invalid ${label}`);
+  }
+  return domain;
+}
+
+async function applyDefaultDataLocation(defaults, { includeApps = true } = {}) {
+  const location = String(defaults?.dataLocation || '').trim();
+  if (!location) return { path: '', mode: '' };
+  if (!path.isAbsolute(location) || location === '/' || /[\r\n:\0]/.test(location)) {
+    throw httpError(400, 'Data location must be a dedicated absolute host path without colons or newlines');
+  }
+  const mode = dataModeValue(defaults.dataMode);
+  await ensureHostDirectory(location, { label: 'data location', action: 'creating', mode });
+  if (includeApps) {
+    const appsRoot = path.join(location, 'apps');
+    await ensureHostDirectory(appsRoot, { label: 'data location apps directory', action: 'creating', mode });
+  }
+  return { path: location, mode: '0' + mode.toString(8).padStart(3, '0') };
+}
+
+function configuredDefaults() {
+  return defaultsDefaults(readSettings().defaults || {});
+}
+
+function appDefaultDataDir(name) {
+  const defaults = configuredDefaults();
+  if (!defaults.dataLocation || defaults.autoAppData === false) return '';
+  return path.join(defaults.dataLocation, 'apps', projectName(name, 'app'), 'data');
+}
+
+function dataLocationContains(target, defaults = configuredDefaults()) {
+  if (!defaults.dataLocation || !target) return true;
+  const root = path.resolve(defaults.dataLocation);
+  const resolved = path.resolve(String(target));
+  return resolved === root || resolved.startsWith(root + path.sep);
+}
+
+function defaultVolumeSource(name, target, defaults = configuredDefaults()) {
+  if (!defaults.dataLocation) return '';
+  const slug = String(target || '')
+    .replace(/^[/\\]+/, '')
+    .replace(/[^A-Za-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'data';
+  const base = path.join(defaults.dataLocation, 'apps', projectName(name, 'app'), 'data');
+  return slug === 'data' ? base : path.join(base, slug);
+}
+
+async function ensureAppDataDirectory(name) {
+  const dir = appDefaultDataDir(name);
+  if (!dir) return '';
+  const defaults = configuredDefaults();
+  await ensureHostDirectory(dir, {
+    label: 'app data directory',
+    action: 'creating',
+    mode: dataModeValue(defaults.dataMode)
+  });
+  return dir;
+}
+
+function defaultsPatch(current, body = {}) {
+  const next = defaultsDefaults(current);
+  if (body.primaryDomain !== undefined) next.primaryDomain = validateDefaultDomain(body.primaryDomain, 'primary domain');
+  if (body.dokDomain !== undefined) next.dokDomain = validateDefaultDomain(body.dokDomain, 'Dok domain');
+  if (body.dataLocation !== undefined) {
+    const location = String(body.dataLocation || '').trim();
+    if (location && !path.isAbsolute(location)) throw httpError(400, 'Data location must be an absolute path');
+    if (/[\r\n:\0]/.test(location)) throw httpError(400, 'Data location contains unsupported characters');
+    if (location === '/') throw httpError(400, 'Choose a dedicated data location directory, not the filesystem root');
+    next.dataLocation = location ? path.resolve(location) : '';
+  }
+  if (body.dataMode !== undefined) next.dataMode = storedDataMode(body.dataMode);
+  if (body.allowOutsideData !== undefined) next.allowOutsideData = body.allowOutsideData === true;
+  if (body.autoAppData !== undefined) next.autoAppData = body.autoAppData === true;
+  if (body.protectDok !== undefined) next.protectDok = body.protectDok === true;
+  if (body.adminUser !== undefined) {
+    const user = String(body.adminUser || '').trim();
+    if (user && !/^[A-Za-z0-9._@-]+$/.test(user)) throw httpError(400, 'Invalid default admin username');
+    next.adminUser = user || 'admin';
+  }
+  if (body.adminEmail !== undefined) {
+    const email = String(body.adminEmail || '').trim();
+    if (email && (!email.includes('@') || /[\r\n<>]/.test(email))) throw httpError(400, 'Invalid default admin email');
+    next.adminEmail = email;
+  }
+  if (body.clearAdminPassword === true) next.adminPassword = '';
+  else if (body.adminPassword) next.adminPassword = String(body.adminPassword);
+  if (body.defaultNetwork !== undefined) {
+    const network = String(body.defaultNetwork || '').trim() || 'wicked';
+    if (!isUserNetworkName(network) || network === 'bridge') throw httpError(400, 'Invalid default network name');
+    next.defaultNetwork = network;
+  }
+  const nginxDomain = normalizeDomain(body.nginxDomain || '');
+  if (!next.dokDomain && nginxDomain) next.dokDomain = nginxDomain;
+  if (next.protectDok && !next.dokDomain) {
+    throw httpError(400, 'Set a Dok domain (or a nginx domain) before requiring auth on the Dok UI');
+  }
+  return next;
+}
+
+app.get('/api/settings/defaults', (req, res) => {
+  try {
+    res.json({ ok: true, defaults: defaultsForClient(readSettings()) });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+app.post('/api/settings/defaults', async (req, res) => {
+  try {
+    const settings = readSettings();
+    const defaults = defaultsPatch(settings.defaults || {}, { ...(req.body || {}), nginxDomain: settings.services?.nginxProxy?.domain || '' });
+    const applied = await applyDefaultDataLocation(defaults);
+    if (defaults.dokDomain && !normalizeDomain(settings.services?.nginxProxy?.domain || '')) {
+      settings.services = settings.services || {};
+      settings.services.nginxProxy = {
+        ...(settings.services.nginxProxy || {}),
+        domain: defaults.dokDomain
+      };
+    }
+    settings.defaults = defaults;
+    writeSettings(settings);
+    const publicDefaults = defaultsForClient(settings);
+    if (req.body?.protectDok !== undefined || defaults.protectDok) {
+      try { await syncAuthVhosts(); } catch (e) { appendServerLog('WARN', `Authelia sync after defaults change failed: ${e.message}`); }
+    }
+    res.json({ ok: true, defaults: publicDefaults, dataLocation: applied.path, dataMode: applied.mode });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+app.post('/api/settings/defaults/apply', async (req, res) => {
+  try {
+    const settings = readSettings();
+    const defaults = defaultsDefaults(settings.defaults || {});
+    const applied = await applyDefaultDataLocation(defaults);
+    res.json({ ok: true, dataLocation: applied.path, dataMode: applied.mode });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
   }
 });
 
@@ -7155,8 +7574,10 @@ app.post('/api/core/nginx-proxy/run', async (req, res) => {
     const body = req.body || {};
     const settings = readSettings();
     const configured = settings.services?.nginxProxy || {};
-    const network = String(body.network || configured.network || 'wicked').trim() || 'wicked';
-    const domain = normalizeDomain(body.domain !== undefined ? body.domain : (configured.domain || ''));
+    const installDefaults = configuredDefaults();
+    const network = String(body.network || configured.network || installDefaults.defaultNetwork || 'wicked').trim() || 'wicked';
+    const configuredDomain = configured.domain || installDefaults.dokDomain || '';
+    const domain = normalizeDomain(body.domain !== undefined ? body.domain : configuredDomain);
     if (domain && !/^[A-Za-z0-9*][A-Za-z0-9*._-]*$/.test(domain)) {
       return res.status(400).json({ error: 'Invalid domain name' });
     }
@@ -7410,9 +7831,15 @@ app.post('/api/core/auth/run', async (req, res) => {
   try {
     const body = req.body || {};
     const settings = readSettings();
+    const installDefaults = configuredDefaults();
     const auth = { ...(settings.services?.authentik || {}) };
     if (body.adminEmail !== undefined) auth.adminEmail = String(body.adminEmail || '').trim();
+    else if (!auth.adminEmail) auth.adminEmail = installDefaults.adminEmail;
     if (body.adminPassword) auth.adminPassword = String(body.adminPassword);
+    else if (!auth.adminPassword && installDefaults.adminPassword) auth.adminPassword = installDefaults.adminPassword;
+    if (body.domain === undefined && !auth.domain && installDefaults.primaryDomain) {
+      auth.domain = normalizeDomain('sso.' + installDefaults.primaryDomain);
+    }
     if (body.domain !== undefined) {
       const domain = normalizeDomain(body.domain);
       if (domain && !/^[A-Za-z0-9*][A-Za-z0-9*._-]*$/.test(domain)) return res.status(400).json({ error: 'Invalid domain name' });
@@ -7530,7 +7957,9 @@ app.post('/api/core/authelia/run', async (req, res) => {
     const body = req.body || {};
     const settings = readSettings();
     const authelia = autheliaDefaults(settings.services?.authelia || {});
-    const domain = normalizeDomain(body.domain !== undefined ? body.domain : authelia.domain);
+    const installDefaults = configuredDefaults();
+    let domain = normalizeDomain(body.domain !== undefined ? body.domain : authelia.domain);
+    if (!domain && installDefaults.primaryDomain) domain = normalizeDomain('auth.' + installDefaults.primaryDomain);
     if (!domain) return res.status(400).json({ error: 'Authelia needs a portal domain, for example auth.example.com' });
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(domain) || !domain.includes('.')) {
       return res.status(400).json({ error: 'Invalid domain name (Authelia needs a domain with a dot)' });
@@ -7546,9 +7975,13 @@ app.post('/api/core/authelia/run', async (req, res) => {
       authelia.adminUser = user || 'admin';
     }
     if (body.adminEmail !== undefined) authelia.adminEmail = String(body.adminEmail || '').trim();
+    else if (!authelia.adminEmail) authelia.adminEmail = installDefaults.adminEmail;
+    if (body.adminUser === undefined && (!authelia.adminUser || authelia.adminUser === 'admin')) {
+      authelia.adminUser = installDefaults.adminUser || 'admin';
+    }
     const providedPassword = body.adminPassword ? String(body.adminPassword) : '';
     if (providedPassword) authelia.adminPassword = providedPassword;
-    if (!authelia.adminPassword) authelia.adminPassword = randomSecret(12);
+    if (!authelia.adminPassword) authelia.adminPassword = installDefaults.adminPassword || randomSecret(12);
     if (!authelia.sessionSecret) authelia.sessionSecret = randomSecret(32);
     if (!authelia.encryptionKey) authelia.encryptionKey = randomSecret(32);
     if (!authelia.jwtSecret) authelia.jwtSecret = randomSecret(32);
@@ -7627,6 +8060,178 @@ app.post('/api/core/authelia/domain', async (req, res) => {
     res.json({ ok: true, domain, restarted: status.running, url: domain ? `https://${domain}` : '', protectedHosts: synced.hosts, stdout, stderr });
   } catch (e) {
     res.status(500).json({ error: e.message, stdout: e.stdout, stderr: e.stderr });
+  }
+});
+
+
+function autheliaUsersForClient(raw = {}) {
+  const authelia = autheliaDefaults(raw);
+  const admin = {
+    username: authelia.adminUser || 'admin',
+    email: authelia.adminEmail || '',
+    admin: true,
+    passwordSet: !!authelia.adminPasswordHash,
+    disabled: false
+  };
+  const users = (Array.isArray(authelia.users) ? authelia.users : [])
+    .filter(entry => entry && entry.username && entry.username !== admin.username)
+    .map(entry => ({
+      username: String(entry.username),
+      displayname: String(entry.displayname || entry.username),
+      email: String(entry.email || ''),
+      disabled: entry.disabled === true,
+      passwordSet: !!(entry.passwordHashEnc || entry.passwordHash),
+      admin: false
+    }));
+  return { admin, users };
+}
+
+async function refreshAutheliaConfig(raw = null, { restart = true } = {}) {
+  const settings = raw || readSettings();
+  const authelia = autheliaDefaults(settings.services?.authelia || {});
+  if (!authelia.domain) throw httpError(400, 'Set the Authelia portal domain first');
+  if (!authelia.adminPasswordHash) throw httpError(400, 'Set the Authelia admin password first');
+  const cookieDomains = await authProtectedCookieDomains(authelia.domain);
+  const written = await writeAutheliaConfig(authelia, cookieDomains);
+  let restarted = false;
+  if (restart && written.changed) {
+    const containers = await docker.listContainers({ all: false }).catch(() => []);
+    if (containers.some(c => (c.Names || []).some(n => n.replace(/^\//, '') === 'authelia'))) {
+      await run('docker', ['restart', 'authelia']).catch(() => {});
+      restarted = true;
+    }
+  }
+  return { changed: written.changed, restarted };
+}
+
+function validAutheliaUsername(value) {
+  const username = String(value || '').trim();
+  if (!username || !/^[A-Za-z0-9][A-Za-z0-9._@-]*$/.test(username)) {
+    throw httpError(400, 'Usernames may only contain letters, numbers, dots, underscores, @, and hyphens');
+  }
+  return username;
+}
+
+function validAutheliaEmail(value) {
+  const email = String(value || '').trim();
+  if (email && (!email.includes('@') || /[\r\n<>]/.test(email))) throw httpError(400, 'Invalid email address');
+  return email;
+}
+
+
+app.post('/api/core/authelia/admin', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const settings = readSettings();
+    const authelia = autheliaDefaults(settings.services?.authelia || {});
+    if (body.username !== undefined) authelia.adminUser = validAutheliaUsername(body.username);
+    if (body.email !== undefined) authelia.adminEmail = validAutheliaEmail(body.email);
+    if (body.password) {
+      const password = String(body.password);
+      if (password.length < 8) return res.status(400).json({ error: 'Passwords must be at least 8 characters' });
+      authelia.adminPassword = password;
+      authelia.adminPasswordHash = await autheliaPasswordHash(password);
+    }
+    settings.services = settings.services || {};
+    settings.services.authelia = authelia;
+    writeSettings(settings);
+    if (authelia.domain) await refreshAutheliaConfig(settings, { restart: true });
+    try { await syncAuthVhosts(); } catch {}
+    res.json({ ok: true, ...autheliaUsersForClient(authelia) });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+app.get('/api/core/authelia/users', (req, res) => {
+  try {
+    const settings = readSettings();
+    res.json({ ok: true, ...autheliaUsersForClient(settings.services?.authelia || {}) });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+app.post('/api/core/authelia/users', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const settings = readSettings();
+    const authelia = autheliaDefaults(settings.services?.authelia || {});
+    const username = validAutheliaUsername(body.username);
+    const original = body.originalUsername ? validAutheliaUsername(body.originalUsername) : username;
+    if (username === String(authelia.adminUser || 'admin')) {
+      return res.status(400).json({ error: 'Use the admin credentials section to change the admin account' });
+    }
+    const users = Array.isArray(authelia.users) ? authelia.users.slice() : [];
+    const index = users.findIndex(entry => String(entry?.username || '') === original);
+    if (users.some((entry, entryIndex) => entryIndex !== index && String(entry?.username || '') === username)) {
+      return res.status(409).json({ error: 'A user with that name already exists' });
+    }
+    const existing = index >= 0 ? users[index] : {};
+    const email = validAutheliaEmail(body.email);
+    const displayname = String(body.displayname || username).trim() || username;
+    let passwordHashEnc = String(existing.passwordHashEnc || '');
+    const password = body.password ? String(body.password) : '';
+    if (password) {
+      if (password.length < 8) return res.status(400).json({ error: 'Passwords must be at least 8 characters' });
+      passwordHashEnc = encryptSecret(await autheliaPasswordHash(password));
+    }
+    if (!passwordHashEnc && !existing.passwordHash) {
+      return res.status(400).json({ error: 'A password is required for a new Authelia user' });
+    }
+    const entry = { username, displayname, email, disabled: body.disabled === true, passwordHashEnc };
+    if (index >= 0) users[index] = entry;
+    else users.push(entry);
+    authelia.users = users;
+    settings.services = settings.services || {};
+    settings.services.authelia = authelia;
+    writeSettings(settings);
+    if (authelia.domain && authelia.adminPasswordHash) await refreshAutheliaConfig(settings, { restart: true });
+    try { await syncAuthVhosts(); } catch {}
+    res.json({ ok: true, ...autheliaUsersForClient(authelia) });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/core/authelia/users/:username', async (req, res) => {
+  try {
+    const settings = readSettings();
+    const authelia = autheliaDefaults(settings.services?.authelia || {});
+    const username = validAutheliaUsername(req.params.username);
+    if (username === String(authelia.adminUser || 'admin')) {
+      return res.status(400).json({ error: 'The admin account cannot be removed' });
+    }
+    authelia.users = (Array.isArray(authelia.users) ? authelia.users : [])
+      .filter(entry => String(entry?.username || '') !== username);
+    settings.services = settings.services || {};
+    settings.services.authelia = authelia;
+    writeSettings(settings);
+    if (authelia.domain && authelia.adminPasswordHash) await refreshAutheliaConfig(settings, { restart: true });
+    try { await syncAuthVhosts(); } catch {}
+    res.json({ ok: true, ...autheliaUsersForClient(authelia) });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+app.post('/api/core/authelia/dok-protection', async (req, res) => {
+  try {
+    const settings = readSettings();
+    const protect = req.body?.protect === true;
+    const defaults = defaultsDefaults(settings.defaults || {});
+    const dokDomain = normalizeDomain(defaults.dokDomain || settings.services?.nginxProxy?.domain || '');
+    if (protect && !dokDomain) {
+      return res.status(400).json({ error: 'Set the Dok domain in Dok Settings before requiring authentication' });
+    }
+    defaults.protectDok = protect;
+    if (!defaults.dokDomain && dokDomain) defaults.dokDomain = dokDomain;
+    settings.defaults = defaults;
+    writeSettings(settings);
+    const synced = await syncAuthVhosts();
+    res.json({ ok: true, protectDok: protect, dokDomain, ...synced });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
   }
 });
 
@@ -7842,8 +8447,13 @@ app.post('/api/core/dns/run', async (req, res) => {
   try {
     const body = req.body || {};
     const settings = readSettings();
+    const installDefaults = configuredDefaults();
     const dns = { ...(settings.services?.technitium || {}) };
     if (body.adminPassword) dns.adminPassword = String(body.adminPassword);
+    else if (!dns.adminPassword && installDefaults.adminPassword) dns.adminPassword = installDefaults.adminPassword;
+    if (body.domain === undefined && !dns.domain && installDefaults.primaryDomain) {
+      dns.domain = normalizeDomain('dns.' + installDefaults.primaryDomain);
+    }
     if (body.webPort !== undefined) {
       const port = Number(body.webPort);
       if (!Number.isInteger(port) || port < 1 || port > 65535) return res.status(400).json({ error: 'Invalid web port' });
@@ -8521,7 +9131,7 @@ function terminalSessionSummary(session) {
   };
 }
 
-async function createTerminalSession({ mode = 'admin', app = 'shell' } = {}) {
+async function createTerminalSession({ mode = 'admin', app = 'shell', prompt = '', title = '' } = {}) {
   if (!TERMINAL_MODES[mode]) throw httpError(400, 'Unknown terminal mode');
   if (!['shell', 'opencode'].includes(app)) throw httpError(400, 'Unknown terminal application');
   if (terminalSessions.size >= OPENCODE_MAX_SESSIONS) {
@@ -8542,17 +9152,18 @@ async function createTerminalSession({ mode = 'admin', app = 'shell' } = {}) {
     writeOpencodeConfigs(settings);
     binary = info.path;
     args = ['--agent', mode];
+    if (prompt) args.push('--prompt', String(prompt));
     version = info.version;
   }
 
   fs.mkdirSync(cwd, { recursive: true });
   const id = `term_${crypto.randomBytes(12).toString('hex')}`;
-  const title = app === 'opencode' ? `OpenCode · ${TERMINAL_MODES[mode].label}` : `Terminal · ${TERMINAL_MODES[mode].label}`;
+  const sessionTitle = title || (app === 'opencode' ? `OpenCode · ${TERMINAL_MODES[mode].label}` : `Terminal · ${TERMINAL_MODES[mode].label}`);
   const session = {
     id,
     mode,
     app,
-    title,
+    title: sessionTitle,
     cwd,
     version,
     createdAt: new Date().toISOString(),

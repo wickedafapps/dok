@@ -1694,7 +1694,7 @@ function openAppConfig(data) {
   };
   pendingSaveAction = null;
   qs('#appCfgName').value = data.appName || '';
-  qs('#appCfgNetwork').value = data.network || 'wicked';
+  qs('#appCfgNetwork').value = data.network || installDefaults.defaultNetwork || 'wicked';
   const notices = [];
   if (Array.isArray(data.unsupported) && data.unsupported.length) {
     notices.push(`These docker run options were not converted and may need to be added manually: ${data.unsupported.join(', ')}`);
@@ -1897,7 +1897,7 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
     }
     return;
   }
-  const network = qs('#appCfgNetwork').value.trim() || 'wicked';
+  const network = qs('#appCfgNetwork').value.trim() || installDefaults.defaultNetwork || 'wicked';
   const quick = appCfgBuilderManual
     ? { ports: '', vhost: '', vhostPort: '' }
     : appCfgBuilderQuickValues();
@@ -1906,6 +1906,7 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
 
   await loadNetworksForModal();
   if (appCfgNetworksLoaded && network && !isSpecialNetworkName(network) && network !== 'wicked' &&
+      network !== installDefaults.defaultNetwork &&
       !appCfgNetworks.includes(network)) {
     msg.textContent = `Network "${network}" does not exist. Click "Create network" or choose an existing network.`;
     fail();
@@ -1968,6 +1969,27 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
     loadApps();
   } catch (e) {
     hideAppCfgProgress();
+    if (e.data?.created) {
+      // The registry entry is the source of truth: the app was saved even if
+      // the launch step timed out or the connection dropped. Close instead of
+      // prompting the user to install the same app again.
+      finishAppCfgProgress('Created');
+      await new Promise(resolve => setTimeout(resolve, 500));
+      qs('#appConfigModal').classList.add('hidden');
+      hideAppCfgProgress();
+      pendingAppConfig = null;
+      pendingSaveAction = null;
+      msg.textContent = '';
+      toast(`${e.data.appName || payload.appName} was created. Check the Apps tab before retrying.`, false, 8000);
+      refreshAll();
+      loadApps();
+      return;
+    }
+    if (e.data?.alreadyFinalizing) {
+      msg.textContent = e.message;
+      toast('This app is already being created. Wait for it to finish.', true);
+      return;
+    }
     if (e.status === 409 && e.data?.needsOverwrite) {
       appCfgOverwritePending = { launchNow, force };
       qs('#appOverwriteName').textContent = e.data.appName || payload.appName;
@@ -2340,7 +2362,8 @@ async function loadRegistry() {
       const meta = [
         launch.network ? `network: ${launch.network}` : '',
         launch.ports && launch.ports.length ? `ports: ${Array.isArray(launch.ports) ? launch.ports.join(', ') : launch.ports}` : '',
-        launch.vhost ? `domain: ${launch.vhost}` : ''
+        launch.vhost ? `domain: ${launch.vhost}` : '',
+        entry.dataPath ? `data: ${entry.dataPath}` : ''
       ].filter(Boolean).join(' · ');
       return `
         <div class="item" data-id="${escapeHtml(entry.id)}">
@@ -2578,8 +2601,141 @@ async function runGitUpdate(force = false) {
   }
 }
 
+let installDefaults = {
+  primaryDomain: '', dokDomain: '', dataLocation: '', dataMode: '0775',
+  allowOutsideData: true, autoAppData: true, adminUser: 'admin',
+  adminEmail: '', defaultNetwork: 'wicked', protectDok: false
+};
+
+function suggestedServiceDomain(prefix) {
+  return installDefaults.primaryDomain ? `${prefix}.${installDefaults.primaryDomain}` : '';
+}
+
+function applyDefaultsToServiceForms() {
+  const defaults = installDefaults || {};
+  const autheliaDomain = qs('#autheliaDomain');
+  if (autheliaDomain && !autheliaDomain.value.trim()) autheliaDomain.placeholder = `Portal domain, e.g. ${suggestedServiceDomain('auth') || 'auth.example.com'}`;
+  if (qs('#autheliaUser') && (!qs('#autheliaUser').value.trim() || qs('#autheliaUser').value === 'admin')) {
+    qs('#autheliaUser').value = defaults.adminUser || 'admin';
+  }
+  if (qs('#autheliaEmail') && !qs('#autheliaEmail').value.trim()) qs('#autheliaEmail').value = defaults.adminEmail || '';
+  if (qs('#autheliaDomain') && !qs('#autheliaDomain').value.trim() && suggestedServiceDomain('auth')) {
+    qs('#autheliaDomain').value = suggestedServiceDomain('auth');
+  }
+  if (qs('#authDomain') && !qs('#authDomain').value.trim() && suggestedServiceDomain('sso')) {
+    qs('#authDomain').value = suggestedServiceDomain('sso');
+  }
+  if (qs('#authEmail') && !qs('#authEmail').value.trim()) qs('#authEmail').value = defaults.adminEmail || '';
+  if (qs('#dnsDomain') && !qs('#dnsDomain').value.trim() && suggestedServiceDomain('dns')) {
+    qs('#dnsDomain').value = suggestedServiceDomain('dns');
+  }
+  if (qs('#mailpitDomain') && !qs('#mailpitDomain').value.trim() && suggestedServiceDomain('mail')) {
+    qs('#mailpitDomain').value = suggestedServiceDomain('mail');
+  }
+  if (qs('#nginxDomain') && !qs('#nginxDomain').value.trim() && defaults.dokDomain) {
+    qs('#nginxDomain').value = defaults.dokDomain;
+  }
+  if (qs('#appCfgNetwork') && (!qs('#appCfgNetwork').value.trim() || qs('#appCfgNetwork').value === 'wicked')) {
+    qs('#appCfgNetwork').value = defaults.defaultNetwork || 'wicked';
+  }
+}
+
+async function loadDefaults() {
+  try {
+    const res = await api('/api/settings/defaults');
+    installDefaults = res.defaults || installDefaults;
+    const d = installDefaults;
+    if (qs('#defaultsPrimaryDomain')) qs('#defaultsPrimaryDomain').value = d.primaryDomain || '';
+    if (qs('#defaultsDokDomain')) qs('#defaultsDokDomain').value = d.dokDomain || '';
+    if (qs('#defaultsDataLocation')) qs('#defaultsDataLocation').value = d.dataLocation || '';
+    if (qs('#defaultsDataMode')) qs('#defaultsDataMode').value = d.dataMode || '0775';
+    if (qs('#defaultsAllowOutsideData')) qs('#defaultsAllowOutsideData').checked = d.allowOutsideData !== false;
+    if (qs('#defaultsAutoAppData')) qs('#defaultsAutoAppData').checked = d.autoAppData !== false;
+    if (qs('#defaultsAdminUser')) qs('#defaultsAdminUser').value = d.adminUser || 'admin';
+    if (qs('#defaultsAdminEmail')) qs('#defaultsAdminEmail').value = d.adminEmail || '';
+    if (qs('#defaultsAdminPassword')) qs('#defaultsAdminPassword').value = '';
+    if (qs('#defaultsClearAdminPassword')) qs('#defaultsClearAdminPassword').checked = false;
+    if (qs('#defaultsNetwork')) qs('#defaultsNetwork').value = d.defaultNetwork || 'wicked';
+    if (qs('#defaultsProtectDok')) qs('#defaultsProtectDok').checked = !!d.protectDok;
+    if (qs('#autheliaProtectDok')) qs('#autheliaProtectDok').checked = !!d.protectDok;
+    if (qs('#defaultsPasswordState')) {
+      qs('#defaultsPasswordState').textContent = d.adminPasswordSet
+        ? 'A default admin password is stored. Leave the password field blank to keep it.'
+        : 'No default admin password stored yet.';
+    }
+    applyDefaultsToServiceForms();
+  } catch (e) {
+    if (qs('#defaultsMsg')) qs('#defaultsMsg').textContent = e.message;
+  }
+}
+
+function defaultsPayload() {
+  const payload = {
+    primaryDomain: qs('#defaultsPrimaryDomain')?.value.trim() || '',
+    dokDomain: qs('#defaultsDokDomain')?.value.trim() || '',
+    dataLocation: qs('#defaultsDataLocation')?.value.trim() || '',
+    dataMode: qs('#defaultsDataMode')?.value.trim() || '0775',
+    allowOutsideData: !!qs('#defaultsAllowOutsideData')?.checked,
+    autoAppData: !!qs('#defaultsAutoAppData')?.checked,
+    adminUser: qs('#defaultsAdminUser')?.value.trim() || 'admin',
+    adminEmail: qs('#defaultsAdminEmail')?.value.trim() || '',
+    defaultNetwork: qs('#defaultsNetwork')?.value.trim() || 'wicked',
+    protectDok: !!qs('#defaultsProtectDok')?.checked,
+    clearAdminPassword: !!qs('#defaultsClearAdminPassword')?.checked
+  };
+  const password = qs('#defaultsAdminPassword')?.value || '';
+  if (password) payload.adminPassword = password;
+  return payload;
+}
+
+async function saveDefaults() {
+  const btn = qs('#saveDefaults');
+  const msg = qs('#defaultsMsg');
+  setLoading(btn, true, 'Saving…');
+  if (msg) msg.textContent = '';
+  try {
+    const res = await api('/api/settings/defaults', jsonBody(defaultsPayload()));
+    installDefaults = res.defaults || installDefaults;
+    if (msg) msg.textContent = res.dataLocation ? `Saved. Data location is ready at ${res.dataLocation} (${res.dataMode}).` : 'Saved.';
+    toast('Default settings saved');
+    await loadDefaults();
+    applyDefaultsToServiceForms();
+    return res;
+  } catch (e) {
+    if (msg) msg.textContent = e.message;
+    toast(e.message, true);
+    throw e;
+  } finally {
+    setLoading(btn, false, 'Save defaults');
+  }
+}
+
+if (qs('#saveDefaults')) qs('#saveDefaults').addEventListener('click', () => saveDefaults().catch(() => {}));
+if (qs('#defaultsRefresh')) qs('#defaultsRefresh').addEventListener('click', loadDefaults);
+if (qs('#defaultsApplyData')) {
+  qs('#defaultsApplyData').addEventListener('click', async () => {
+    const btn = qs('#defaultsApplyData');
+    const msg = qs('#defaultsMsg');
+    setLoading(btn, true, 'Applying…');
+    try {
+      await saveDefaults();
+      const res = await api('/api/settings/defaults/apply', jsonBody({}));
+      if (msg) msg.textContent = res.dataLocation
+        ? `Created ${res.dataLocation} with permissions ${res.dataMode}.`
+        : 'Set a data location first.';
+      toast(res.dataLocation ? 'Data location ready' : 'Set a data location first', !res.dataLocation);
+    } catch (e) {
+      if (msg) msg.textContent = e.message;
+      toast(e.message, true);
+    } finally {
+      setLoading(btn, false, 'Create and apply');
+    }
+  });
+}
+
 async function loadSettings() {
   try {
+    await loadDefaults();
     const s = await api('/api/settings');
     if (qs('#nginxNetwork')) qs('#nginxNetwork').value = s.services?.nginxProxy?.network || 'wicked';
     if (qs('#nginxPort')) {
@@ -2657,6 +2813,7 @@ async function loadCoreNginx() {
   } catch (e) {
     // ignore
   }
+  applyDefaultsToServiceForms();
 }
 
 if (qs('#editNginxCompose')) {
@@ -3178,6 +3335,8 @@ async function loadCoreAuth() {
     if (qs('#authDomainManage')) qs('#authDomainManage').value = res.settings?.domain || '';
     if (qs('#authComposeEditor') && res.compose) qs('#authComposeEditor').value = res.compose;
   } catch {}
+  applyDefaultsToServiceForms();
+
 }
 
 async function loadCoreAuthelia() {
@@ -3193,8 +3352,11 @@ async function loadCoreAuthelia() {
       const hosts = Array.isArray(res.protectedHosts) ? res.protectedHosts : [];
       qs('#autheliaProtected').textContent = `Protected apps: ${hosts.length ? hosts.join(', ') : 'none'}`;
     }
+    if (qs('#autheliaProtectDok')) qs('#autheliaProtectDok').checked = !!installDefaults.protectDok;
     if (qs('#autheliaComposeEditor') && res.compose) qs('#autheliaComposeEditor').value = res.compose;
   } catch {}
+  applyDefaultsToServiceForms();
+
 }
 
 async function loadCoreMail() {
@@ -3231,6 +3393,8 @@ async function loadCoreMail() {
     if (qs('#mailpitDomainManage')) qs('#mailpitDomainManage').value = res.settings?.domain || '';
     if (qs('#mailpitComposeEditor') && res.compose) qs('#mailpitComposeEditor').value = res.compose;
   } catch {}
+  applyDefaultsToServiceForms();
+
 }
 
 async function loadCoreDns() {
@@ -3243,6 +3407,8 @@ async function loadCoreDns() {
     if (qs('#dnsDomainManage')) qs('#dnsDomainManage').value = res.settings?.domain || '';
     if (qs('#dnsComposeEditor') && res.compose) qs('#dnsComposeEditor').value = res.compose;
   } catch {}
+  applyDefaultsToServiceForms();
+
 }
 
 async function loadCoreHelper() {
@@ -3498,6 +3664,73 @@ async function openTerminal({ mode = 'admin', app = 'shell' } = {}) {
   }
 }
 
+async function openExistingTerminal(session) {
+  if (!session?.id) return;
+  const modal = qs('#terminalModal');
+  if (!modal) return;
+  const mode = session.mode === 'user' ? 'user' : 'admin';
+  const app = session.app === 'opencode' ? 'opencode' : 'shell';
+  modal.classList.remove('hidden');
+  if (qs('#terminalModeSelect')) qs('#terminalModeSelect').value = mode;
+  if (qs('#terminalTitle')) qs('#terminalTitle').textContent = session.title || (app === 'opencode' ? 'OpenCode' : 'Terminal');
+  setTerminalModeBadge(mode);
+  setTerminalStatus('Connecting…');
+  const openToken = ++terminalOpenToken;
+  await stopCurrentTerminalSession({ quiet: true });
+  if (openToken !== terminalOpenToken || modal.classList.contains('hidden')) return;
+  resetTerminalView();
+  ensureTerminal();
+  terminalSessionId = session.id;
+  if (qs('#terminalSessionLabel')) qs('#terminalSessionLabel').textContent = session.title || session.id;
+  connectTerminal();
+  setTimeout(fitTerminal, 120);
+}
+
+if (qs('#assistStartBtn')) {
+  qs('#assistStartBtn').addEventListener('click', async () => {
+    const btn = qs('#assistStartBtn');
+    const prompt = qs('#assistPrompt')?.value.trim() || '';
+    const output = qs('#assistOutput');
+    if (!prompt) {
+      toast('Describe the app you want OC Assist to create', true);
+      qs('#assistPrompt')?.focus();
+      return;
+    }
+    const files = [
+      ...Array.from(qs('#assistFiles')?.files || []),
+      ...Array.from(qs('#assistFolder')?.files || [])
+    ];
+    const form = new FormData();
+    form.append('prompt', prompt);
+    form.append('data', qs('#assistData')?.value || '');
+    form.append('name', qs('#assistName')?.value.trim() || '');
+    const paths = [];
+    for (const file of files) {
+      form.append('files', file, file.name);
+      paths.push(file.webkitRelativePath || file.name);
+    }
+    if (paths.length) form.append('paths', JSON.stringify(paths));
+    setLoading(btn, true, 'Starting…');
+    if (output) {
+      output.textContent = 'Starting OpenCode…';
+      output.classList.remove('hidden');
+    }
+    try {
+      const res = await fetch('/api/assist/start', { method: 'POST', body: form });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || res.statusText || 'OC Assist failed to start');
+      if (output) output.textContent = `OpenCode is ready for ${data.appName}. Chat in the terminal; the app will be registered in Apps when it is ready.`;
+      toast(`OC Assist started for ${data.appName}`, false, 6000);
+      await openExistingTerminal(data.session);
+    } catch (e) {
+      if (output) output.textContent = e.message;
+      toast(e.message, true);
+    } finally {
+      setLoading(btn, false, 'Create App with OC Assist');
+    }
+  });
+}
+
 async function loadCoreOpencode() {
   try {
     const res = await api('/api/core/opencode');
@@ -3749,6 +3982,180 @@ if (qs('#autheliaSyncBtn')) {
       toast(e.message, true);
     } finally {
       setLoading(btn, false);
+    }
+  });
+}
+
+// ---------------- Authelia user management ----------------
+let autheliaUsersEditing = '';
+let autheliaUsersCache = [];
+
+function renderAutheliaUsers(users) {
+  const list = qs('#autheliaUsersList');
+  if (!list) return;
+  autheliaUsersCache = Array.isArray(users) ? users : [];
+  if (!autheliaUsersCache.length) {
+    list.innerHTML = '<div class="empty">No additional Authelia users yet.</div>';
+    return;
+  }
+  list.innerHTML = autheliaUsersCache.map(user => `
+    <div class="item">
+      <div class="item-header">
+        <div>
+          <div class="item-title">${escapeHtml(user.displayname || user.username)} <span class="muted">(${escapeHtml(user.username)})</span>${user.disabled ? ' <span class="mode-pill">disabled</span>' : ''}</div>
+          <div class="item-sub">${escapeHtml(user.email || 'no email')} · ${user.passwordSet ? 'password set' : 'no password'}</div>
+        </div>
+        <div class="inline">
+          <button class="btn" data-authelia-user-edit="${escapeHtml(user.username)}">Edit</button>
+          <button class="btn btn-danger" data-authelia-user-delete="${escapeHtml(user.username)}">Delete</button>
+        </div>
+      </div>
+    </div>`).join('');
+  list.querySelectorAll('[data-authelia-user-edit]').forEach(btn => {
+    btn.addEventListener('click', () => editAutheliaUser(btn.dataset.autheliaUserEdit));
+  });
+  list.querySelectorAll('[data-authelia-user-delete]').forEach(btn => {
+    btn.addEventListener('click', () => deleteAutheliaUser(btn.dataset.autheliaUserDelete));
+  });
+}
+
+function resetAutheliaUserForm() {
+  autheliaUsersEditing = '';
+  if (qs('#autheliaUserName')) qs('#autheliaUserName').value = '';
+  if (qs('#autheliaUserDisplay')) qs('#autheliaUserDisplay').value = '';
+  if (qs('#autheliaUserEmail')) qs('#autheliaUserEmail').value = '';
+  if (qs('#autheliaUserPassword')) qs('#autheliaUserPassword').value = '';
+  if (qs('#autheliaUserDisabled')) qs('#autheliaUserDisabled').checked = false;
+  if (qs('#autheliaUserSave')) qs('#autheliaUserSave').textContent = 'Add user';
+  qs('#autheliaUserCancel')?.classList.add('hidden');
+}
+
+function editAutheliaUser(username) {
+  const user = autheliaUsersCache.find(item => item.username === username);
+  if (!user) return;
+  autheliaUsersEditing = username;
+  if (qs('#autheliaUserName')) qs('#autheliaUserName').value = user.username;
+  if (qs('#autheliaUserDisplay')) qs('#autheliaUserDisplay').value = user.displayname || '';
+  if (qs('#autheliaUserEmail')) qs('#autheliaUserEmail').value = user.email || '';
+  if (qs('#autheliaUserPassword')) qs('#autheliaUserPassword').value = '';
+  if (qs('#autheliaUserDisabled')) qs('#autheliaUserDisabled').checked = !!user.disabled;
+  if (qs('#autheliaUserSave')) qs('#autheliaUserSave').textContent = 'Update user';
+  qs('#autheliaUserCancel')?.classList.remove('hidden');
+}
+
+async function loadAutheliaUsers() {
+  try {
+    const res = await api('/api/core/authelia/users');
+    renderAutheliaUsers(res.users || []);
+    const admin = res.admin || {};
+    if (qs('#autheliaAdminUser')) qs('#autheliaAdminUser').value = admin.username || 'admin';
+    if (qs('#autheliaAdminEmail')) qs('#autheliaAdminEmail').value = admin.email || '';
+    if (qs('#autheliaAdminState')) qs('#autheliaAdminState').textContent = admin.passwordSet ? 'password set' : 'password missing';
+    if (qs('#autheliaUsersHint')) {
+      const portal = coreAutheliaData?.url || '';
+      qs('#autheliaUsersHint').textContent = portal
+        ? `Manage the local Authelia user database. Portal: ${portal}. Provider and application policies are configured there.`
+        : 'Manage the local Authelia user database. Provider and application policies are configured in the Authelia portal.';
+    }
+  } catch (e) {
+    if (qs('#autheliaUsersMsg')) qs('#autheliaUsersMsg').textContent = e.message;
+    toast(e.message, true);
+  }
+}
+
+async function deleteAutheliaUser(username) {
+  if (!confirm(`Delete Authelia user "${username}"?`)) return;
+  try {
+    await api(`/api/core/authelia/users/${encodeURIComponent(username)}`, { method: 'DELETE' });
+    if (autheliaUsersEditing === username) resetAutheliaUserForm();
+    toast('Authelia user deleted');
+    await loadAutheliaUsers();
+    loadCoreAuthelia();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+if (qs('#autheliaManageBtn')) {
+  qs('#autheliaManageBtn').addEventListener('click', () => {
+    resetAutheliaUserForm();
+    qs('#autheliaUsersModal')?.classList.remove('hidden');
+    loadAutheliaUsers();
+  });
+}
+if (qs('#autheliaUsersRefresh')) qs('#autheliaUsersRefresh').addEventListener('click', loadAutheliaUsers);
+if (qs('#autheliaUserCancel')) qs('#autheliaUserCancel').addEventListener('click', resetAutheliaUserForm);
+if (qs('#autheliaUserSave')) {
+  qs('#autheliaUserSave').addEventListener('click', async () => {
+    const btn = qs('#autheliaUserSave');
+    const msg = qs('#autheliaUsersMsg');
+    const username = qs('#autheliaUserName')?.value.trim() || '';
+    const password = qs('#autheliaUserPassword')?.value || '';
+    if (!username) { if (msg) msg.textContent = 'Username is required.'; return; }
+    setLoading(btn, true, autheliaUsersEditing ? 'Updating…' : 'Adding…');
+    try {
+      const payload = {
+        username,
+        originalUsername: autheliaUsersEditing || '',
+        displayname: qs('#autheliaUserDisplay')?.value.trim() || '',
+        email: qs('#autheliaUserEmail')?.value.trim() || '',
+        disabled: !!qs('#autheliaUserDisabled')?.checked
+      };
+      if (password) payload.password = password;
+      await api('/api/core/authelia/users', jsonBody(payload));
+      resetAutheliaUserForm();
+      if (msg) msg.textContent = 'Saved. Authelia was refreshed.';
+      toast('Authelia user saved');
+      await loadAutheliaUsers();
+    } catch (e) {
+      if (msg) msg.textContent = e.message;
+      toast(e.message, true);
+    } finally {
+      setLoading(btn, false, autheliaUsersEditing ? 'Update user' : 'Add user');
+    }
+  });
+}
+if (qs('#autheliaAdminSave')) {
+  qs('#autheliaAdminSave').addEventListener('click', async () => {
+    const btn = qs('#autheliaAdminSave');
+    setLoading(btn, true, 'Saving…');
+    try {
+      const payload = {
+        username: qs('#autheliaAdminUser')?.value.trim() || 'admin',
+        email: qs('#autheliaAdminEmail')?.value.trim() || ''
+      };
+      const password = qs('#autheliaAdminPassword')?.value || '';
+      if (password) payload.password = password;
+      await api('/api/core/authelia/admin', jsonBody(payload));
+      if (qs('#autheliaAdminPassword')) qs('#autheliaAdminPassword').value = '';
+      if (qs('#autheliaUsersMsg')) qs('#autheliaUsersMsg').textContent = 'Admin account saved and Authelia restarted.';
+      toast('Authelia admin account saved');
+      await loadAutheliaUsers();
+      loadCoreAuthelia();
+    } catch (e) {
+      toast(e.message, true);
+    } finally {
+      setLoading(btn, false, 'Save admin');
+    }
+  });
+}
+if (qs('#autheliaProtectDok')) {
+  qs('#autheliaProtectDok').addEventListener('change', async () => {
+    const checkbox = qs('#autheliaProtectDok');
+    const msg = qs('#autheliaProtectDokMsg');
+    try {
+      const res = await api('/api/core/authelia/dok-protection', jsonBody({ protect: checkbox.checked }));
+      installDefaults.protectDok = res.protectDok;
+      if (qs('#defaultsProtectDok')) qs('#defaultsProtectDok').checked = !!res.protectDok;
+      if (msg) msg.textContent = res.protectDok
+        ? `Dok UI protected at ${res.dokDomain}.`
+        : 'Dok UI protection disabled.';
+      toast(res.protectDok ? 'Dok UI now requires Authelia login' : 'Dok UI protection disabled', false, 8000);
+      loadCoreAuthelia();
+    } catch (e) {
+      checkbox.checked = !checkbox.checked;
+      if (msg) msg.textContent = e.message;
+      toast(e.message, true);
     }
   });
 }
@@ -4413,28 +4820,34 @@ async function openAuthContainersPicker() {
   modal.classList.remove('hidden');
   try {
     const containers = await api('/api/containers');
-    const candidates = (containers || []).filter(c => !c.core && !c.self);
+    const candidates = (containers || []).filter(c => c.running);
     if (!candidates.length) {
-      list.innerHTML = '<div class="empty">No workload containers found. Deploy an app first, then run this again.</div>';
+      list.innerHTML = '<div class="empty">No running containers found. Start an app or core service first, then run this again.</div>';
       return;
     }
-    list.innerHTML = candidates.map(c => `
+    list.innerHTML = candidates.map(c => {
+      const locked = !!c.self;
+      const note = c.self
+        ? ' · Dok itself: use "Require login for the Dok UI" in Dok Settings'
+        : c.protected ? ' · protected core service (managed separately)' : '';
+      return `
       <label class="item" style="cursor:pointer">
         <div class="item-header">
           <div>
-            <div class="item-title"><input type="checkbox" value="${escapeHtml(c.id)}"> ${escapeHtml(c.name || c.shortId)} ${stateChip(c.state)}</div>
-            <div class="item-sub">${escapeHtml(c.image)}${c.project ? ` · ${escapeHtml(c.project)}` : ''}</div>
+            <div class="item-title"><input type="checkbox" value="${escapeHtml(c.id)}" ${locked ? 'disabled' : ''}> ${escapeHtml(c.name || c.shortId)} ${stateChip(c.state)}</div>
+            <div class="item-sub">${escapeHtml(c.image)}${c.project ? ` · ${escapeHtml(c.project)}` : ''}${note}</div>
             ${containerPorts(c.ports) ? `<div class="ports">${containerPorts(c.ports)}</div>` : ''}
           </div>
         </div>
-      </label>`).join('');
+      </label>`;
+    }).join('');
   } catch (e) {
     list.innerHTML = `<div class="empty">Unable to load containers: ${escapeHtml(e.message)}</div>`;
   }
 }
 
 function authPickerInputs() {
-  return Array.from(qsa('#authContainersList input[type="checkbox"]'));
+  return Array.from(qsa('#authContainersList input[type="checkbox"]')).filter(input => !input.disabled);
 }
 
 if (qs('#authSelectAll')) {
