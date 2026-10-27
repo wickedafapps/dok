@@ -329,6 +329,7 @@
           <h3>nginx-proxy <span class="muted">(core service)</span></h3>
           <p class="muted">Only 1 nginx-proxy can be made from core services. Default network is "wicked".</p>
           <div id="nginxCreateSection">
+            <p id="nginxCreateHint" class="muted hidden">A saved nginx-proxy compose file was found, but no container exists. Running nginx-proxy will reuse it; use Edit compose to review or change it first.</p>
             <div class="row">
               <input id="nginxNetwork" class="input" placeholder="Network name" value="wicked">
               <input id="nginxPort" class="input" placeholder="Default VIRTUAL_PORT" value="80">
@@ -470,6 +471,7 @@
             <div class="row">
               <span class="muted" id="autheliaProtected">Protected apps: —</span>
               <button id="autheliaSyncBtn" class="btn">Sync protected apps</button>
+              <button id="autheliaPickContainers" class="btn">Protect containers</button>
               <span id="autheliaSyncMsg" class="muted"></span>
             </div>
           </div>
@@ -696,7 +698,7 @@
           </div>
           <div class="row">
             <label class="checkbox"><input type="checkbox" id="defaultsClearAdminPassword"> Clear stored default password</label>
-            <label class="checkbox"><input type="checkbox" id="defaultsProtectDok"> Require Authelia login for the Dok UI (Dok must already route through nginx-proxy)</label>
+            <label class="checkbox"><input type="checkbox" id="defaultsProtectDok"> Require Authelia login for the Dok UI (set the Authelia portal domain first; Dok and Authelia must share a cookie domain)</label>
           </div>
           <div class="row">
             <button id="saveDefaults" class="btn btn-primary">Save defaults</button>

@@ -1808,6 +1808,25 @@ function hideAppCfgProgress() {
   qs('#appCfgProgress')?.classList.add('hidden');
 }
 
+function slugifyAppName(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^[-_]+|[-_]+$/g, '').slice(0, 60);
+}
+
+async function recentlyCreatedApp(name) {
+  // A proxy timeout or dropped connection can hide a successful finalize. The
+  // registry is written before the launch step, so use a fresh entry as proof
+  // that the app exists instead of leaving the modal open for a retry.
+  try {
+    const list = await api('/api/registry');
+    const wanted = slugifyAppName(name);
+    const match = (Array.isArray(list) ? list : []).find(item => item.name === wanted);
+    if (!match) return null;
+    const created = Date.parse(match.created || '');
+    if (Number.isFinite(created) && Date.now() - created < 10 * 60 * 1000) return match;
+  } catch {}
+  return null;
+}
+
 async function doAppComplete(launchNow = false, force = false, overwrite = false) {
   if (!pendingAppConfig || appCfgCompleting) return;
   appCfgCompleting = true;
@@ -1885,6 +1904,15 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
       loadApps();
     } catch (e) {
       hideAppCfgProgress();
+      if (e.data?.saved) {
+        // The new compose is already on disk; only the deploy step failed.
+        // Say so explicitly instead of making it look like the edit was lost.
+        msg.textContent = `${e.message} The compose file was saved.`;
+        toast(`${data.appName} compose saved, but deploy failed: ${e.message}`, true, 12000);
+        refreshAll();
+        loadApps();
+        return;
+      }
       if (e.data && Array.isArray(e.data.issues) && e.data.issues.length) {
         msg.textContent = e.message;
         showComposeIssues(e.data.issues, () => doAppComplete(launchNow, true));
@@ -1984,6 +2012,24 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
       refreshAll();
       loadApps();
       return;
+    }
+    if (!e.data || Object.keys(e.data).length === 0) {
+      // No structured server response (proxy timeout, dropped socket, or an
+      // HTML error page). Check the registry before asking the user to retry.
+      const existing = await recentlyCreatedApp(payload.appName);
+      if (existing) {
+        finishAppCfgProgress('Created');
+        await new Promise(resolve => setTimeout(resolve, 500));
+        qs('#appConfigModal').classList.add('hidden');
+        hideAppCfgProgress();
+        pendingAppConfig = null;
+        pendingSaveAction = null;
+        msg.textContent = '';
+        toast(`${existing.name} was created. Check the Apps tab before retrying.`, false, 8000);
+        refreshAll();
+        loadApps();
+        return;
+      }
     }
     if (e.data?.alreadyFinalizing) {
       msg.textContent = e.message;
@@ -2703,6 +2749,11 @@ async function saveDefaults() {
     return res;
   } catch (e) {
     if (msg) msg.textContent = e.message;
+    // The server may have reverted protectDok after a failed sync; use its
+    // reported value instead of assuming the previous checkbox state.
+    if (typeof e.data?.protectDok === 'boolean') installDefaults.protectDok = e.data.protectDok;
+    if (qs('#defaultsProtectDok')) qs('#defaultsProtectDok').checked = !!installDefaults.protectDok;
+    if (qs('#autheliaProtectDok')) qs('#autheliaProtectDok').checked = !!installDefaults.protectDok;
     toast(e.message, true);
     throw e;
   } finally {
@@ -2791,7 +2842,13 @@ async function loadCoreNginx() {
     coreNginxData = res;
     const create = qs('#nginxCreateSection');
     const manage = qs('#nginxManageSection');
-    const installed = !!(res.installed || res.containerId || res.exists || res.running || res.composeExists);
+    // The server owns "installed": a live or stopped container, plus a
+    // compose-file fallback only when the Docker lookup itself failed. Never
+    // treat a leftover compose file as an installed service here, or removing
+    // the container leaves the card stuck in manage mode.
+    const installed = res.lookupFailed
+      ? (state.coreNginxInstalled === true || res.installed === true)
+      : res.installed === true;
     if (installed) {
       if (create) create.classList.add('hidden');
       if (manage) manage.classList.remove('hidden');
@@ -2801,8 +2858,10 @@ async function loadCoreNginx() {
       if (create) create.classList.remove('hidden');
       if (manage) manage.classList.add('hidden');
     }
-    if (qs('#nginxComposeEditor') && res.compose) {
-      qs('#nginxComposeEditor').value = res.compose;
+    const hint = qs('#nginxCreateHint');
+    if (hint) hint.classList.toggle('hidden', installed || !res.composeExists);
+    if (qs('#nginxComposeEditor')) {
+      qs('#nginxComposeEditor').value = res.compose || '';
     }
     state.coreNginxRunning = !!res.running;
     state.coreNginxInstalled = installed;
@@ -2925,9 +2984,10 @@ async function loadCoreCloudflared() {
   try {
     const res = await api('/api/core/cloudflared');
     coreCfData = res;
+    const cfInstalled = coreServiceInstalled('cf', res);
     const create = qs('#cfCreateSection');
     const manage = qs('#cfManageSection');
-    if (res.exists) {
+    if (cfInstalled) {
       if (create) create.classList.add('hidden');
       if (manage) manage.classList.remove('hidden');
       const label = qs('#cfManageSection .muted');
@@ -3312,6 +3372,17 @@ function setCoreSections(prefix, exists) {
   if (manage) manage.classList.toggle('hidden', !exists);
 }
 
+function coreServiceInstalled(prefix, res) {
+  // A failed Docker lookup says nothing about whether a service exists. Keep
+  // the currently displayed state instead of flipping an installed service
+  // back to its create view on a transient error.
+  if (res?.lookupFailed) {
+    const manage = qs(`#${prefix}ManageSection`);
+    if (manage) return !manage.classList.contains('hidden');
+  }
+  return !!res?.exists;
+}
+
 async function coreServiceAction(service, action, btn, reload) {
   if (btn) setLoading(btn, true);
   try {
@@ -3329,7 +3400,7 @@ async function loadCoreAuth() {
   try {
     const res = await api('/api/core/auth');
     coreAuthData = res;
-    setCoreSections('auth', res.exists);
+    setCoreSections('auth', coreServiceInstalled('auth', res));
     if (qs('#authStatus')) qs('#authStatus').textContent = `Authentik status: ${res.state || (res.running ? 'running' : 'stopped')}`;
     if (qs('#authDomain')) qs('#authDomain').value = res.settings?.domain || '';
     if (qs('#authDomainManage')) qs('#authDomainManage').value = res.settings?.domain || '';
@@ -3343,7 +3414,7 @@ async function loadCoreAuthelia() {
   try {
     const res = await api('/api/core/authelia');
     coreAutheliaData = res;
-    setCoreSections('authelia', res.exists);
+    setCoreSections('authelia', coreServiceInstalled('authelia', res));
     if (qs('#autheliaStatus')) qs('#autheliaStatus').textContent = `Authelia status: ${res.state || (res.running ? 'running' : 'stopped')}`;
     if (qs('#autheliaDomain')) qs('#autheliaDomain').value = res.settings?.domain || '';
     if (qs('#autheliaDomainManage')) qs('#autheliaDomainManage').value = res.settings?.domain || '';
@@ -3384,7 +3455,7 @@ async function loadCoreMail() {
         ? `SMTP: ${target}${smtp.passwordSet ? ' · password saved' : ''} · ${authelia}`
         : 'SMTP: not configured · Authelia writes notifications to /config/notifications.txt';
     }
-    setCoreSections('mailpit', res.exists);
+    setCoreSections('mailpit', coreServiceInstalled('mailpit', res));
     if (qs('#mailpitStatus')) qs('#mailpitStatus').textContent = `Mailpit status: ${res.state || (res.running ? 'running' : 'stopped')}`;
     if (qs('#mailpitSmtpPort')) qs('#mailpitSmtpPort').value = res.settings?.smtpPort || 1025;
     if (qs('#mailpitWebPort')) qs('#mailpitWebPort').value = res.settings?.webPort || 8025;
@@ -3401,7 +3472,7 @@ async function loadCoreDns() {
   try {
     const res = await api('/api/core/dns');
     coreDnsData = res;
-    setCoreSections('dns', res.exists);
+    setCoreSections('dns', coreServiceInstalled('dns', res));
     if (qs('#dnsStatus')) qs('#dnsStatus').textContent = `Technitium status: ${res.state || (res.running ? 'running' : 'stopped')}`;
     if (qs('#dnsDomain')) qs('#dnsDomain').value = res.settings?.domain || '';
     if (qs('#dnsDomainManage')) qs('#dnsDomainManage').value = res.settings?.domain || '';
@@ -3415,7 +3486,7 @@ async function loadCoreHelper() {
   try {
     const res = await api('/api/core/host-helper');
     coreHelperData = res;
-    setCoreSections('helper', res.exists);
+    setCoreSections('helper', coreServiceInstalled('helper', res));
     if (qs('#helperStatus')) {
       qs('#helperStatus').textContent = `Host Helper status: ${res.state || (res.running ? 'running' : 'stopped')}${res.available ? ' · available' : ' · not responding'}`;
     }
@@ -4083,6 +4154,9 @@ if (qs('#autheliaManageBtn')) {
     loadAutheliaUsers();
   });
 }
+if (qs('#autheliaPickContainers')) {
+  qs('#autheliaPickContainers').addEventListener('click', openAuthContainersPicker);
+}
 if (qs('#autheliaUsersRefresh')) qs('#autheliaUsersRefresh').addEventListener('click', loadAutheliaUsers);
 if (qs('#autheliaUserCancel')) qs('#autheliaUserCancel').addEventListener('click', resetAutheliaUserForm);
 if (qs('#autheliaUserSave')) {
@@ -4153,7 +4227,13 @@ if (qs('#autheliaProtectDok')) {
       toast(res.protectDok ? 'Dok UI now requires Authelia login' : 'Dok UI protection disabled', false, 8000);
       loadCoreAuthelia();
     } catch (e) {
-      checkbox.checked = !checkbox.checked;
+      if (typeof e.data?.protectDok === 'boolean') {
+        installDefaults.protectDok = e.data.protectDok;
+        checkbox.checked = e.data.protectDok;
+        if (qs('#defaultsProtectDok')) qs('#defaultsProtectDok').checked = e.data.protectDok;
+      } else {
+        checkbox.checked = !checkbox.checked;
+      }
       if (msg) msg.textContent = e.message;
       toast(e.message, true);
     }
@@ -4696,13 +4776,17 @@ async function checkAppCreationNginxNotice() {
   try {
     res = await api('/api/core/nginx-proxy');
   } catch {
-    // A transient API or Docker error says nothing about whether nginx-proxy is
+    // A transient API error says nothing about whether nginx-proxy is
     // installed, so keep the last known state instead of showing "not installed".
     updateAppCfgRequired();
     return;
   }
-  const has = !!(res && (res.installed || res.containerId || res.exists || res.running || res.composeExists));
-  state.coreNginxRunning = !!(res && res.running);
+  // Same rule as the Core Services card: a leftover compose file is not an
+  // installation. Only a failed Docker lookup may keep a previous "installed".
+  const has = res.lookupFailed
+    ? (state.coreNginxInstalled === true || res.installed === true)
+    : res.installed === true;
+  state.coreNginxRunning = !!res.running;
   state.coreNginxInstalled = has;
   applyNotice(has);
   updateAppCfgRequired();
@@ -4826,7 +4910,7 @@ async function openAuthContainersPicker() {
       return;
     }
     list.innerHTML = candidates.map(c => {
-      const locked = !!c.self;
+      const locked = !!c.self || !!c.protected;
       const note = c.self
         ? ' · Dok itself: use "Require login for the Dok UI" in Dok Settings'
         : c.protected ? ' · protected core service (managed separately)' : '';
@@ -4841,6 +4925,9 @@ async function openAuthContainersPicker() {
         </div>
       </label>`;
     }).join('');
+    if (!candidates.some(c => !c.self && !c.protected)) {
+      list.insertAdjacentHTML('beforeend', '<div class="empty">No app containers are running. Start the apps you want to protect, then open this again.</div>');
+    }
   } catch (e) {
     list.innerHTML = `<div class="empty">Unable to load containers: ${escapeHtml(e.message)}</div>`;
   }
@@ -4870,13 +4957,21 @@ if (qs('#authApplySelected')) {
     try {
       const res = await api('/api/core/auth/apply', jsonBody({ ids }));
       const failed = Array.isArray(res.results) ? res.results.filter(item => !item.ok && !item.skipped) : [];
+      const skipped = Array.isArray(res.results) ? res.results.filter(item => item.skipped) : [];
       if (msg) {
+        const skippedNote = skipped.length
+          ? ` Skipped ${skipped.length}: ${skipped.map(item => `${item.name}: ${item.reason || 'not eligible'}`).join('; ')}`
+          : '';
         msg.textContent = failed.length
-          ? `${res.message} ${failed.length} failed: ${failed.map(item => `${item.name}: ${item.error || item.reason}`).join('; ')}`
-          : (res.message || 'Done.');
+          ? `${res.message} ${failed.length} failed: ${failed.map(item => `${item.name}: ${item.error || item.reason}`).join('; ')}${skippedNote}`
+          : `${res.message || 'Done.'}${skippedNote}`;
       }
-      toast(res.message || 'Auth updated', failed.length > 0);
-      if (!failed.length) {
+      toast(skipped.length && !res.applied && !res.already
+        ? 'No eligible containers were changed'
+        : (res.message || 'Auth updated'), failed.length > 0 || (skipped.length > 0 && !res.applied && !res.already));
+      // Keep the dialog open when nothing was applied, so a skipped-only
+      // selection does not look like a successful change.
+      if (!failed.length && (res.applied > 0 || res.already > 0)) {
         await new Promise(resolve => setTimeout(resolve, 800));
         qs('#authContainersModal')?.classList.add('hidden');
       }
