@@ -23,7 +23,7 @@
           <li>Configure each app in the compose builder, then save or save and launch.</li>
           <li>Use <strong>Apps</strong> for lifecycle actions, Alter State, Quick Deploy, and library export/import.</li>
           <li>Protect access with <strong>Authelia</strong> or publish through <strong>Cloudflare Tunnel</strong> if needed.</li>
-          <li>Take regular backups from <strong>Settings → Backups &amp; Updates</strong>.</li>
+          <li>Take regular backups from <strong>Settings → Maintenance</strong>.</li>
         </ol>
         <p class="muted">Dok has no built-in login. Anyone who can reach the UI can use the Docker socket, so expose it only behind a trusted network or an authenticated reverse proxy.</p>
       `
@@ -37,7 +37,7 @@
           <li><strong>Terminal</strong> opens a shell inside the Dok container. Admin shell starts in <code>/app</code>; the apps shell starts in <code>apps/</code>.</li>
           <li><strong>OpenCode</strong> opens the AI assistant in Admin or User mode.</li>
         </ul>
-        <p>High disk usage usually points to images, volumes, or backups that can be removed from Images and Backups. High load with low CPU can indicate blocked I/O inside a container.</p>
+        <p>High disk usage usually points to images, volumes, or backups that can be removed from Images and Maintenance. High load with low CPU can indicate blocked I/O inside a container.</p>
       `
     },
     containers: {
@@ -452,7 +452,8 @@
     'settings-backups': {
       title: 'Backups and updates',
       html: `
-        <p>Backups are stored locally under <code>data/backups</code> as a <code>.tar.gz</code> archive plus JSON metadata.</p>
+        <p>Backups, snapshots, imports, and updates are now managed by the Dok Maintenance container under <strong>Settings → Maintenance</strong>. The legacy Dok backup routes remain available for compatibility, but the Maintenance store is separate from <code>data/</code> and is never exported with an app.</p>
+        <p>Legacy backups are stored locally under <code>data/backups</code> as a <code>.tar.gz</code> archive plus JSON metadata.</p>
         <h4>Scopes</h4>
         <ul>
           <li><strong>Full</strong> includes data, apps, core, and sources. Backups, temporary files, and the helper socket are excluded; logs are optional.</li>

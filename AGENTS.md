@@ -1,5 +1,7 @@
 # WickedAFDok - Agent Guide
 
+## Directive from 
+
 ## Overview
 - **Name:** WickedAFDok
 - **Purpose:** Self-hosted Docker/container management UI running in a container with access to `/var/run/docker.sock`. Provides a web interface to manage containers, images, deploy apps, and configure core services.
@@ -38,12 +40,162 @@ docker run -d --name wickedafdok -p 8080:8080 \
 - Root `docker-compose.yml` declares the `wicked` network as external. `setup.sh` creates it, and `start.sh` also creates it when missing, so `docker compose up` directly requires setup first
 - `start.sh` honors a custom `DOCKER_SOCK` by exporting `DOCKER_HOST=unix://...` when `DOCKER_HOST` is not already set
 - Managed compose is generated from the running container's inspect data during self-recreation; it is not created at server startup
-- `setup.sh` defaults the container UID/GID to `SUDO_UID`/`SUDO_GID` (the sudo user), then falls back to the repo owner when not run via sudo. `--uid`/`--gid` override it; `--root` uses `0:0`. It also adds the invoking `SUDO_USER` to the socket group and prints a logout reminder at the end.
+- `setup.sh` defaults the container UID/GID to `SUDO_UID`/`SUDO_GID` (the sudo user), then falls back to the repo owner when not run via sudo. `--uid`/`--gid` override it; `--root` uses `0:0`. It also adds the invoking `SUDO_USER` to the socket group and prints a logout reminder at the end. After preparing permissions it builds `wickedafdok:latest` (`SKIP_BUILD=1` skips), creates `data/.maintenance-token` and `maintenance-data/`, and starts the `wickedafdok-maintenance` container with the host checkout, host root, and Docker socket mounted; it prints the token URL for the browser installer.
 - `setup.sh` takes ownership of the whole checkout (including `server/`, `public/`, and `.git`), normalizes directories to `755` and files to `644` while keeping executable scripts at `755`. Runtime JSON, logs, backups, helper credentials, `.env`, and managed `docker-compose*.yml` files are set to `600`; `data/.home`, `data/backups`, `data/host-helper`, and `data/opencode` (including its subdirectories) are `700`, and files under `data/opencode` are `600`. It also chowns the generated compose override files when running non-root.
 - OpenCode is installed into the image at build time from the official installer (`OPENCODE_VERSION` build arg, symlinked to `/usr/local/bin/opencode`). Setting `OPENCODE_BIN` points the server at a different binary, which is useful for development.
 - The Dockerfile starts Node directly (`node server/index.js`) so non-root operation does not depend on npm having a writable home; setup sets `HOME=/app/data/.home`
 - No built-in authentication - put behind a reverse proxy with auth if exposed publicly. `/api/auth` is a settings placeholder, not an auth middleware; it stores credentials and does not protect API routes.
 - Runtime JSON files are written with mode `600` because settings/auth/DNS files can contain secrets. Registry/git connection secrets in `data/registries.json` and service secrets in `data/settings.json` are AES-256-GCM encrypted with `data/.credentials-key`; other runtime JSON remains plaintext.
+
+
+## General Engineering Principles and Proactive Problem-Solving
+
+### 1. Take Ownership of the Intended Outcome
+
+When given a task by the user, take ownership of achieving the user's intended outcome, not merely following the literal wording of their instructions.
+
+Understand what the user is trying to accomplish, why the requested change matters, and how it fits into the existing project. Use your own logic, reasoning, technical knowledge, and engineering judgment to determine what is needed to deliver a complete, reliable, secure, and usable solution.
+
+Treat the user's explicit instructions as the primary requirements, but recognize that users may not know every technical detail, dependency, prerequisite, edge case, or supporting feature necessary to achieve their goals.
+
+Do not interpret incomplete instructions as a requirement to produce an incomplete solution.
+
+### 2. Proactively Identify Missing Requirements
+
+Before implementing a task, independently consider what may have been overlooked or left unstated.
+
+Depending on the task, evaluate:
+
+- Required supporting functionality, dependencies, integrations, and configuration.
+- Connections between the requested change and existing components, services, APIs, databases, and workflows.
+- Data validation, error handling, permissions, authentication, authorization, and security implications.
+- Data persistence, state management, concurrency, retries, recovery, and failure handling.
+- User feedback, usability, accessibility, and expected behavior in normal and exceptional situations.
+- Installation, deployment, environment variables, migrations, documentation, and operational requirements.
+- Backwards compatibility, existing functionality, regressions, and interactions with other features.
+- Testing requirements and how the finished result can be verified.
+
+These are considerations, not a checklist that must be implemented identically for every task. Apply judgment based on the actual requirements and risks.
+
+Identify both what the user explicitly requested and what must reasonably be true for the requested functionality to work as intended.
+
+### 3. Inspect Before Assuming
+
+Do not make decisions based solely on assumptions when relevant evidence is available.
+
+Inspect the existing codebase, project structure, related implementations, configuration, dependencies, documentation, and tests before deciding how to proceed.
+
+Follow established project conventions where appropriate. Reuse existing functionality and dependencies when doing so produces a sound solution.
+
+When you identify a potential missing requirement, determine whether it is genuinely necessary, already implemented elsewhere, intentionally excluded, or merely an optional enhancement.
+
+Do not duplicate existing functionality or introduce redundant infrastructure because you overlooked what the project already provides.
+
+### 4. Implement the Smallest Complete Solution
+
+When a missing requirement is clearly necessary or strongly implied by the user's goal, address it proactively as part of the task when it falls within the authorized scope.
+
+Do not wait for the user to explicitly request every supporting implementation detail.
+
+Prefer the smallest complete, maintainable solution that achieves the intended outcome. Include necessary integration, configuration, validation, error handling, and tests rather than delivering an isolated code change that does not work in practice.
+
+However, proactive problem-solving does not authorize unnecessary feature development, unrelated refactoring, architectural redesigns, or speculative improvements.
+
+Distinguish between:
+
+- **Essential:** Necessary for the requested functionality to work correctly. Include it.
+- **Important and directly relevant:** Materially improves reliability, security, maintainability, or usability. Include it when proportionate to the task and within scope.
+- **Optional enhancement:** Potentially useful but not necessary to achieve the intended outcome. Mention it when worthwhile, but do not automatically implement it.
+- **Out of scope or consequential:** Changes that materially expand the task, affect unrelated systems, incur significant costs, or introduce destructive or externally visible effects. Obtain approval when appropriate.
+
+Never silently remove existing functionality, weaken security, discard user data, or change established behavior merely to simplify implementation.
+
+### 5. Use Independent Judgment and Anticipate Problems
+
+Do not blindly follow an implementation approach if inspection reveals that it will not achieve the user's goal.
+
+Identify technical problems, contradictions, missing prerequisites, flawed assumptions, and foreseeable failure scenarios. If the user's proposed approach is likely to fail, explain why and choose a better approach when the intended outcome and authorization are clear.
+
+Consider realistic edge cases and failure conditions relevant to the task, such as invalid input, missing configuration, unavailable services, network interruptions, permission failures, partial operations, and inconsistent state.
+
+Add appropriate validation, error handling, logging, recovery, and user feedback where justified.
+
+Make reasonable technical decisions independently. Do not ask the user to decide routine implementation details that can be resolved through sound engineering judgment.
+
+### 6. Ask Questions Only When They Matter
+
+Do not interrupt progress with unnecessary clarification requests when the intended outcome is clear and reasonable assumptions are sufficient.
+
+Proceed using the best-supported assumptions when uncertainty is minor and the consequences of being wrong are low. Document important assumptions when they affect the implementation.
+
+Ask the user for clarification or approval when:
+
+- Multiple plausible interpretations would lead to materially different results.
+- A missing decision cannot reasonably be resolved from the codebase, documentation, or context.
+- A decision could cause significant data loss, security exposure, expense, downtime, or irreversible changes.
+- The proposed implementation would materially expand the scope or conflict with the user's stated requirements.
+- Required credentials, permissions, or authorization are unavailable.
+
+When clarification is necessary, ask a focused question that explains the specific decision and why it matters. Do not offload the entire problem-solving process to the user.
+
+### 7. Plan Around the Complete Task
+
+Before making changes, establish:
+
+1. The user's intended outcome and what success looks like.
+2. The relevant existing implementation and project conventions.
+3. The explicit requirements and necessary implied requirements.
+4. Dependencies, integration points, edge cases, and risks.
+5. The implementation steps and appropriate verification methods.
+
+For complex tasks, communicate a concise plan before substantial implementation when useful. For straightforward tasks, perform this reasoning without unnecessary planning overhead.
+
+As work progresses, update the approach when new evidence reveals overlooked requirements or a better solution.
+
+### 8. Verify Functionality, Not Just Code Changes
+
+Do not consider a task complete simply because the requested code has been written or the application compiles.
+
+Perform appropriate verification based on the task, such as:
+
+- Running relevant automated tests and adding tests for important new behavior.
+- Checking linting, type checking, builds, and configuration validity when applicable.
+- Exercising important workflows, integration points, and realistic edge cases.
+- Checking that error handling and failure recovery behave appropriately.
+- Reviewing changes for regressions, security issues, unintended side effects, and incomplete integration.
+- Confirming that required configuration, migrations, dependencies, and documentation are addressed.
+
+Use available tools and practical tests to establish whether the implementation works. Do not claim to have run tests, inspected systems, or verified behavior unless you actually did so.
+
+If verification is blocked or unavailable, explain what remains unverified and why. Do not disguise uncertainty as success.
+
+### 9. Definition of Done
+
+A task is complete when:
+
+- The intended outcome has been achieved to a reasonable, verifiable standard.
+- Explicit requirements and necessary supporting requirements have been addressed.
+- The implementation integrates correctly with the existing project.
+- Relevant edge cases, failure conditions, security considerations, and regressions have been considered.
+- Appropriate verification has been performed, or remaining verification limitations have been disclosed.
+- No unnecessary scope expansion or unauthorized consequential changes have been introduced.
+- Any remaining limitations, important assumptions, or recommended follow-up work are communicated clearly.
+
+If a task cannot be completed fully, deliver the most useful safe progress possible and explicitly identify what remains outstanding.
+
+### 10. Report Results Clearly
+
+When finishing a task, summarize:
+
+- What was implemented.
+- What additional supporting requirements or overlooked issues were addressed.
+- What tests and verification were actually performed and their results.
+- Any remaining limitations, assumptions, risks, or follow-up actions.
+
+Keep reports proportionate to the task. Prioritize meaningful results and outstanding issues over a lengthy account of routine implementation steps.
+
+**Guiding principle:** Think like an engineer responsible for delivering the outcome, not a code generator responsible only for executing instructions. Use initiative to discover and address necessary missing pieces, evidence to guide decisions, restraint to avoid unnecessary complexity, and verification to establish whether the solution actually works.
+
 
 ## Directory Structure
 ```
@@ -51,16 +203,19 @@ docker run -d --name wickedafdok -p 8080:8080 \
 ├── .dockerignore        # Keeps runtime data and node_modules out of image builds
 ├── .gitignore           # Keeps runtime data, node_modules, and generated files out of git
 ├── server/index.js      # Main server with all API routes and business logic
-├── server/host-agent.js # Optional privileged helper socket for host directory creation
+├── server/host-agent.js # Legacy privileged helper socket (superseded by Maintenance)
 ├── server/assist-register.mjs # OC Assist helper that registers/deploys an app via finalize API
 ├── server/app-agents.md # OC Assist app-library contract; written to apps/AGENTS.md on startup
+├── maintenance/         # Dok Maintenance container (server, shared lib, compose)
 ├── public/              # Frontend
 │   ├── index.html       # UI structure
 │   ├── css/style.css    # Styles
 │   ├── js/app.js        # Frontend logic
-│   └── js/manual.js     # In-app manual, section help, and field labels/tooltips
+│   ├── js/manual.js     # In-app manual, section help, and field labels/tooltips
+│   └── maintenance/     # Maintenance installer/tools UI
 ├── apps/                # Deployed apps (each app in its own subdirectory with compose)
-├── core/                # Core services (nginx-proxy, cloudflared, authentik, authelia, dns, mailpit, host-helper)
+├── core/                # Installed core services (nginx-proxy, cloudflared, authentik, authelia, dns, mailpit, stalwart)
+├── maintenance-data/    # Separate persistent store for Maintenance (backups, snapshots, records)
 ├── data/                # Persistent data (registry, settings, backups, logs, managed compose)
 │   ├── registries.json  # Encrypted registry and git connection credentials
 │   ├── .credentials-key # 0600 AES-256-GCM key used for registry and settings secrets
@@ -164,7 +319,7 @@ The unified way to deploy applications. Every app is stored in `apps/<name>/` wi
 
 ### Dok Settings
 
-Settings is split into four subtabs: **Core Services**, **Dok Settings**, **Logs**, and **Backups & Updates**. Dok Settings contains the app's own management options: Default settings, Designer, Groups, and registry connections.
+Settings is split into four subtabs: **Core Services**, **Dok Settings**, **Logs**, and **Maintenance**. Backups and updates moved into the Maintenance container; the old backups pane is kept in the DOM but hidden and its API routes remain for backward compatibility. Dok Settings contains the app's own management options: Default settings, Designer, Groups, and registry connections.
 
 **Default settings:**
 - `#defaultsCard` stores fallback values in `settings.defaults` and exposes `GET/POST /api/settings/defaults`, plus `POST /api/settings/defaults/apply`
@@ -210,7 +365,15 @@ Settings is split into four subtabs: **Core Services**, **Dok Settings**, **Logs
 
 ### Settings / Core Services
 
-The **Core Services** subtab manages the bundled services. Each created service card keeps an **Edit compose** action for manual changes, and the running WickedAFDok container is reported as a protected core service (`role: Dok`) so it appears in the Core Services group. Status endpoints return `lookupFailed` when Docker cannot be queried; each card keeps its last displayed state instead of flipping an installed service back to the create view on a transient error.
+The **Core Services** subtab manages installed bundled services. Installation now happens only in the Dok Maintenance installer; Dok hides cards whose service is not installed and never renders a create/install form. Each installed service card keeps an **Edit compose** action for manual changes, and the running WickedAFDok container is reported as a protected core service (`role: Dok`) so it appears in the Core Services group. Status endpoints return `lookupFailed` when Docker cannot be queried; each card keeps its last displayed state instead of flipping an installed service back to the create view on a transient error.
+
+**Dok Maintenance (managed, on demand):**
+- Separate privileged container `wickedafdok-maintenance` built from the same image, started by `setup.sh`, by Dok's **Settings → Maintenance** tab, or on demand when a host directory must be created. It replaces the Host Helper (its socket/token remain compatible) and is managed from `maintenance/docker-compose.yml` or the generated copy at `data/wickedafdok/maintenance/docker-compose.yml`.
+- Web UI/API on port `8090` (browser entry `/?token=<data/.maintenance-token>`). API routes require the token when `MAINTENANCE_REQUIRE_TOKEN=1`; `/api/health` and static files are public. WS uses `?token=`.
+- Persistent state lives in `maintenance-data/` (never inside `data/`, never exported with apps): `installation.json`, `installation-state.json`, snapshots, backups, OpenCode state, logs. The installer records the sanitized Dok installation state and takes a snapshot when Maintenance opens, after install/update/backup, and on request; reinstall restores the newest snapshot, starts Dok, and starts every installed core service.
+- Installer types are **Standalone Dok** (defaults/registrations may be skipped) and **Dok with Core Services** (choose at most one option per core category; required fields are enforced). It writes Dok settings/registries, launches Dok from the root compose, configures selected core services through Dok's APIs (nginx-proxy, cloudflared, Authentik, Authelia, DNS, Mailpit/Stalwart, SMTP), writes `data/wickedafdok/installation-compose.yml` with Dok plus every installed core service, and saves the record. OpenCode Admin is available inside Maintenance to reconcile the selected stack.
+- Built-in tools cover overview/containers, app deploy/start/stop/restart proxying, backups/snapshots/import/export, updates (git pull/build/recreate then refresh Maintenance), diagnostics/repair, logs, terminal shells, and OpenCode Admin. Admin OpenCode is rejected in the Dok container (`409`); Dok UI buttons open Maintenance instead. User-mode OpenCode remains available in Dok.
+- `setup.sh` takes host ownership as before, builds `wickedafdok:latest` (set `SKIP_BUILD=1` to skip), creates `data/.maintenance-token`, creates `maintenance-data/`, starts the Maintenance compose with host checkout/socket mounts, and prints its token URL. `maintenance-data/` is mode `700`.
 
 **nginx-proxy (managed):**
 - Only one nginx-proxy managed from Core Services UI
@@ -267,16 +430,15 @@ The **Core Services** subtab manages the bundled services. Each created service 
 - Managed compose stored in `core/mailpit/docker-compose.yml`; settings are applied to Authelia immediately (config written, restart only if the content changed)
 - `services.stalwart` is an optional full mail server (`stalwartlabs/stalwart`, compose in `core/stalwart/docker-compose.yml`): admin user/password (encrypted), web port `8088`, SMTP `25`, submission `587`, IMAPS `993`, optional GUI domain. Routes: `GET /api/core/stalwart`, `POST /api/core/stalwart/compose|run|domain`. It is independent of the SMTP notifier settings; point `services.mail.host` at `stalwart` after configuring it.
 
-**Host Helper (optional):**
+**Host Helper (legacy, replaced by Maintenance):**
 - Privileged companion container running `server/host-agent.js`
-- Lets the non-root WickedAFDok process create host directories and chown them through a shared Unix socket
-- Socket/token stored in `data/host-helper`; compose stored in `core/host-helper/docker-compose.yml`
-- Only starts when the user launches it; normal runtime directories still work without it
+- The Maintenance container implements the same Unix socket/token contract and stops an old `wickedafdok-host-helper` when it starts. Existing Host Helper installs keep working until then.
+- Socket/token stored in `data/host-helper`; compose stored in `core/host-helper/docker-compose.yml`. Dok starts Maintenance on demand when a host directory must be created.
 
 **OpenCode (on demand, not a compose service):**
 - AI coding agent available from the dashboard **OpenCode** and **Terminal** buttons or the Settings → Core Services card
 - Unlike the other core services it is not a container in `core/` and is excluded from Start all/Stop all; each launch starts a PTY inside the WickedAFDok container and closing the terminal stops it
-- **Admin mode:** cwd `/app`, `permission: { "*": "allow", external_directory: "allow" }`; intended for maintenance, troubleshooting, and changing WickedAFDok
+- **Admin mode:** only available inside the Dok Maintenance container (cwd `/dok`, full host/Docker access). Dok rejects admin OpenCode sessions with `409` and its dashboard/card buttons open Maintenance instead.
 - **User mode:** cwd `/app/apps`, `external_directory: deny`, and a bash/read allowlist tuned for app work; Docker, system package management, privilege escalation, and WickedAFDok source paths are intended to be off limits
 - Generated configs live at `data/opencode/<mode>/opencode.json`; per-mode `HOME`/XDG directories keep sessions separate, while provider login/auth and caches are shared under `data/opencode/shared`
 - `OPENCODE_DISABLE_PROJECT_CONFIG=1` prevents an app-level `opencode.json` from widening mode permissions
@@ -287,7 +449,8 @@ The **Core Services** subtab manages the bundled services. Each created service 
 - Server console output plus mutating `/api` requests are written to `data/logs/server.log` and a 2000-line in-memory ring buffer
 - Logs subtab shows server logs and Docker Compose logs for apps and core services with auto-refresh and tail controls
 
-**Backups & Updates:**
+**Backups & Updates (legacy Dok pane, hidden):**
+- New backups, snapshots, imports, and updates are managed by Dok Maintenance; the routes below remain for compatibility.
 - Local backups stored under `data/backups` as `<id>.tar.gz` plus `<id>.json` metadata
 - Scopes: `full`, `app`, and `custom`
 - Full backups include `data`, `apps`, `core`, and `sources`; `data/backups`, `data/tmp`, and the helper socket are excluded, and `data/logs` is optional
@@ -297,7 +460,7 @@ The **Core Services** subtab manages the bundled services. Each created service 
 - Custom restores only overwrite the sections recorded in the manifest; full and app archives remain backward compatible
 - `GET /api/backups/options` returns the app and core-service pickers used by the UI
 - Import accepts a WickedAFDok archive and restores it; restore requires explicit overwrite confirmation
-- The temporary git update UI now lives under Backups & Updates
+- The temporary git update UI lives in the Maintenance container's Updates panel.
 
 **Settings:** Persisted in `data/settings.json`. Legacy `/api/dns` and `/api/auth` endpoints remain as unenforced scaffolds; they are not used by the new Core Services UI.
 
@@ -337,6 +500,12 @@ The **Core Services** subtab manages the bundled services. Each created service 
 - `POST /api/compose/validate` - Validate compose file content
 - `POST /api/compose/parse` - Parse a compose file into editable builder fields
 - `POST /api/compose/build` - Generate compose from builder fields and return field-level issues
+
+### Maintenance / Installation
+- `GET /api/maintenance` - Maintenance container status, token URL, port, and compose path
+- `POST /api/maintenance/start|stop|mode` - Start/stop Maintenance or toggle maintenance mode (`{ active }`) and start Dok when leaving
+- `GET /api/installation` / `POST /api/installation/sync` - Read or write the sanitized `data/installation-state.json` snapshot used by Maintenance
+- `GET /api/maintenance` also backs the Settings → Maintenance card; Admin OpenCode is rejected in Dok with `409`
 
 ### Core Services
 - `GET /api/core/nginx-proxy` - Get nginx-proxy status/config
@@ -638,21 +807,32 @@ The **Core Services** subtab manages the bundled services. Each created service 
 
 ##------------------------------------------Your current task--------------------------------------
 
-Apps:
- Import library should also have an option to import from repositories like github
+New Admin/Maintenance Section/Container
+
+Create an app that runs in it's own container for Dok maintenance and management. It will be multipurpose and manage Installation, Updates, Upgrades, Backups, Troubleshooting, Repairs and be the Admin over the whole containerverse.
+The Dok Maintenance container replaces and takes over the functions of the Host Helper.
+This container will only run when Maintenance Mode is activated, when triggered by Host Helper functions or when launched by the user for installation etc..
+It will have built in opencode and contain tools for troubleshooting and repairing the Dok installation
+It should have a persistent storage location that is kept seperate from everything for safety. It will use that location to store the details of the Dok installation and everything needed to repair and restore the installation if needed. Whith these files an exact reinstall can be done without the user having to re-enter any information. 
+The installation information should be updated with every change, app creation etc.. to keep it up to date.
+The backup and update section will be moved to this container. Admin Opencode can only be run from this container. 
+A tag should be added automatically to all apps created by Dok to ensure all their info is available to the maintenanca container.
+
+Dok Installation:
+When the container is launched and no Dok container exists it will check it's persistent storage for previous installation data. If none is found it will assume Installation and present the start installation button. It will have another button in the bottom corner for maintenance mode in case the installation wasn't auto detected.  
+Core Services will now only be installed here to make the whole setup more stable. The user can pick what services they want and this installer will make a single compose file for the Dok app that includes all selected Core Services. The Core Services section currently in dok will now only show the installed core services with the same options it does now but the install mode will be gone.
 
 
-App Creator:
- If a Core Service is installed fields for it's options such as VIRTUAL_HOST etc.. should automatically be added to the compose file and editor. This also applies to the Apps lirary compose editor.
 
-Dok:
- Field titles should always be above the field
+The current setup.sh will now launch this container with sudo allowing the Maintenance Apps GUI installation to setup the host and install and launch Dok.
+Once the apps GUI is available in the users web browser they can select to start the installation. 
+ Installation Steps:
+  1. Installation type - Choices will be "Standalone Dok" and "Dok with Core Services". 
+      "Standalone Dok" Guides the user to filling out the fields from Dok Settings/default settings. Then Repository connections. Both sections can be skipped by the user. The installer then launches the dok app with the needed settings, configurations and permissions. When done it points the user to the apps URL, Saves the install configuration and informs the user of how to activate maintenance mode, and displays a button to shutdown the installation container.
+     
+      "Dok with Core Serrvices" Guides the user through selecting Core services. Explains what each service does and if there are multiple options in that service category it lets them select one. Then it guides them through filling out the fields from Dok Settings/default settings and any other information needed for the Core Services they selected. The installer then launches the dok app and configures and starts the Core Services they selected with the needed settings, configurations and permissions. When done it points the user to the apps URL, Has a button to save the install configuration and displays a button to shutdown the installation container. Steps can not be skipped for this installation type because of required information.
+	  
+The installer should have opencode built in for configuring Dok with the selected Core Services. Opencode should take the information provided by the user and configure the selected Core Services to work together making all configurations needed for them to function as a single server.
 
-Core Services:
- Reverse Proxy:
-  Add nginxproxy/acme-companion as an option for certificates
- Email:
-  Add Stalwart Mail Server as an email option
- DNS: Add Adguard as a DNS option
-
+Review all code for errors, loose ends etc..
 Push to github

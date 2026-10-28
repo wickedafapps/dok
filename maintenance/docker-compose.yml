@@ -1,0 +1,64 @@
+# managed-by: wickedafdok-maintenance
+# On-demand maintenance and installation container. It is normally started by
+# setup.sh, the Dok UI, or a Host Helper request. It is intentionally not kept
+# running with the Dok installation.
+name: wickedafdok-maintenance
+
+services:
+  maintenance:
+    image: wickedafdok:latest
+    container_name: wickedafdok-maintenance
+    restart: "no"
+    privileged: true
+    working_dir: /app
+    command: ["node", "/app/maintenance/server.js"]
+    ports:
+      - "${MAINTENANCE_PORT:-8090}:8090"
+    volumes:
+      - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
+      # Host checkout (read/write): installation, updates, and repair target.
+      - type: bind
+        source: "${DOK_PATH:-..}"
+        target: "${DOK_PATH:-/dok}"
+      # Dedicated maintenance storage, deliberately outside data/.
+      - type: bind
+        source: "${DOK_PATH:-..}/maintenance-data"
+        target: /maintenance-data
+      # Whole host filesystem for the Host Helper replacement and host paths.
+      - type: bind
+        source: "${HOST_PATH:-/}"
+        target: /host
+        bind:
+          propagation: rslave
+    environment:
+      - DOK_ROOT=/dok
+      - MAINTENANCE_DATA=/maintenance-data
+      - HOST_ROOT=/host
+      - DOK_HOST_PATH=${DOK_PATH:-..}
+      - DOK_CONTAINER=wickedafdok
+      - DOK_PORT=8080
+      - DOCKER_SOCK=${DOCKER_SOCK:-/var/run/docker.sock}
+      - DOK_UID=${PUID:-0}
+      - DOK_GID=${PGID:-0}
+      - MAINTENANCE_PORT=8090
+      - MAINTENANCE_URL=${MAINTENANCE_URL:-http://localhost:8090}
+      - MAINTENANCE_REQUIRE_TOKEN=${MAINTENANCE_REQUIRE_TOKEN:-1}
+      - MAINTENANCE_TOKEN_FILE=/dok/data/.maintenance-token
+      - OPENCODE_BIN=/usr/local/bin/opencode
+    networks:
+      - wicked
+    labels:
+      - dok.managed=true
+      - dok.maintenance=true
+      - dok.role=maintenance
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8090/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+networks:
+  wicked:
+    external: true
+    name: wicked

@@ -26,6 +26,15 @@ const logsDir = path.join(dataDir, 'logs');
 const tmpDir = path.join(dataDir, 'tmp');
 const opencodeDir = path.join(dataDir, 'opencode');
 const designerDir = path.join(dataDir, 'designer');
+const maintenanceContainer = 'wickedafdok-maintenance';
+const maintenanceComposePath = path.join(dataDir, 'wickedafdok', 'maintenance', 'docker-compose.yml');
+const maintenanceTokenPath = path.join(dataDir, '.maintenance-token');
+const installationStatePath = path.join(dataDir, 'installation-state.json');
+const installationPath = path.join(dataDir, 'installation.json');
+const installationStateSchema = 'wickedafdok.installation-state/v1';
+let installationStateTimer = null;
+let installationStateWriting = false;
+let lastMaintenanceStartAttempt = 0;
 
 for (const dir of [dataDir, sourcesDir, uploadsDir, appsDir, coreDir, backupsDir, logsDir, tmpDir, opencodeDir, designerDir]) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -139,6 +148,7 @@ function readRegistry() {
 function writeRegistry(reg) {
   fs.writeFileSync(registryPath, JSON.stringify(reg, null, 2), { mode: 0o600 });
   try { fs.chmodSync(registryPath, 0o600); } catch {}
+  scheduleInstallationState();
 }
 const registryPath = path.join(dataDir, 'registry.json');
 const groupsPath = path.join(dataDir, 'groups.json');
@@ -365,11 +375,155 @@ function redactServiceSecrets(service, value) {
 function writeSettings(s) {
   fs.writeFileSync(settingsPath, JSON.stringify(encryptSettingsSecrets(s), null, 2), { mode: 0o600 });
   try { fs.chmodSync(settingsPath, 0o600); } catch {}
+  scheduleInstallationState();
 }
 
 function writePrivateFile(file, content) {
   fs.writeFileSync(file, content, { mode: 0o600 });
   try { fs.chmodSync(file, 0o600); } catch {}
+}
+
+// ---------- installation state ----------
+// Dok writes a sanitized snapshot of the whole installation on every settings
+// or registry change (and periodically). The Maintenance container copies it
+// into maintenance-data, so an exact reinstall never needs the user to enter
+// the same configuration twice.
+function ensureInstallationId() {
+  const settings = readSettings();
+  const existing = String(settings.installation?.id || '').trim();
+  if (existing) return existing;
+  const id = `dok-${Date.now().toString(36)}-${randomSecret(3)}`;
+  settings.installation = {
+    ...(settings.installation || {}),
+    id,
+    installedAt: settings.installation?.installedAt || new Date().toISOString(),
+    installedBy: settings.installation?.installedBy || 'dok'
+  };
+  writeSettings(settings);
+  return id;
+}
+
+function installationComposeNames(dir) {
+  return composeFiles.map(name => path.join(dir, name)).filter(file => {
+    try { return fs.statSync(file).isFile(); } catch { return false; }
+  });
+}
+
+function installationCoreServices() {
+  const names = [];
+  try {
+    for (const entry of fs.readdirSync(coreDir, { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.name === 'host-helper') continue;
+      const dir = path.join(coreDir, entry.name);
+      const compose = installationComposeNames(dir);
+      names.push({
+        name: entry.name,
+        dir,
+        compose: compose.map(file => path.relative(root, file)),
+        exists: compose.length > 0
+      });
+    }
+  } catch {}
+  return names.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function installationRegistryApps() {
+  return readRegistry().map(entry => {
+    const appDir = entry.appDir || entry.path || '';
+    const compose = appDir ? installationComposeNames(appDir) : [];
+    return {
+      id: entry.id || '',
+      name: entry.name || '',
+      appDir,
+      compose: compose.map(file => path.relative(root, file)),
+      dataPath: entry.dataPath || '',
+      managedBy: entry.managedBy || 'dok',
+      dok: entry.dok || null,
+      library: entry.library || null,
+      needsConfig: entry.needsConfig === true,
+      launch: entry.launch || null
+    };
+  });
+}
+
+function buildInstallationState(settings = readSettings()) {
+  const redacted = redactSettingsSecrets(settings);
+  const defaults = redacted.defaults || {};
+  const apps = installationRegistryApps();
+  const coreServices = installationCoreServices();
+  return {
+    schema: installationStateSchema,
+    installationId: ensureInstallationId(),
+    updated: new Date().toISOString(),
+    dok: {
+      container: 'wickedafdok',
+      image: process.env.WICKEDAFDOK_IMAGE || 'wickedafdok:latest',
+      version: readJson(path.join(dataDir, '..', 'package.json'), {})?.version || '1.0.0',
+      port: Number(process.env.PORT) || 8080,
+      root: updateSourceDir()
+    },
+    summary: {
+      apps: apps.length,
+      coreServices: coreServices.filter(item => item.exists).map(item => item.name),
+      registryConnections: (readJson(registriesPath, { connections: [] })?.connections || []).length,
+      primaryDomain: defaults.primaryDomain || '',
+      dokDomain: defaults.dokDomain || redacted.services?.nginxProxy?.domain || '',
+      dataLocation: defaults.dataLocation || '',
+      defaultNetwork: defaults.defaultNetwork || 'wicked'
+    },
+    settings: redacted,
+    apps,
+    coreServices,
+    networks: { default: defaults.defaultNetwork || 'wicked' },
+    paths: {
+      data: dataDir,
+      apps: appsDir,
+      core: coreDir,
+      sources: sourcesDir,
+      uploads: uploadsDir,
+      checkout: updateSourceDir()
+    }
+  };
+}
+
+function writeInstallationState() {
+  if (installationStateWriting) return null;
+  installationStateWriting = true;
+  try {
+    const settings = readSettings();
+    const state = buildInstallationState(settings);
+    writeJson(installationStatePath, state);
+    let current = {};
+    try { current = readJson(installationPath, {}) || {}; } catch {}
+    writeJson(installationPath, {
+      ...current,
+      schema: 'wickedafdok.installation/v1',
+      id: current.id || state.installationId,
+      created: current.created || new Date().toISOString(),
+      updated: new Date().toISOString(),
+      type: current.type || settings.installation?.type || 'standalone',
+      summary: state.summary,
+      dok: { ...(current.dok || {}), container: 'wickedafdok', image: state.dok.image, url: current.dok?.url || '' },
+      plan: current.plan || null,
+      completedAt: current.completedAt || ''
+    });
+    return state;
+  } catch (e) {
+    appendServerLog('WARN', `Could not write installation state: ${e.message}`);
+    return null;
+  } finally {
+    installationStateWriting = false;
+  }
+}
+
+function scheduleInstallationState() {
+  if (installationStateWriting) return;
+  clearTimeout(installationStateTimer);
+  installationStateTimer = setTimeout(() => {
+    installationStateTimer = null;
+    writeInstallationState();
+  }, 500);
+  if (installationStateTimer.unref) installationStateTimer.unref();
 }
 
 // Generated compose files are a few kilobytes. Reading an unbounded file here
@@ -427,16 +581,47 @@ function recoverOversizedManagedCompose(file) {
   }
 }
 
+function ensureDokAppLabels(appDir, name, composeFile = 'docker-compose.yml') {
+  try {
+    const composeText = fs.readFileSync(path.join(appDir, composeFile), 'utf-8');
+    const services = serviceNamesFromCompose(composeText);
+    if (!services.length) return false;
+    writePrivateFile(
+      path.join(appDir, 'docker-compose.wickedafdok.yml'),
+      buildComposeOverride(services, { labels: appDokLabels(name) })
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function addRegistryEntry(entry) {
   const reg = readRegistry();
+  const appName = projectName(entry.name || entry.appDir || entry.path, 'app');
+  const installationId = ensureInstallationId();
+  const metadata = {
+    managedBy: 'dok',
+    dok: {
+      managed: true,
+      installationId,
+      app: appName,
+      labels: appDokLabels(appName)
+    }
+  };
   const existing = (entry.appDir ? reg.find(r => r.appDir === entry.appDir) : null)
     || (entry.name ? reg.find(r => r.name === entry.name) : null);
   if (existing) {
-    Object.assign(existing, entry, { id: existing.id, created: existing.created });
+    Object.assign(existing, entry, metadata, { id: existing.id, created: existing.created });
     writeRegistry(reg);
     return existing;
   }
-  const full = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, created: new Date().toISOString(), ...entry };
+  const full = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    created: new Date().toISOString(),
+    ...entry,
+    ...metadata
+  };
   reg.unshift(full);
   writeRegistry(reg);
   return full;
@@ -3480,19 +3665,33 @@ async function hostHelperAvailable() {
 }
 
 async function hostMkdir(target, { uid, gid, mode } = {}) {
-  return hostHelperRequest('POST', '/mkdir', {
+  const payload = {
     path: target,
     uid: uid ?? (typeof process.getuid === 'function' ? process.getuid() : null),
     gid: gid ?? (typeof process.getgid === 'function' ? process.getgid() : null),
     mode: mode ?? 0o775
-  }, 10000);
+  };
+  try {
+    return await hostHelperRequest('POST', '/mkdir', payload, 10000);
+  } catch (e) {
+    // The Maintenance container replaces the old Host Helper. Start it on
+    // demand when a host path has to be created, then retry once.
+    if (Date.now() - lastMaintenanceStartAttempt < 30000) throw e;
+    lastMaintenanceStartAttempt = Date.now();
+    try {
+      await ensureMaintenanceService({ wait: true });
+      return await hostHelperRequest('POST', '/mkdir', payload, 15000);
+    } catch {
+      throw e;
+    }
+  }
 }
 
 function permissionDenied(target, action = 'creating') {
   return httpError(403,
     `Permission denied while ${action} "${target}" as UID/GID ${processIdentity()}. ` +
     'Run "sudo ./setup.sh" on the host to fix ownership of the runtime directories, or create/chown this path with matching permissions. ' +
-    'You can also launch the optional Host Helper core service to let WickedAFDok create host paths.'
+    'The Dok Maintenance container can also create host paths; start it from Settings → Maintenance.'
   );
 }
 
@@ -4846,10 +5045,11 @@ async function selfContainerInfo() {
   if (selfInfoCache.info && Date.now() - selfInfoCache.at < 5000) return selfInfoCache.info;
   try {
     const containers = await docker.listContainers({ all: true });
-    const self = containers.find(c => (c.Names || []).some(n => {
+    const matches = containers.filter(c => (c.Names || []).some(n => {
       const name = n.replace(/^\//, '');
-      return /wickedafdok/i.test(name) && !/updater|helper/i.test(name);
+      return /wickedafdok/i.test(name) && !/updater|helper|maintenance/i.test(name);
     }));
+    const self = matches.find(c => (c.Names || []).some(n => n.replace(/^\//, '') === 'wickedafdok')) || matches[0];
     if (self?.Id) {
       const info = await docker.getContainer(self.Id).inspect();
       selfInfoCache = { at: Date.now(), info };
@@ -4888,11 +5088,195 @@ async function selfContainerImage() {
     const containers = await docker.listContainers({ all: true });
     const self = containers.find(c => (c.Names || []).some(n => {
       const name = n.replace(/^\//, '');
-      return /wickedafdok/i.test(name) && !/updater|helper/i.test(name);
+      return /wickedafdok/i.test(name) && !/updater|helper|maintenance/i.test(name);
     }));
     if (self?.Image) return self.Image;
   } catch {}
   return process.env.WICKEDAFDOK_IMAGE || 'wickedafdok:latest';
+}
+
+function maintenanceToken({ create = true } = {}) {
+  try {
+    const token = fs.readFileSync(maintenanceTokenPath, 'utf-8').trim();
+    if (token) return token;
+  } catch {}
+  if (!create) return '';
+  const token = randomSecret(24);
+  try {
+    writePrivateFile(maintenanceTokenPath, token);
+    fs.chmodSync(maintenanceTokenPath, 0o600);
+  } catch {}
+  return token;
+}
+
+function maintenanceHostPort() {
+  const value = Number(process.env.MAINTENANCE_PORT);
+  return Number.isInteger(value) && value > 0 ? value : 8090;
+}
+
+async function maintenanceHostCheckout() {
+  const info = await selfContainerInfo();
+  const dataMount = (info?.Mounts || []).find(m => m.Destination === '/app/data' && m.Type === 'bind' && m.Source);
+  if (dataMount) return path.dirname(dataMount.Source);
+  return await selfMountSource('/app/host-source');
+}
+
+function maintenanceComposeText({ checkout, image, installationId: id, hostPort, uid, gid, socket }) {
+  const dataPath = path.join(checkout, 'maintenance-data');
+  const lines = [
+    '# managed-by: wickedafdok',
+    'name: wickedafdok-maintenance',
+    '',
+    'services:',
+    '  maintenance:',
+    `    image: ${yamlScalar(image)}`,
+    `    container_name: ${maintenanceContainer}`,
+    '    restart: "no"',
+    '    privileged: true',
+    '    working_dir: /app',
+    '    command: ["node", "/app/maintenance/server.js"]',
+    '    ports:',
+    `      - ${yamlScalar(`${hostPort}:8090`)}`,
+    '    volumes:',
+    `      - ${yamlScalar(`${socket}:/var/run/docker.sock`)}`,
+    `      - ${yamlScalar(`${checkout}:/dok`)}`,
+    ...(checkout === '/dok' ? [] : [`      - ${yamlScalar(`${checkout}:${checkout}`)}`]),
+    `      - ${yamlScalar(`${dataPath}:/maintenance-data`)}`,
+    '      - type: bind',
+    '        source: /',
+    '        target: /host',
+    '        bind:',
+    '          propagation: rslave',
+    '    environment:',
+    '      - DOK_ROOT=/dok',
+    '      - MAINTENANCE_DATA=/maintenance-data',
+    '      - HOST_ROOT=/host',
+    `      - ${yamlScalar(`DOK_HOST_PATH=${checkout}`)}`,
+    '      - DOK_CONTAINER=wickedafdok',
+    `      - ${yamlScalar(`DOK_PORT=${Number(process.env.PORT) || 8080}`)}`,
+    `      - ${yamlScalar(`DOCKER_SOCK=${socket}`)}`,
+    `      - ${yamlScalar(`DOK_UID=${uid}`)}`,
+    `      - ${yamlScalar(`DOK_GID=${gid}`)}`,
+    `      - ${yamlScalar(`MAINTENANCE_PORT=8090`)}`,
+    `      - ${yamlScalar(`MAINTENANCE_URL=http://localhost:${hostPort}`)}`,
+    '      - MAINTENANCE_REQUIRE_TOKEN=1',
+    '      - MAINTENANCE_TOKEN_FILE=/dok/data/.maintenance-token',
+    '      - OPENCODE_BIN=/usr/local/bin/opencode',
+    '    networks:',
+    '      - wicked',
+    '    labels:',
+    '      - dok.managed=true',
+    '      - dok.maintenance=true',
+    '      - dok.role=maintenance',
+    `      - ${yamlScalar(`dok.installation=${id}`)}`,
+    '    healthcheck:',
+    '      test: ["CMD", "curl", "-fsS", "http://localhost:8090/api/health"]',
+    '      interval: 15s',
+    '      timeout: 5s',
+    '      retries: 5',
+    '      start_period: 15s',
+    '',
+    'networks:',
+    '  wicked:',
+    '    external: true',
+    '    name: wicked',
+    ''
+  ];
+  return lines.join('\n');
+}
+
+async function ensureMaintenanceCompose() {
+  const checkout = await maintenanceHostCheckout();
+  if (!checkout) {
+    throw httpError(409, 'The Dok checkout is not available on the host. Run sudo ./setup.sh to configure the Maintenance container.');
+  }
+  let socket = process.env.DOCKER_SOCK || '/var/run/docker.sock';
+  try {
+    if (!/^[a-zA-Z0-9_./-]+$/.test(socket)) socket = '/var/run/docker.sock';
+  } catch {}
+  const image = await selfContainerImage();
+  const id = ensureInstallationId();
+  const token = maintenanceToken({ create: true });
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 0;
+  const gid = typeof process.getgid === 'function' ? process.getgid() : 0;
+  const hostPort = maintenanceHostPort();
+  const text = maintenanceComposeText({
+    checkout, image, installationId: id, hostPort, uid, gid, socket
+  });
+  fs.mkdirSync(path.dirname(maintenanceComposePath), { recursive: true });
+  writePrivateFile(maintenanceComposePath, text);
+  // The host checkout is mounted at /app/host-source in the Dok container.
+  // Create the dedicated store here when the checkout is bind-mounted so the
+  // Maintenance container never has to guess at its host location.
+  try {
+    const hostSource = updateSourceDir();
+    if (hostSource !== root) fs.mkdirSync(path.join(hostSource, 'maintenance-data'), { recursive: true });
+  } catch {}
+  return { composePath: maintenanceComposePath, checkout, image, hostPort, token, id };
+}
+
+async function maintenanceContainerInfo() {
+  try {
+    return await docker.getContainer(maintenanceContainer).inspect();
+  } catch {
+    return null;
+  }
+}
+
+async function waitForMaintenanceHelper(timeoutMs = 45000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    try {
+      await hostHelperRequest('GET', '/ping', undefined, 1500);
+      return true;
+    } catch {
+      await new Promise(resolve => setTimeout(resolve, 750));
+    }
+  }
+  return false;
+}
+
+async function ensureMaintenanceService({ wait = true } = {}) {
+  const info = await maintenanceContainerInfo();
+  if (info?.State?.Running) {
+    if (!wait || await waitForMaintenanceHelper(5000)) {
+      return { started: false, running: true, already: true };
+    }
+    await docker.getContainer(maintenanceContainer).restart().catch(() => {});
+  } else if (info) {
+    await docker.getContainer(maintenanceContainer).start();
+  } else {
+    const context = await ensureMaintenanceCompose();
+    await ensureNetwork('wicked');
+    await run('docker', ['compose', '-p', 'wickedafdok-maintenance', '-f', context.composePath, 'up', '-d', '--remove-orphans'], { cwd: root, timeout: 180000 });
+  }
+  const ready = wait ? await waitForMaintenanceHelper(60000) : true;
+  return { started: true, running: true, ready };
+}
+
+function maintenanceUrl(req) {
+  const token = maintenanceToken({ create: true });
+  const forwarded = String(req?.headers?.['x-forwarded-host'] || req?.headers?.host || '').split(',')[0].trim();
+  let host = forwarded.replace(/:\d+$/, '') || 'localhost';
+  if (host.startsWith('[') && host.includes(']')) host = host.slice(1, host.indexOf(']'));
+  return `http://${host}:${maintenanceHostPort()}/?token=${encodeURIComponent(token)}`;
+}
+
+async function maintenanceStatus(req) {
+  const info = await maintenanceContainerInfo();
+  const running = info?.State?.Running === true;
+  return {
+    installed: !!info,
+    running,
+    state: info?.State?.Status || (info ? 'stopped' : 'not created'),
+    container: maintenanceContainer,
+    url: running ? maintenanceUrl(req) : '',
+    startUrl: maintenanceUrl(req),
+    tokenRequired: true,
+    port: maintenanceHostPort(),
+    composePath: maintenanceComposePath,
+    image: info?.Config?.Image || ''
+  };
 }
 
 function hostHelperCompose(settings = {}, image = '', tokenOverride = '', hostDataDir = '') {
@@ -5409,9 +5793,19 @@ async function createBackup({
   return meta;
 }
 
+function appDokLabels(name) {
+  return {
+    'dok.managed': 'true',
+    'dok.created-by': 'dok',
+    'dok.app': projectName(name, 'app'),
+    'dok.installation': ensureInstallationId()
+  };
+}
+
 function buildComposeOverride(services, {
   network = '', networks = [], networkMappings = [], vhost = '', vhostPort = '',
-  clearVhost = false, vhostService = '', ports = [], volumeMappings = [], baseText = ''
+  clearVhost = false, vhostService = '', ports = [], volumeMappings = [], baseText = '',
+  labels = {}
 } = {}) {
   const lines = ['services:'];
   const base = String(baseText || '');
@@ -5435,8 +5829,16 @@ function buildComposeOverride(services, {
   }
   const targetVhostService = services.includes(vhostService) ? vhostService : services[0];
 
+  const labelEntries = Object.entries(labels || {})
+    .filter(([key, value]) => key && value !== undefined && value !== null && String(value) !== '');
   services.forEach((svc) => {
     lines.push(`  ${yamlScalar(svc)}:`);
+    if (labelEntries.length) {
+      lines.push('    labels:');
+      for (const [key, value] of labelEntries) {
+        lines.push(`      ${yamlScalar(key)}: ${yamlScalar(value)}`);
+      }
+    }
     if (selectedNetworks.length) {
       lines.push('    networks:');
       for (const net of selectedNetworks) lines.push(`      - ${yamlScalar(net)}`);
@@ -5882,6 +6284,7 @@ app.post('/api/containers/:id/save-to-registry', async (req, res) => {
     ensureWritableDirectory(appDir, { label: 'app directory' });
     if (!isInsideApps(appDir)) throw httpError(400, 'Invalid app directory');
     fs.writeFileSync(path.join(appDir, 'docker-compose.yml'), containerToCompose(info, { serviceName: appName, network }));
+    ensureDokAppLabels(appDir, appName);
 
     const entry = addRegistryEntry({
       type: 'compose',
@@ -6957,9 +7360,9 @@ app.post('/api/launch/finalize', async (req, res) => {
     const effectiveVhostService = analysis.vhostService || vhostService;
     const overrideVhostService = services.includes(effectiveVhostService) ? effectiveVhostService : (targetService || '');
     const overrideClearVhost = clearVhost && !runMode;
-    const overrideNeeded = !!(overrideNetwork || cleanVhost || overrideClearVhost || overridePorts.length ||
-      networkMappings.length || volumeMappings.length);
-    const overrideText = overrideNeeded ? buildComposeOverride(orderedServices, {
+    // Labels are always written so the Maintenance container can find every
+    // app Dok created, even when no network/vhost/port override is needed.
+    const overrideText = buildComposeOverride(orderedServices, {
       network: overrideNetwork,
       networkMappings,
       vhost: cleanVhost,
@@ -6968,8 +7371,9 @@ app.post('/api/launch/finalize', async (req, res) => {
       vhostService: overrideVhostService,
       ports: overridePorts,
       volumeMappings,
-      baseText: finalCompose
-    }) : '';
+      baseText: finalCompose,
+      labels: appDokLabels(name)
+    });
 
     let combinedIssues = [];
     let combinedMissingNetworks = [];
@@ -7702,6 +8106,7 @@ async function importLibraryTree({ manifest, appsRoot, overwrite = false }) {
     }
     fs.mkdirSync(path.dirname(composeDest), { recursive: true });
     writePrivateFile(composeDest, entry.compose);
+    ensureDokAppLabels(entry.target, entry.name, entry.composeRel);
     addRegistryEntry({
       type: 'compose',
       name: entry.name,
@@ -7952,7 +8357,19 @@ app.post('/api/apps/:id/compose', async (req, res) => {
     const composePath = existingComposePath || path.join(appDir, 'docker-compose.yml');
     writePrivateFile(composePath, compose);
     savedComposePath = composePath;
-    try { fs.unlinkSync(path.join(appDir, 'docker-compose.wickedafdok.yml')); } catch {}
+    const overridePath = path.join(appDir, 'docker-compose.wickedafdok.yml');
+    try { fs.unlinkSync(overridePath); } catch {}
+    // Keep the Dok ownership labels even after the routing override was
+    // removed by an Alter State save.
+    try {
+      const services = serviceNamesFromCompose(compose);
+      if (services.length) {
+        writePrivateFile(overridePath, buildComposeOverride(services, {
+          labels: appDokLabels(entry.name),
+          baseText: compose
+        }));
+      }
+    } catch {}
     try {
       const reg = readRegistry();
       const current = reg.find(item => item.id === entry.id);
@@ -10808,6 +11225,10 @@ function terminalSessionSummary(session) {
 async function createTerminalSession({ mode = 'admin', app = 'shell', agent = '', prompt = '', title = '' } = {}) {
   if (!TERMINAL_MODES[mode]) throw httpError(400, 'Unknown terminal mode');
   if (!['shell', 'opencode'].includes(app)) throw httpError(400, 'Unknown terminal application');
+  if (app === 'opencode' && mode === 'admin') {
+    throw httpError(409,
+      'Admin OpenCode runs only inside the Dok Maintenance container. Start Maintenance from Settings → Maintenance, then launch OpenCode there.');
+  }
   if (terminalSessions.size >= OPENCODE_MAX_SESSIONS) {
     throw httpError(429, `Too many terminal sessions are open (max ${OPENCODE_MAX_SESSIONS}). Stop one first.`);
   }
@@ -11101,6 +11522,73 @@ app.post('/api/core/:service/:action(start|stop|restart)', async (req, res) => {
     res.json({ ok: true, stdout, stderr });
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message, stdout: e.stdout, stderr: e.stderr });
+  }
+});
+
+// ---------- maintenance / installation state ----------
+app.get('/api/installation', async (req, res) => {
+  try {
+    const state = writeInstallationState() || buildInstallationState();
+    const saved = readJson(installationPath, {}) || {};
+    res.json({ ok: true, installation: saved, state });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/installation/sync', (req, res) => {
+  try {
+    const state = writeInstallationState();
+    res.json({ ok: !!state, state: state ? { updated: state.updated, summary: state.summary } : null });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/maintenance', async (req, res) => {
+  try {
+    res.json({ ok: true, maintenance: await maintenanceStatus(req) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/maintenance/start', async (req, res) => {
+  try {
+    const result = await ensureMaintenanceService({ wait: true });
+    res.json({ ok: true, ...result, maintenance: await maintenanceStatus(req) });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+app.post('/api/maintenance/stop', async (req, res) => {
+  try {
+    const info = await maintenanceContainerInfo();
+    if (!info) return res.json({ ok: true, running: false, message: 'Maintenance is not created.' });
+    if (info.State?.Running) await docker.getContainer(maintenanceContainer).stop({ t: 10 }).catch(() => {});
+    res.json({ ok: true, running: false, message: 'Maintenance stopped.' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/maintenance/mode', async (req, res) => {
+  try {
+    const active = req.body?.active !== false;
+    if (active) {
+      const result = await ensureMaintenanceService({ wait: true });
+      return res.json({ ok: true, active: true, ...result, maintenance: await maintenanceStatus(req) });
+    }
+    const self = await selfContainerInfo();
+    if (self?.State && !self.State.Running) {
+      await docker.getContainer(self.Id).start().catch(() => {});
+    }
+    const info = await maintenanceContainerInfo();
+    if (info?.State?.Running) await docker.getContainer(maintenanceContainer).stop({ t: 10 }).catch(() => {});
+    res.json({ ok: true, active: false, running: false, message: 'Maintenance mode is off.' });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
   }
 });
 
@@ -11720,6 +12208,17 @@ try {
 } catch (e) {
   appendServerLog('WARN', `settings secret migration failed: ${e.message}`);
 }
+
+// Record the complete installation state for the Maintenance container and
+// refresh it on a timer so changes made outside Dok's settings routes (compose
+// edits, core-service files, app folders) are still captured.
+try {
+  writeInstallationState();
+} catch (e) {
+  appendServerLog('WARN', `initial installation state failed: ${e.message}`);
+}
+const installationStateTimerInterval = setInterval(() => { writeInstallationState(); }, 30_000);
+if (installationStateTimerInterval.unref) installationStateTimerInterval.unref();
 
 // Ship editable error-page templates with every installation. Existing user
 // edits are left untouched.

@@ -9,3 +9,4 @@ core
 .env
 docker-compose.override.yml
 *.log
+maintenance-data

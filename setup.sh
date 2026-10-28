@@ -189,7 +189,7 @@ add_host_user_to_socket_group() {
 
 add_host_user_to_socket_group
 
-for d in data sources uploads apps core data/wickedafdok data/.home data/opencode data/docker-config data/tmp; do
+for d in data sources uploads apps core data/wickedafdok data/.home data/opencode data/docker-config data/tmp maintenance-data; do
   mkdir -p "$DIR/$d"
 done
 
@@ -229,7 +229,7 @@ if [ -f "$DIR/.env" ]; then
   chmod 600 "$DIR/.env" 2>/dev/null || true
 fi
 chmod 700 "$DIR/data/.home" "$DIR/data/backups" "$DIR/data/host-helper" "$DIR/data/opencode" \
-  "$DIR/data/docker-config" "$DIR/data/tmp" 2>/dev/null || true
+  "$DIR/data/docker-config" "$DIR/data/tmp" "$DIR/maintenance-data" 2>/dev/null || true
 chmod 600 "$DIR/data/.credentials-key" 2>/dev/null || true
 chmod 700 "$DIR/data/tmp/git-askpass.sh" 2>/dev/null || true
 # OpenCode stores provider auth, session state, and generated configs here.
@@ -264,6 +264,8 @@ services:
         target: /var/run/docker.sock
     environment:
       - HOME=/app/data/.home
+      - "DOCKER_SOCK=$SOCK"
+      - "MAINTENANCE_PORT=${MAINTENANCE_PORT:-8090}"
 EOF
   then
     rm -f "$tmp"
@@ -295,6 +297,58 @@ else
   echo "Created Docker network wicked."
 fi
 
+# ---------------------------------------------------------------------------
+# Dok Maintenance
+# setup.sh is the only host-privileged entry point. It starts the Maintenance
+# container so the browser installer can create host directories, launch Dok,
+# and configure the selected core services.
+# ---------------------------------------------------------------------------
+TOKEN_FILE="$DIR/data/.maintenance-token"
+if [ ! -s "$TOKEN_FILE" ]; then
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 24 > "$TOKEN_FILE"
+  else
+    head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$TOKEN_FILE"
+  fi
+fi
+chmod 600 "$TOKEN_FILE" 2>/dev/null || true
+if [ "$PUID" -ne 0 ] || [ "$PGID" -ne 0 ]; then
+  chown "$PUID:$PGID" "$TOKEN_FILE" 2>/dev/null || true
+fi
+MAINTENANCE_TOKEN=$(cat "$TOKEN_FILE")
+MAINTENANCE_PORT=${MAINTENANCE_PORT:-8090}
+
+find "$DIR/maintenance-data" -type d -exec chmod 700 {} + 2>/dev/null || true
+find "$DIR/maintenance-data" -type f -exec chmod 600 {} + 2>/dev/null || true
+if [ "$PUID" -ne 0 ] || [ "$PGID" -ne 0 ]; then
+  chown -R "$PUID:$PGID" "$DIR/maintenance-data" 2>/dev/null || true
+fi
+
+if [ "${SKIP_BUILD:-0}" != "1" ]; then
+  echo "Building the WickedAFDok/Maintenance image..."
+  if ! docker build -t wickedafdok:latest "$DIR"; then
+    echo "Could not build wickedafdok:latest." >&2
+    exit 1
+  fi
+fi
+
+if ! DOK_PATH="$DIR" HOST_PATH=/ PUID="$PUID" PGID="$PGID" \
+  DOCKER_SOCK="$SOCK" MAINTENANCE_PORT="$MAINTENANCE_PORT" \
+  MAINTENANCE_URL="http://localhost:$MAINTENANCE_PORT" MAINTENANCE_REQUIRE_TOKEN=1 \
+  docker compose -p wickedafdok-maintenance -f "$DIR/maintenance/docker-compose.yml" up -d --remove-orphans; then
+  echo "Could not start the Dok Maintenance container." >&2
+  exit 1
+fi
+
+echo
+echo "Dok Maintenance is starting:"
+echo "  URL:   http://localhost:$MAINTENANCE_PORT/?token=$MAINTENANCE_TOKEN"
+echo "  Token: $MAINTENANCE_TOKEN"
+echo
+echo "Open the URL and choose Start installation. The Maintenance container"
+echo "installs Dok and the core services you select, then can be shut down."
+echo
+
 echo
 echo "WickedAFDok permissions configured:"
 echo "  Container user: $PUID:$PGID"
@@ -309,7 +363,7 @@ if [ "$OVERRIDE_FAILED" -ne 0 ]; then
   exit 1
 fi
 
-echo "Recreate the container with: ./start.sh"
+echo "After installation, start Dok with: ./start.sh"
 if [ "$GROUP_ADDED" -ne 0 ]; then
   echo "Log out and back in first so the new Docker group membership applies."
 fi

@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dok Maintenance</title>
+  <link rel="stylesheet" href="/vendor/xterm/css/xterm.css">
+  <link rel="stylesheet" href="/maintenance.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">D</div>
+      <div>
+        <div class="brand-name">Dok Maintenance</div>
+        <div class="brand-tag">Installation · Backups · Repairs · Admin</div>
+      </div>
+    </div>
+    <div class="top-actions">
+      <span class="pill" id="dokPill"><span class="dot"></span> Dok: checking</span>
+      <span class="pill" id="modePill"><span class="dot warn"></span> Maintenance</span>
+      <button class="btn sm" id="refreshAll">Refresh</button>
+      <button class="btn sm danger" id="exitMaintenance">Exit maintenance</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav class="tabs" id="tabs">
+      <button class="tab-btn active" data-view="overview">Overview</button>
+      <button class="tab-btn" data-view="install">Installation</button>
+      <button class="tab-btn" data-view="backups">Backups</button>
+      <button class="tab-btn" data-view="snapshots">Snapshots</button>
+      <button class="tab-btn" data-view="updates">Updates</button>
+      <button class="tab-btn" data-view="diagnostics">Diagnostics</button>
+      <button class="tab-btn" data-view="terminal">Terminal &amp; OpenCode</button>
+      <div class="nav-foot">
+        Runs only while needed. Storage lives in <span class="mono">maintenance-data/</span>, separate from the Dok installation.
+      </div>
+    </nav>
+
+    <main>
+      <section class="view active" id="view-overview">
+        <div class="page-head">
+          <div>
+            <h2>Overview</h2>
+            <div class="sub">Installation state, containers, and host health.</div>
+          </div>
+          <div class="row">
+            <button class="btn sm" id="syncStateBtn">Sync installation state</button>
+            <button class="btn sm" id="snapshotNowBtn">Capture snapshot</button>
+          </div>
+        </div>
+
+        <div id="installBanner" class="hidden"></div>
+
+        <div class="grid">
+          <div class="card">
+            <div class="card-head"><h3>Dok</h3><span class="badge" id="dokBadge">unknown</span></div>
+            <div id="dokInfo" class="stack small"></div>
+            <div class="row" style="margin-top:12px">
+              <button class="btn sm primary" id="dokOpenBtn">Open Dok</button>
+              <button class="btn sm" id="dokStartBtn">Start</button>
+              <button class="btn sm" id="dokRestartBtn">Restart</button>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h3>Maintenance</h3><span class="badge ok">active</span></div>
+            <div id="maintInfo" class="stack small"></div>
+            <div class="row" style="margin-top:12px">
+              <button class="btn sm" id="syncNowBtn">Sync now</button>
+              <button class="btn sm" id="saveInstallBtn">Save installation files</button>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h3>Host</h3></div>
+            <div id="hostInfo" class="stack small"></div>
+          </div>
+        </div>
+
+        <div class="divider"></div>
+        <div class="card">
+          <div class="card-head"><h3>Containers</h3><span class="card-note" id="containerCount"></span></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Name</th><th>Image</th><th>State</th><th>Status</th><th></th></tr></thead>
+              <tbody id="containersBody"><tr><td colspan="5" class="empty">Loading...</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="divider"></div>
+        <div class="grid two">
+          <div class="card">
+            <div class="card-head"><h3>Apps</h3><span class="card-note" id="appsCount"></span></div>
+            <div id="appsList" class="list"><div class="empty">Loading...</div></div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h3>Installation summary</h3></div>
+            <div id="summaryInfo" class="kv"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="view" id="view-install">
+        <div class="page-head">
+          <div>
+            <h2>Installation</h2>
+            <div class="sub">Install Dok, optionally with a curated set of core services.</div>
+          </div>
+        </div>
+
+        <div id="installLanding" class="hero">
+          <div id="landingContent">
+            <h2>Prepare this server for Dok</h2>
+            <p>
+              This container has privileged access to the Docker host. Choose how much of the stack Dok should
+              install, and it will write the configuration, build the image, launch Dok, and configure the
+              selected core services. Installation data and snapshots stay in the separate maintenance store so
+              an exact reinstall never needs the same answers twice.
+            </p>
+            <div id="landingNotice" class="notice hidden" style="margin-top:14px"></div>
+            <div class="hero-actions">
+              <button class="btn primary" id="startInstallBtn">Start installation</button>
+              <button class="btn cyan hidden" id="reinstallBtn">Exact reinstall from snapshot</button>
+              <button class="btn" id="openExistingDokBtn">Open existing Dok</button>
+            </div>
+          </div>
+          <div class="maintenance-corner">
+            <button class="btn sm ghost" id="maintenanceModeBtn">Maintenance mode (already installed)</button>
+          </div>
+        </div>
+
+        <div id="installWizard" class="wizard hidden">
+          <div class="steps" id="wizardSteps"></div>
+          <div class="card" id="wizardBody"></div>
+          <div class="row between">
+            <button class="btn" id="wizardBack">Back</button>
+            <div class="row">
+              <button class="btn ghost" id="wizardSkip">Skip</button>
+              <button class="btn primary" id="wizardNext">Continue</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="installProgress" class="card hidden" style="margin-top:16px">
+          <div class="card-head"><h3 id="installPhase">Preparing installation</h3><span class="badge warn" id="installBadge">running</span></div>
+          <div class="progress"><span id="installBar"></span></div>
+          <pre class="log" id="installLog" style="margin-top:12px"></pre>
+          <div id="installResult" class="hidden" style="margin-top:14px"></div>
+        </div>
+      </section>
+
+      <section class="view" id="view-backups">
+        <div class="page-head">
+          <div>
+            <h2>Backups</h2>
+            <div class="sub">Full installation archives stored in <span class="mono">maintenance-data/backups</span>.</div>
+          </div>
+          <div class="row">
+            <button class="btn sm" id="backupRefresh">Refresh</button>
+            <button class="btn sm primary" id="backupCreate">Create backup</button>
+          </div>
+        </div>
+        <div class="card" style="margin-bottom:14px">
+          <div class="row">
+            <input class="input" id="backupName" placeholder="Backup label (optional)">
+            <label class="check"><input type="checkbox" id="backupLogs" checked> Include logs</label>
+            <button class="btn sm" id="backupImportPick">Import archive</button>
+            <input type="file" id="backupImportFile" class="hidden" accept=".tar.gz,.tgz,application/gzip">
+          </div>
+          <div class="card-note" style="margin-top:8px">Restoring overwrites the Dok installation directories. App data is included in full archives, so restore only an archive you trust.</div>
+        </div>
+        <div class="card">
+          <div id="backupsList" class="list"><div class="empty">Loading...</div></div>
+        </div>
+      </section>
+
+      <section class="view" id="view-snapshots">
+        <div class="page-head">
+          <div>
+            <h2>Installation snapshots</h2>
+            <div class="sub">Automatic points-in-time copies used for exact reinstalls and repairs.</div>
+          </div>
+          <div class="row">
+            <button class="btn sm" id="snapRefresh">Refresh</button>
+            <button class="btn sm primary" id="snapCreate">Capture snapshot</button>
+            <button class="btn sm cyan" id="snapReinstall">Exact reinstall</button>
+          </div>
+        </div>
+        <div class="card">
+          <div id="snapshotsList" class="list"><div class="empty">Loading...</div></div>
+        </div>
+      </section>
+
+      <section class="view" id="view-updates">
+        <div class="page-head">
+          <div>
+            <h2>Updates</h2>
+            <div class="sub">Update the Dok checkout and rebuild the shared image.</div>
+          </div>
+          <button class="btn sm" id="updateRefresh">Refresh</button>
+        </div>
+        <div class="card">
+          <div class="grid two">
+            <div>
+              <div class="field">
+                <label for="updateRepo">Git repository</label>
+                <input class="input" id="updateRepo" placeholder="https://github.com/wickedafapps/dok.git">
+                <div class="help">Leave blank to keep the current origin.</div>
+              </div>
+              <div class="field">
+                <label for="updateBranch">Branch</label>
+                <input class="input" id="updateBranch" placeholder="main">
+              </div>
+              <label class="check" style="margin-bottom:12px"><input type="checkbox" id="updateForce"> Discard local changes and reset if fast-forward fails</label>
+              <button class="btn primary" id="updateRun">Update and rebuild</button>
+            </div>
+            <div class="stack">
+              <div><span class="stat-label">Checkout</span><div class="mono small" id="updateCheckout">-</div></div>
+              <div><span class="stat-label">Latest commit</span><div class="mono small" id="updateCommit">-</div></div>
+              <div id="updateDirty" class="notice warn hidden">The checkout has local changes. Review them before updating.</div>
+            </div>
+          </div>
+          <div class="divider"></div>
+          <div class="card-head"><h3>Update log</h3><span class="badge" id="updateBadge">idle</span></div>
+          <pre class="log" id="updateLog">No update has run yet.</pre>
+        </div>
+      </section>
+
+      <section class="view" id="view-diagnostics">
+        <div class="page-head">
+          <div>
+            <h2>Diagnostics &amp; repairs</h2>
+            <div class="sub">Review the installation, fix permissions, recreate the network, and inspect logs.</div>
+          </div>
+          <div class="row">
+            <button class="btn sm" id="diagRun">Run checks</button>
+            <button class="btn sm primary" id="diagRepair">Repair</button>
+          </div>
+        </div>
+        <div class="card" style="margin-bottom:14px">
+          <div id="diagChecks" class="list"><div class="empty">Run checks to inspect the installation.</div></div>
+        </div>
+        <div class="grid two">
+          <div class="card">
+            <div class="card-head"><h3>Maintenance log</h3><button class="btn sm" id="logsRefresh">Refresh</button></div>
+            <pre class="log" id="maintenanceLog">-</pre>
+          </div>
+          <div class="card">
+            <div class="card-head"><h3>Dok container log</h3></div>
+            <pre class="log" id="dokLog">-</pre>
+          </div>
+        </div>
+      </section>
+
+      <section class="view" id="view-terminal">
+        <div class="page-head">
+          <div>
+            <h2>Terminal &amp; OpenCode</h2>
+            <div class="sub">Admin shell and the only Admin OpenCode session in the containerverse.</div>
+          </div>
+          <button class="btn sm" id="termRefresh">Refresh</button>
+        </div>
+        <div class="grid two">
+          <div class="card">
+            <div class="card-head"><h3>Admin shell</h3><span class="badge warn">privileged</span></div>
+            <p class="card-note">Runs inside this privileged container with access to <span class="mono">/dok</span>, <span class="mono">/host</span>, and the Docker socket.</p>
+            <button class="btn primary" id="openShellBtn">Open admin shell</button>
+          </div>
+          <div class="card">
+            <div class="card-head"><h3>OpenCode Admin</h3><span class="badge" id="opencodeBadge">checking</span></div>
+            <p class="card-note">Full maintenance agent: installation, updates, backups, repairs, and host management.</p>
+            <button class="btn cyan" id="openOpencodeBtn">Open Admin OpenCode</button>
+            <button class="btn" id="openAssistBtn" style="margin-left:8px">Configure with OpenCode</button>
+          </div>
+        </div>
+        <div class="card" style="margin-top:14px">
+          <div class="card-head"><h3>Active sessions</h3><button class="btn sm danger" id="stopAllSessions">Stop all</button></div>
+          <div id="sessionsList" class="list"><div class="empty">No sessions.</div></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="modal-backdrop hidden" id="tokenModal">
+    <div class="modal" style="max-width:440px">
+      <div class="modal-head"><h3>Maintenance access</h3></div>
+      <p class="sub small">This container can change the host, so the maintenance API requires the token printed by <span class="mono">setup.sh</span>.</p>
+      <div class="field">
+        <label for="tokenInput">Maintenance token</label>
+        <input class="input" id="tokenInput" autocomplete="off" spellcheck="false" placeholder="Paste token from setup.sh output">
+      </div>
+      <div class="modal-actions">
+        <button class="btn primary" id="tokenSave">Unlock</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="terminalModal">
+    <div class="modal wide">
+      <div class="modal-head">
+        <h3 id="terminalTitle">Maintenance terminal</h3>
+        <div class="row">
+          <span class="badge" id="terminalStatus">connecting</span>
+          <button class="btn sm" id="terminalStop">Stop</button>
+          <button class="btn sm ghost" id="terminalClose">Close</button>
+        </div>
+      </div>
+      <div class="terminal-shell" id="terminalContainer"></div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="confirmModal">
+    <div class="modal" style="max-width:520px">
+      <div class="modal-head"><h3 id="confirmTitle">Confirm</h3></div>
+      <div id="confirmBody" class="small"></div>
+      <div class="modal-actions">
+        <button class="btn" id="confirmCancel">Cancel</button>
+        <button class="btn danger" id="confirmOk">Continue</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+  <script src="/vendor/xterm/lib/xterm.js"></script>
+  <script src="/vendor/xterm-fit/lib/addon-fit.js"></script>
+  <script src="/maintenance.js"></script>
+</body>
+</html>

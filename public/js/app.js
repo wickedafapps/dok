@@ -3193,6 +3193,89 @@ if (qs('#updateFromGitBtn')) {
   qs('#updateFromGitBtn').addEventListener('click', () => runGitUpdate(false));
 }
 
+let maintenanceData = null;
+
+async function loadMaintenanceStatus() {
+  try {
+    const res = await api('/api/maintenance');
+    maintenanceData = res.maintenance || null;
+    const status = qs('#maintenanceStatus');
+    if (status && maintenanceData) {
+      status.textContent = maintenanceData.running
+        ? `Maintenance is running (${maintenanceData.state}).`
+        : maintenanceData.installed
+          ? `Maintenance is ${maintenanceData.state}. Start it to open the installer or tools.`
+          : 'Maintenance has not been created yet. Start it to run the installer.';
+    }
+    const stop = qs('#maintenanceStopBtn');
+    if (stop) stop.disabled = !maintenanceData?.running;
+  } catch (e) {
+    const status = qs('#maintenanceStatus');
+    if (status) status.textContent = `Maintenance status unavailable: ${e.message}`;
+  }
+}
+
+async function openMaintenancePanel({ start = false } = {}) {
+  const popup = window.open('about:blank', '_blank');
+  if (popup) popup.document.write('<p style="font-family:sans-serif;padding:24px">Starting Dok Maintenance…</p>');
+  try {
+    let url = maintenanceData?.url || '';
+    if (start || !maintenanceData?.running) {
+      const res = await api('/api/maintenance/start', { method: 'POST' });
+      maintenanceData = res.maintenance || maintenanceData;
+      url = res.maintenance?.url || res.url || url;
+    }
+    if (!url) throw new Error('Maintenance did not return a URL.');
+    await loadMaintenanceStatus();
+    if (popup) popup.location.replace(url);
+    else window.location.href = url;
+  } catch (e) {
+    if (popup) popup.close();
+    const msg = qs('#maintenanceMsg');
+    if (msg) {
+      msg.classList.remove('hidden');
+      msg.textContent = e.message;
+    }
+    toast(e.message, true);
+  }
+}
+
+if (qs('#maintenanceOpenBtn')) {
+  qs('#maintenanceOpenBtn').addEventListener('click', (e) => {
+    setLoading(e.currentTarget, true);
+    openMaintenancePanel({ start: true }).finally(() => setLoading(e.currentTarget, false));
+  });
+}
+if (qs('#maintenanceStartBtn')) {
+  qs('#maintenanceStartBtn').addEventListener('click', async (e) => {
+    setLoading(e.currentTarget, true);
+    try {
+      await api('/api/maintenance/start', { method: 'POST' });
+      toast('Maintenance started');
+      await loadMaintenanceStatus();
+    } catch (err) {
+      toast(err.message, true);
+    } finally {
+      setLoading(e.currentTarget, false);
+    }
+  });
+}
+if (qs('#maintenanceStopBtn')) {
+  qs('#maintenanceStopBtn').addEventListener('click', async (e) => {
+    setLoading(e.currentTarget, true);
+    try {
+      await api('/api/maintenance/stop', { method: 'POST' });
+      toast('Maintenance stopped');
+      await loadMaintenanceStatus();
+    } catch (err) {
+      toast(err.message, true);
+    } finally {
+      setLoading(e.currentTarget, false);
+    }
+  });
+}
+if (qs('#maintenanceRefresh')) qs('#maintenanceRefresh').addEventListener('click', loadMaintenanceStatus);
+
 let coreNginxData = null;
 
 async function loadCoreNginx() {
@@ -3208,15 +3291,13 @@ async function loadCoreNginx() {
     const installed = res.lookupFailed
       ? (state.coreNginxInstalled === true || res.installed === true)
       : res.installed === true;
+    if (create) create.classList.add('hidden');
+    if (manage) manage.classList.toggle('hidden', !installed);
     if (installed) {
-      if (create) create.classList.add('hidden');
-      if (manage) manage.classList.remove('hidden');
       const label = qs('#nginxManageSection .muted');
       if (label) label.textContent = `nginx-proxy status: ${res.state || 'created'}`;
-    } else {
-      if (create) create.classList.remove('hidden');
-      if (manage) manage.classList.add('hidden');
     }
+    hideCoreCardUnless('coreNginxCard', installed);
     const hint = qs('#nginxCreateHint');
     if (hint) hint.classList.toggle('hidden', installed || !res.composeExists);
     if (qs('#nginxComposeEditor')) {
@@ -3376,16 +3457,11 @@ async function loadCoreCloudflared() {
     const res = await api('/api/core/cloudflared');
     coreCfData = res;
     const cfInstalled = coreServiceInstalled('cf', res);
-    const create = qs('#cfCreateSection');
-    const manage = qs('#cfManageSection');
+    setCoreSections('cf', cfInstalled);
+    hideCoreCardUnless('coreCloudflaredCard', cfInstalled);
     if (cfInstalled) {
-      if (create) create.classList.add('hidden');
-      if (manage) manage.classList.remove('hidden');
       const label = qs('#cfManageSection .muted');
       if (label) label.textContent = `cloudflared status: ${res.state}`;
-    } else {
-      if (create) create.classList.remove('hidden');
-      if (manage) manage.classList.add('hidden');
     }
     if (qs('#cfComposeEditor') && res.compose) {
       qs('#cfComposeEditor').value = res.compose;
@@ -3759,8 +3835,15 @@ let appLogsTimer = null;
 function setCoreSections(prefix, exists) {
   const create = qs(`#${prefix}CreateSection`);
   const manage = qs(`#${prefix}ManageSection`);
-  if (create) create.classList.toggle('hidden', !!exists);
+  // Core services are installed by the Maintenance installer now; Dok only
+  // shows and manages services that already exist.
+  if (create) create.classList.add('hidden');
   if (manage) manage.classList.toggle('hidden', !exists);
+}
+
+function hideCoreCardUnless(id, installed) {
+  const card = qs(`#${id}`);
+  if (card) card.classList.toggle('hidden', !installed);
 }
 
 function coreServiceInstalled(prefix, res) {
@@ -3791,7 +3874,9 @@ async function loadCoreAuth() {
   try {
     const res = await api('/api/core/auth');
     coreAuthData = res;
-    setCoreSections('auth', coreServiceInstalled('auth', res));
+    const authInstalled = coreServiceInstalled('auth', res);
+    setCoreSections('auth', authInstalled);
+    hideCoreCardUnless('coreAuthCard', authInstalled);
     if (qs('#authStatus')) qs('#authStatus').textContent = `Authentik status: ${res.state || (res.running ? 'running' : 'stopped')}`;
     if (qs('#authDomain')) qs('#authDomain').value = res.settings?.domain || '';
     if (qs('#authDomainManage')) qs('#authDomainManage').value = res.settings?.domain || '';
@@ -3805,7 +3890,9 @@ async function loadCoreAuthelia() {
   try {
     const res = await api('/api/core/authelia');
     coreAutheliaData = res;
-    setCoreSections('authelia', coreServiceInstalled('authelia', res));
+    const autheliaInstalled = coreServiceInstalled('authelia', res);
+    setCoreSections('authelia', autheliaInstalled);
+    hideCoreCardUnless('coreAutheliaCard', autheliaInstalled);
     if (qs('#autheliaStatus')) qs('#autheliaStatus').textContent = `Authelia status: ${res.state || (res.running ? 'running' : 'stopped')}`;
     if (qs('#autheliaDomain')) qs('#autheliaDomain').value = res.settings?.domain || '';
     if (qs('#autheliaDomainManage')) qs('#autheliaDomainManage').value = res.settings?.domain || '';
@@ -3909,7 +3996,9 @@ async function loadCoreDns() {
   try {
     const res = await api('/api/core/dns');
     coreDnsData = res;
-    setCoreSections('dns', coreServiceInstalled('dns', res));
+    const dnsInstalled = coreServiceInstalled('dns', res);
+    setCoreSections('dns', dnsInstalled);
+    hideCoreCardUnless('coreDnsCard', dnsInstalled);
     const provider = res.provider === 'adguard' ? 'adguard' : 'technitium';
     const label = provider === 'adguard' ? 'AdGuard Home' : 'Technitium DNS';
     if (qs('#dnsProvider')) qs('#dnsProvider').value = provider;
@@ -3930,7 +4019,9 @@ async function loadCoreHelper() {
   try {
     const res = await api('/api/core/host-helper');
     coreHelperData = res;
-    setCoreSections('helper', coreServiceInstalled('helper', res));
+    const helperInstalled = coreServiceInstalled('helper', res);
+    setCoreSections('helper', helperInstalled);
+    hideCoreCardUnless('coreHostHelperCard', helperInstalled);
     if (qs('#helperStatus')) {
       qs('#helperStatus').textContent = `Host Helper status: ${res.state || (res.running ? 'running' : 'stopped')}${res.available ? ' · available' : ' · not responding'}`;
     }
@@ -4277,10 +4368,10 @@ if (qs('#dashboardTerminalBtn')) {
   qs('#dashboardTerminalBtn').addEventListener('click', () => openTerminal({ mode: 'admin', app: 'shell' }));
 }
 if (qs('#dashboardOpencodeBtn')) {
-  qs('#dashboardOpencodeBtn').addEventListener('click', () => openTerminal({ mode: 'admin', app: 'opencode' }));
+  qs('#dashboardOpencodeBtn').addEventListener('click', () => openMaintenancePanel({ start: true }));
 }
 if (qs('#opencodeLaunchAdmin')) {
-  qs('#opencodeLaunchAdmin').addEventListener('click', () => openTerminal({ mode: 'admin', app: 'opencode' }));
+  qs('#opencodeLaunchAdmin').addEventListener('click', () => openMaintenancePanel({ start: true }));
 }
 if (qs('#opencodeLaunchUser')) {
   qs('#opencodeLaunchUser').addEventListener('click', () => openTerminal({ mode: 'user', app: 'opencode' }));
@@ -4301,10 +4392,11 @@ if (qs('#terminalShellBtn')) {
   }));
 }
 if (qs('#terminalOpencodeBtn')) {
-  qs('#terminalOpencodeBtn').addEventListener('click', () => openTerminal({
-    mode: qs('#terminalModeSelect')?.value || 'admin',
-    app: 'opencode'
-  }));
+  qs('#terminalOpencodeBtn').addEventListener('click', () => {
+    const mode = qs('#terminalModeSelect')?.value || 'admin';
+    if (mode === 'admin') return openMaintenancePanel({ start: true });
+    openTerminal({ mode: 'user', app: 'opencode' });
+  });
 }
 if (qs('#terminalStopBtn')) {
   qs('#terminalStopBtn').addEventListener('click', () => stopCurrentTerminalSession());
@@ -5272,6 +5364,7 @@ if (qs('#settingsSubtabs')) {
         loadAppLogChoices();
       }
       if (btn.dataset.settingsTab === 'backups') loadBackups();
+      if (btn.dataset.settingsTab === 'maintenance') loadMaintenanceStatus();
       if (btn.dataset.settingsTab === 'dok') {
         loadGroups();
         loadRegistries();
@@ -5326,10 +5419,10 @@ async function createCoreNginxProxyQuick() {
 }
 
 if (qs('#appCreationCreateNginx')) {
-  qs('#appCreationCreateNginx').addEventListener('click', createCoreNginxProxyQuick);
+  qs('#appCreationCreateNginx').addEventListener('click', () => openMaintenancePanel({ start: true }));
 }
 if (qs('#appCreationCreateNginxModal')) {
-  qs('#appCreationCreateNginxModal').addEventListener('click', createCoreNginxProxyQuick);
+  qs('#appCreationCreateNginxModal').addEventListener('click', () => openMaintenancePanel({ start: true }));
 }
 
 ['#appCfgName', '#appCfgCompose'].forEach(sel => {

@@ -8,3 +8,4 @@ core/
 docker-compose.override.yml
 *.log
 .DS_Store
+maintenance-data/

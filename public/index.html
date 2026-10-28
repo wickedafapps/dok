@@ -141,8 +141,8 @@
         </div>
       </div>
       <div id="appCreationNginxNotice" class="card hidden" style="border-color: rgba(255,180,0,0.5)">
-        <p class="muted">The core nginx service has not been created. Create it to automatically direct your domains to your containers.</p>
-        <div class="row"><button id="appCreationCreateNginx" class="btn btn-primary">Create core nginx-proxy</button></div>
+        <p class="muted">The core nginx service has not been installed. Install it from Dok Maintenance so it can automatically direct your domains to your containers.</p>
+        <div class="row"><button id="appCreationCreateNginx" class="btn btn-primary">Open Dok Maintenance</button></div>
       </div>
       <div class="subtabs">
         <button class="subtab-btn active" data-subtab="run">Docker run</button>
@@ -306,7 +306,7 @@
       <div class="section-header">
         <div>
           <h2>Settings</h2>
-          <p class="muted">Dok Settings, core services, logs, backups, and application updates.</p>
+          <p class="muted">Dok Settings, installed core services, logs, and the Dok Maintenance container.</p>
         </div>
         <div class="inline">
           <button id="openManualBtn" class="btn">User manual</button>
@@ -318,7 +318,7 @@
         <button class="subtab-btn active" data-settings-tab="core">Core Services</button>
         <button class="subtab-btn" data-settings-tab="dok">Dok Settings</button>
         <button class="subtab-btn" data-settings-tab="logs">Logs</button>
-        <button class="subtab-btn" data-settings-tab="backups">Backups &amp; Updates</button>
+        <button class="subtab-btn" data-settings-tab="maintenance">Maintenance</button>
       </div>
 
       <div id="settings-pane-core" class="settings-pane active">
@@ -505,7 +505,7 @@
 
         <div class="card" id="coreMailCard">
           <h3>Email <span class="muted">(SMTP + Mailpit)</span></h3>
-          <p class="muted">Outgoing mail for Authelia notifications. Point it at a real SMTP provider, or launch the built-in Mailpit sink to capture reset and alert mail locally. Mailpit only stores messages for inspection; it never delivers them and is not a mailbox server.</p>
+          <p class="muted">Outgoing mail for Authelia notifications. Point it at a real SMTP provider, or use the Mailpit sink installed from Dok Maintenance to capture reset and alert mail locally. Mailpit only stores messages for inspection; it never delivers them and is not a mailbox server.</p>
           <div class="row">
             <input id="mailSmtpHost" class="input flex" placeholder="SMTP host, e.g. smtp.example.com or mailpit">
             <input id="mailSmtpPort" class="input" type="number" min="1" max="65535" placeholder="Port" value="587">
@@ -522,7 +522,7 @@
           </div>
           <div class="row">
             <button id="mailSaveSmtp" class="btn btn-primary">Save SMTP</button>
-            <button id="mailUseMailpit" class="btn">Use Mailpit</button>
+            <button id="mailUseMailpit" class="btn hidden">Use Mailpit</button>
             <span id="mailMsg" class="muted"></span>
           </div>
           <p class="muted" id="mailStatus">SMTP: not configured · Authelia writes notifications to /config/notifications.txt</p>
@@ -874,7 +874,30 @@
         </div>
       </div>
 
-      <div id="settings-pane-backups" class="settings-pane">
+      <div id="settings-pane-maintenance" class="settings-pane">
+        <div class="card">
+          <h3>Dok Maintenance</h3>
+          <p class="muted">Maintenance runs in its own privileged container, separate from Dok. Use it to install or reinstall Dok, repair the installation, run updates, manage backups, inspect every container, and run Admin OpenCode. It is started only when you open it here or when Dok needs a host action.</p>
+          <div class="row">
+            <button id="maintenanceOpenBtn" class="btn btn-primary">Start &amp; open Maintenance</button>
+            <button id="maintenanceStartBtn" class="btn">Start</button>
+            <button id="maintenanceStopBtn" class="btn">Stop</button>
+          </div>
+          <p id="maintenanceStatus" class="muted">Checking Maintenance status…</p>
+          <pre id="maintenanceMsg" class="output hidden"></pre>
+        </div>
+        <div class="card">
+          <h3>Installation and core services</h3>
+          <p class="muted">Dok and its core services are now installed by the Maintenance installer. The Core Services tab only shows services that are already installed, with the same start, stop, restart, domain, and compose controls.</p>
+          <p class="muted">Backups, updates, snapshots, repair tools, and the full installation record live in the Maintenance container at <code>maintenance-data/</code>. That folder is separate from <code>data/</code> and is never exported with an app.</p>
+        </div>
+        <div class="card">
+          <h3>Admin OpenCode</h3>
+          <p class="muted">Admin OpenCode can only run inside the Maintenance container. It has access to the Dok checkout, Docker, and every app so it can troubleshoot and repair the whole installation. Open Maintenance and use its OpenCode panel.</p>
+        </div>
+      </div>
+
+      <div id="settings-pane-backups" class="settings-pane hidden">
         <div class="card">
           <h3>Application updates</h3>
           <p class="muted">Pull from GitHub, rebuild the WickedAFDok image, and recreate the container. Running from a source checkout pulls the code and asks for a restart.</p>
@@ -973,8 +996,8 @@
       </div>
       <div class="app-config app-config-wide">
         <div id="appCreationNginxNoticeModal" class="card hidden" style="border-color: rgba(255,180,0,0.5); margin-bottom:12px">
-          <p class="muted">The core nginx service has not been created. Create it to automatically direct your domains to your containers.</p>
-          <div class="row"><button id="appCreationCreateNginxModal" class="btn btn-primary">Create core nginx-proxy</button></div>
+          <p class="muted">The core nginx service has not been installed. Install it from Dok Maintenance so it can automatically direct your domains to your containers.</p>
+          <div class="row"><button id="appCreationCreateNginxModal" class="btn btn-primary">Open Dok Maintenance</button></div>
         </div>
         <div class="row">
           <input id="appCfgName" class="input" placeholder="App name">
