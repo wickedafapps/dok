@@ -21,7 +21,7 @@ Options:
   --root          Run the container as root (UID/GID 0)
   -h, --help      Show this help
 
-Environment: PUID, PGID, DOCKER_SOCK
+Environment: PUID, PGID, DOCKER_SOCK, MAINTENANCE_PORT, SKIP_BUILD
 EOF
 }
 

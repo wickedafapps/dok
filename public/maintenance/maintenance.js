@@ -487,7 +487,7 @@
     const skip = qs('#wizardSkip');
     const next = qs('#wizardNext');
     back.disabled = wizard.step === 1;
-    const canSkip = wizard.type === 'standalone' || stepName === 'Connections';
+    const canSkip = stepName !== 'Review' && (wizard.type === 'standalone' || stepName === 'Connections');
     skip.classList.toggle('hidden', !canSkip);
     next.textContent = stepName === 'Review' ? 'Install Dok' : 'Continue';
     next.classList.toggle('primary', true);
