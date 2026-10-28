@@ -130,7 +130,7 @@ function openTab(name) {
   window.scrollTo({ top: 0, behavior: 'smooth' });
   if (name === 'containers') loadContainers();
   if (name === 'images') loadImages();
-  if (name === 'dashboard') loadStats();
+  if (name === 'dashboard') { loadStats(); loadDashboardCoreServices(); }
   if (name === 'sources') loadSources(state.sourceRel);
   if (name === 'apps') loadApps();
   if (name === 'appcreation') checkAppCreationNginxNotice();
@@ -259,6 +259,41 @@ async function loadStats() {
 }
 
 qs('#refreshStats').addEventListener('click', loadStats);
+
+async function loadDashboardCoreServices() {
+  const list = qs('#dashboardCoreLinks');
+  if (!list) return;
+  try {
+    const data = await api('/api/core/dashboard');
+    const services = Array.isArray(data.services) ? data.services : [];
+    if (!services.length) {
+      list.innerHTML = `<div class="empty">${data.lookupFailed
+        ? 'Core service status is temporarily unavailable. Docker may still be starting.'
+        : 'No core services with a web console are installed yet.'}</div>`;
+      return;
+    }
+    list.innerHTML = services.map(service => `
+      <div class="item">
+        <div class="item-header">
+          <div>
+            <div class="item-title">${escapeHtml(service.label)} ${stateChip(service.state)}</div>
+            <div class="item-sub mono">${escapeHtml(service.url)}</div>
+          </div>
+          <div class="item-actions">
+            <button class="btn ${service.running ? 'btn-primary' : ''}" data-core-console="${escapeHtml(service.url)}"
+              ${service.running ? '' : 'disabled title="Start this service first"'}>Open GUI</button>
+          </div>
+        </div>
+      </div>`).join('');
+    list.querySelectorAll('[data-core-console]').forEach(btn => {
+      btn.addEventListener('click', () => window.open(btn.dataset.coreConsole, '_blank', 'noopener'));
+    });
+  } catch (e) {
+    list.innerHTML = `<div class="empty">Unable to load core services: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+qs('#dashboardCoreRefresh')?.addEventListener('click', loadDashboardCoreServices);
 
 // ---------------- Containers ----------------
 function containerPorts(ports) {
@@ -484,7 +519,12 @@ qsa('[data-close]').forEach(el => {
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
   const open = qsa('.modal:not(.hidden)');
-  if (open.length) closeModal(open[open.length - 1].id);
+  if (!open.length) return;
+  const top = open[open.length - 1];
+  // Escape is part of the terminal UI (close a picker, cancel a prompt). Do not
+  // let it close the terminal modal and kill the OpenCode session underneath.
+  if (top.id === 'terminalModal' && e.target instanceof Element && e.target.closest('#terminalContainer')) return;
+  closeModal(top.id);
 });
 
 // ---------------- Images ----------------
@@ -4197,7 +4237,7 @@ function connectTerminal() {
   };
 }
 
-async function stopCurrentTerminalSession({ quiet = false } = {}) {
+async function stopCurrentTerminalSession({ quiet = false, exceptId = '' } = {}) {
   const id = terminalSessionId;
   terminalSessionId = null;
   terminalConnectToken += 1;
@@ -4205,7 +4245,7 @@ async function stopCurrentTerminalSession({ quiet = false } = {}) {
     try { terminalSocket.close(); } catch {}
     terminalSocket = null;
   }
-  if (id) {
+  if (id && id !== exceptId) {
     try {
       await api(`/api/terminal/sessions/${encodeURIComponent(id)}/stop`, { method: 'POST' });
     } catch (e) {
@@ -4283,7 +4323,9 @@ async function openExistingTerminal(session) {
   setTerminalModeBadge(mode);
   setTerminalStatus('Connecting…');
   const openToken = ++terminalOpenToken;
-  await stopCurrentTerminalSession({ quiet: true });
+  // Never stop the session we are about to attach to. This can happen when the
+  // server response is handled after a reconnect or a rapid double launch.
+  await stopCurrentTerminalSession({ quiet: true, exceptId: session.id });
   if (openToken !== terminalOpenToken || modal.classList.contains('hidden')) return;
   resetTerminalView();
   ensureTerminal();
@@ -5803,6 +5845,7 @@ if (qs('#designerFileSave')) {
 
 function refreshAll() {
   loadStats();
+  loadDashboardCoreServices();
   loadContainers();
   if (qs('#tab-images').classList.contains('active')) loadImages();
   if (qs('#tab-apps').classList.contains('active')) loadApps();
@@ -5811,6 +5854,7 @@ function refreshAll() {
 }
 
 loadStats();
+loadDashboardCoreServices();
 setInterval(() => {
   loadStats();
   if (qs('#tab-containers').classList.contains('active')) loadContainers();

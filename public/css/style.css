@@ -506,6 +506,15 @@ select.input { cursor: pointer; }
 
 .list { display: grid; gap: 10px; }
 
+.core-console-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.core-console-grid .item { background: rgba(255, 255, 255, 0.015); }
+
 .section-heading {
   display: flex;
   align-items: baseline;

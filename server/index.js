@@ -7119,7 +7119,8 @@ app.post('/api/assist/start', upload.array('files', 100), async (req, res) => {
       agent: 'assist',
       app: 'opencode',
       prompt: startPrompt,
-      title: 'OC Assist · ' + appName
+      title: 'OC Assist · ' + appName,
+      startupCheck: true
     });
     started = true;
     res.json({ ok: true, session, appName, briefPath, uploadDir: savedFiles.length ? uploadDir : '' });
@@ -11399,7 +11400,18 @@ function terminalSessionSummary(session) {
   };
 }
 
-async function createTerminalSession({ mode = 'admin', app = 'shell', agent = '', prompt = '', title = '' } = {}) {
+function terminalBufferText(session, max = 2000) {
+  const raw = (session.buffer || []).join('');
+  const clean = raw
+    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/\r/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  return clean.slice(-max);
+}
+
+async function createTerminalSession({ mode = 'admin', app = 'shell', agent = '', prompt = '', title = '', startupCheck = false } = {}) {
   if (!TERMINAL_MODES[mode]) throw httpError(400, 'Unknown terminal mode');
   if (!['shell', 'opencode'].includes(app)) throw httpError(400, 'Unknown terminal application');
   if (app === 'opencode' && mode === 'admin') {
@@ -11498,6 +11510,20 @@ async function createTerminalSession({ mode = 'admin', app = 'shell', agent = ''
     const timer = setTimeout(() => stopTerminalSession(id), 30000);
     if (timer.unref) timer.unref();
   });
+
+  if (startupCheck) {
+    // The TUI normally paints its first frame well under a second. If OpenCode
+    // rejects the generated config or the selected agent, it exits immediately;
+    // surface that output instead of returning a session that is already dead.
+    await new Promise(resolve => setTimeout(resolve, 1200));
+    if (session.exited) {
+      const detail = terminalBufferText(session);
+      stopTerminalSession(id);
+      throw httpError(502,
+        `OpenCode exited before the chat opened (code ${session.exitCode ?? 'unknown'})` +
+        (detail ? `: ${detail}` : '. Check the OpenCode settings and try again.'));
+    }
+  }
 
   scheduleTerminalCleanup(session);
   return terminalSessionSummary(session);
@@ -11667,6 +11693,69 @@ app.get('/api/core/app-hints', async (req, res) => {
     });
   } catch (e) {
     res.status(500).json({ error: e.message, services: {}, fields: [] });
+  }
+});
+
+// Core services - dashboard console links
+// The dashboard shows one button per installed service that has a web UI. The
+// URL uses the configured hostname when one exists, otherwise the published
+// localhost port, so the link works both behind nginx-proxy and on the host.
+app.get('/api/core/dashboard', async (req, res) => {
+  try {
+    const settings = readSettings();
+    const authentik = settings.services?.authentik || {};
+    const authelia = autheliaDefaults(settings.services?.authelia || {});
+    const autheliaDomain = normalizeDomain(authelia.domain);
+    const technitium = settings.services?.technitium || {};
+    const adguard = adguardDefaults(settings.services?.adguard || {});
+    const mailpit = mailpitDefaults(settings.services?.mailpit || {});
+    const stalwart = stalwartDefaults(settings.services?.stalwart || {});
+    const entries = [
+      {
+        id: 'authentik', label: 'Authentik', project: 'authentik',
+        status: { nameHint: 'authentik', primaryHint: 'authentik-server' },
+        url: coreServiceUrl(authentik.domain, authentik.port || 9000)
+      },
+      {
+        id: 'authelia', label: 'Authelia', project: 'authelia',
+        status: { nameHint: 'authelia', primaryHint: 'authelia' },
+        url: autheliaDomain ? `https://${autheliaDomain}` : `http://localhost:${authelia.port || 9091}`
+      },
+      {
+        id: 'technitium', label: 'Technitium DNS', project: 'technitium',
+        status: { nameHint: 'technitium-dns', primaryHint: 'technitium-dns' },
+        url: coreServiceUrl(technitium.domain, technitium.webPort || 5380)
+      },
+      {
+        id: 'adguard', label: 'AdGuard Home', project: 'adguard',
+        status: { nameHint: 'adguard', primaryHint: 'adguard' },
+        url: coreServiceUrl(adguard.domain, adguard.webPort || 3000)
+      },
+      {
+        id: 'mailpit', label: 'Mailpit', project: 'mailpit',
+        status: { nameHint: 'mailpit', primaryHint: 'mailpit' },
+        url: coreServiceUrl(mailpit.domain, mailpit.webPort || 8025)
+      },
+      {
+        id: 'stalwart', label: 'Stalwart', project: 'stalwart',
+        status: { nameHint: 'stalwart', primaryHint: 'stalwart' },
+        url: coreServiceUrl(stalwart.domain, stalwart.webPort || 8088)
+      }
+    ];
+    const results = await Promise.all(entries.map(async entry => ({
+      ...entry,
+      ...(await coreServiceStatus(entry.project, entry.status))
+    })));
+    res.json({
+      services: results
+        .filter(item => item.exists)
+        .map(({ id, label, url, running, state, lookupFailed }) => ({
+          id, label, url, running: !!running, state: state || 'not created', lookupFailed: !!lookupFailed
+        })),
+      lookupFailed: results.some(item => item.lookupFailed)
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 

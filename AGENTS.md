@@ -237,6 +237,7 @@ Keep reports proportionate to the task. Prioritize meaningful results and outsta
 - Host/system stats (CPU, memory, disk, load average, uptime)
 - Docker engine info
 - Network information
+- Core Service Consoles card with an **Open GUI** button for every installed service that has a web UI (Authentik, Authelia, Technitium, AdGuard Home, Mailpit, Stalwart). URLs use the configured domain when present, otherwise the published localhost port; stopped services are shown disabled
 - Live auto-refresh
 
 ### Containers
@@ -266,7 +267,7 @@ The unified way to deploy applications. Every app is stored in `apps/<name>/` wi
 2. **Docker Compose** - Paste `docker-compose.yml`/`compose.yaml` content. Stored in the app's own managed compose file and opened in App Configuration modal.
 3. **Git Clone** - Provide any git URL (generic git, not limited to GitHub API). If repo contains `docker-compose.yml`/`compose.yaml` or `Dockerfile`, files are copied to `apps/<name>` and opened in App Configuration modal; Dockerfile-only projects get a generated compose file. If no compose/Dockerfile found, routed to **Projects**.
 4. **Local Upload** - Upload files/folders via multipart form. If compose or Dockerfile present, files are copied to `apps/<name>` and opened in App Configuration modal; Dockerfile-only uploads get a generated compose file. Otherwise routed to **Projects**.
-5. **OC Assist** - Describe the app in a required prompt, optionally paste data (docker run, compose, repository/page URL) and upload files. WickedAFDok writes a private brief plus the uploads under `sources/oc-assist-<stamp>-<random>/`, starts a **User-mode** OpenCode session with the dedicated `assist` agent and the creator fields already in the first prompt, and immediately opens the chat in the terminal modal. The assist agent is restricted to app files, the OC Assist source/brief folders, and the registration helper; it creates the compose, registers the app through `server/assist-register.mjs`, and deploys it. Use `#assistPrompt`, `#assistData`, `#assistName`, `#assistFiles`, `#assistFolder`, `#assistStartBtn`, and `#assistOutput`.
+5. **OC Assist** - Describe the app in a required prompt, optionally paste data (docker run, compose, repository/page URL) and upload files. WickedAFDok writes a private brief plus the uploads under `sources/oc-assist-<stamp>-<random>/`, starts a **User-mode** OpenCode session with the dedicated `assist` agent and the creator fields already in the first prompt, and immediately opens the chat in the terminal modal. The assist agent is restricted to app files, the OC Assist source/brief folders, and the registration helper; it creates the compose, registers the app through `server/assist-register.mjs`, and deploys it. Use `#assistPrompt`, `#assistData`, `#assistName`, `#assistFiles`, `#assistFolder`, `#assistStartBtn`, and `#assistOutput`. The start route waits briefly for OpenCode's first frame; if OpenCode exits during startup, the UI receives the captured terminal error instead of a blank session.
 
 **App Configuration Modal:**
 - Opens with a visual Compose builder (`#appCfgBuilder`) populated from the managed compose via `/api/compose/parse`
@@ -532,6 +533,7 @@ The **Core Services** subtab manages installed bundled services. Installation no
 - `POST /api/core/all/:action(start|stop|restart)` - Apply an action to every created core service
 - `POST /api/core/:service/:action(start|stop|restart)` - Apply an action to one core service
 - `GET /api/core/app-hints` - Running core-service flags and compose environment field hints (`VIRTUAL_HOST`, `VIRTUAL_PORT`, `ENABLE_AUTH`, `LETSENCRYPT_HOST`, `LETSENCRYPT_EMAIL`) used by the app and library compose builders
+- `GET /api/core/dashboard` - Installed core services with web UIs, their configured/localhost URLs, and running state for the Dashboard console buttons
 - `GET /api/core/opencode` - OpenCode install/version, running sessions, modes, and generated configs
 - `POST /api/core/opencode/settings` - Save optional model/provider/API key
 - `POST /api/core/opencode/run` - Start an OpenCode Admin or User session
@@ -617,7 +619,7 @@ The **Core Services** subtab manages installed bundled services. Installation no
 - `POST /api/settings/defaults/apply` re-creates the data location and `<dataLocation>/apps` through `ensureHostDirectory()` (direct or Host Helper), applying the octal mode.
 
 ### OC Assist
-- `POST /api/assist/start` validates the prompt/name, rejects concurrent starts for the same app name, saves uploads under `sources/oc-assist-<stamp>-<random>/` (traversal-checked), writes a private brief at `data/opencode/assist/<stamp>-<random>/brief.md`, and starts a User-mode OpenCode session with the dedicated `assist` agent and title `OC Assist · <app>`. The random suffix keeps two requests in the same second from sharing a directory.
+- `POST /api/assist/start` validates the prompt/name, rejects concurrent starts for the same app name, saves uploads under `sources/oc-assist-<stamp>-<random>/` (traversal-checked), writes a private brief at `data/opencode/assist/<stamp>-<random>/brief.md`, and starts a User-mode OpenCode session with the dedicated `assist` agent and title `OC Assist · <app>`. The random suffix keeps two requests in the same second from sharing a directory. The route waits 1.2 s after spawning OpenCode; if the process exits, it returns `502` with the captured terminal output instead of a dead session.
 - The brief includes instructions, pasted data, uploaded file paths, and default admin username/email (never the password).
 - The `assist` agent uses the User-mode permission model with external access limited to the app directory, `sources/oc-assist-*`, `data/opencode/assist/**`, and `server/assist-register.mjs`; Docker/system/privilege commands remain denied. The UI opens the returned session directly in the terminal modal.
 - OC Assist reads `apps/AGENTS.md`, generated from `server/app-agents.md` at startup and before each assist session. The contract defines the required app layout, compose/network/routing rules, secret handling, library-export hygiene, and the rule that app persistent data is never reset, deleted, or overwritten.
@@ -677,7 +679,7 @@ The **Core Services** subtab manages installed bundled services. Installation no
 - `createTerminalSession()` spawns `/bin/bash -i` or the resolved OpenCode binary with `node-pty`; sessions are kept in an in-memory `terminalSessions` map and exist only until stopped, exited and reaped, or the server shuts down
 - Limits: 8 concurrent sessions, a 2 MiB rolling replay buffer per session, and a 30-minute idle cleanup after the last client disconnects; output is streamed to attached WebSocket clients and the rolling buffer is replayed on connect (the UI resets xterm before applying it)
 - The WebSocket upgrade at `/api/terminal/ws` validates the `Origin` host against `Host`/`X-Forwarded-Host` when an origin is present, and rejects unknown session IDs
-- `POST /api/terminal/sessions/:id/stop` kills the PTY (with a `SIGKILL` fallback) and closes clients; the UI also stops the active session when the terminal modal closes or Escape closes it
+- `POST /api/terminal/sessions/:id/stop` kills the PTY (with a `SIGKILL` fallback) and closes clients; the UI also stops the active session when the terminal modal closes. Escape closes the modal only when focus is outside the terminal, so OpenCode can use Escape for its own dialogs without killing the session.
 - OpenCode configs are generated on every launch from `opencodeConfigForMode()`, which sets the default agent, optional model/provider, and the Admin or User permission model. `writePrivateFile()` keeps them at mode `600`
 - OpenCode launches use `OPENCODE_CONFIG_CONTENT` (the generated mode config, which outranks config files), `OPENCODE_CONFIG`, `OPENCODE_DISABLE_PROJECT_CONFIG=1`, `OPENCODE_DISABLE_AUTOUPDATE=1`, per-mode `HOME`/`XDG_*`, and `OPENCODE_PROVIDER_API_KEY` when a key is configured. Inherited `OPENCODE_*` variables are removed from all managed sessions so a host/desktop instance cannot leak its config or session id into the container terminal.
 - User-mode sessions start in `apps/`, strip Docker/host/credential environment variables, deny `external_directory`, and use explicit bash allows/denies; this is a permission guardrail for the agent, not a separate OS sandbox (the process still runs as the WickedAFDok container user)
@@ -736,7 +738,7 @@ The **Core Services** subtab manages installed bundled services. Installation no
 
 **Key UI Elements:**
 - Containers: `#containersList`, `#containerSearch`, `#containersOpenApps` (opens the Apps tab), `#refreshContainers`
-- Dashboard: `#dashboardTerminalBtn`, `#dashboardOpencodeBtn`
+- Dashboard: `#dashboardTerminalBtn`, `#dashboardOpencodeBtn`, `#dashboardCoreLinks`, `#dashboardCoreRefresh`
 - Terminal Modal: `#terminalModal`, `#terminalContainer`, `#terminalModeSelect`, `#terminalShellBtn`, `#terminalOpencodeBtn`, `#terminalStopBtn`, `#terminalStatus`, `#terminalModeBadge`
 - OpenCode Card: `#coreOpencodeCard`, `#opencodeLaunchAdmin`, `#opencodeLaunchUser`, `#opencodeShellAdmin`, `#opencodeShellUser`, `#opencodeStopBtn`, `#opencodeModel`, `#opencodeProvider`, `#opencodeApiKey`, `#opencodeSaveSettings`
 - App Creation: `#runCreateBtn`, `#composeCreateBtn`, `#gitCloneBtn`, `#uploadBtn`, OC Assist (`#assistPrompt`, `#assistData`, `#assistName`, `#assistFiles`, `#assistFolder`, `#assistStartBtn`, `#assistOutput`)

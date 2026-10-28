@@ -87,6 +87,18 @@
           <div id="networkSummary" class="kv"></div>
         </div>
       </div>
+      <div class="card">
+        <div class="section-heading">
+          <div>
+            <h3>Core Service Consoles</h3>
+            <p class="muted">Open the web interface for each installed core service.</p>
+          </div>
+          <button id="dashboardCoreRefresh" class="btn">Refresh</button>
+        </div>
+        <div id="dashboardCoreLinks" class="core-console-grid">
+          <div class="empty">Loading core services…</div>
+        </div>
+      </div>
       <details class="card raw">
         <summary>Raw system data</summary>
         <pre id="statsDetail" class="output"></pre>
