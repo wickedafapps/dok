@@ -28,16 +28,6 @@ credentialsKey({ create: true }).toString('base64');
 // the token yet.
 maintenanceToken({ create: true });
 
-const app = express();
-const upload = multer({ dest: path.join(MAINT_DATA, 'tmp'), limits: { fileSize: 1024 * 1024 * 1024, files: 5 } });
-app.use(express.json({ limit: '20mb' }));
-app.use(express.static(path.join(DOK_ROOT, 'public', 'maintenance'), { etag: false, maxAge: 0 }));
-app.use(express.static('/app/public/maintenance', { etag: false, maxAge: 0 }));
-app.use('/vendor/xterm', express.static('/app/node_modules/@xterm/xterm'));
-app.use('/vendor/xterm-fit', express.static('/app/node_modules/@xterm/addon-fit'));
-app.use('/vendor/xterm', express.static(path.join(DOK_ROOT, 'node_modules/@xterm/xterm')));
-app.use('/vendor/xterm-fit', express.static(path.join(DOK_ROOT, 'node_modules/@xterm/addon-fit')));
-
 const MAINTENANCE_REQUIRE_TOKEN = process.env.MAINTENANCE_REQUIRE_TOKEN !== '0';
 const MAINTENANCE_PORT = Number(process.env.MAINTENANCE_PORT) || 8090;
 const SESSION_LIMIT = 6;
@@ -48,6 +38,29 @@ let installJob = null;
 let updateJob = null;
 let logCache = [];
 
+const app = express();
+const upload = multer({ dest: path.join(MAINT_DATA, 'tmp'), limits: { fileSize: 1024 * 1024 * 1024, files: 5 } });
+app.use(express.json({ limit: '20mb' }));
+app.use((req, res, next) => {
+  if (!MAINTENANCE_REQUIRE_TOKEN) return next();
+  const provided = String(req.query?.token || '').trim();
+  if (provided && provided === maintenanceToken()) {
+    res.cookie('dok_maintenance_token', provided, {
+      httpOnly: true,
+      sameSite: 'lax',
+      path: '/',
+      maxAge: 7 * 24 * 60 * 60 * 1000
+    });
+  }
+  next();
+});
+app.use(express.static(path.join(DOK_ROOT, 'public', 'maintenance'), { etag: false, maxAge: 0 }));
+app.use(express.static('/app/public/maintenance', { etag: false, maxAge: 0 }));
+app.use('/vendor/xterm', express.static('/app/node_modules/@xterm/xterm'));
+app.use('/vendor/xterm-fit', express.static('/app/node_modules/@xterm/addon-fit'));
+app.use('/vendor/xterm', express.static(path.join(DOK_ROOT, 'node_modules/@xterm/xterm')));
+app.use('/vendor/xterm-fit', express.static(path.join(DOK_ROOT, 'node_modules/@xterm/addon-fit')));
+
 function logLine(level, message) {
   const line = `${new Date().toISOString()} [${level}] ${String(message).replace(/\r?\n/g, '\n    ')}`;
   logCache.push(line);
@@ -56,17 +69,22 @@ function logLine(level, message) {
   process.stdout.write(line + '\n');
 }
 
+function cookieToken(headers = {}) {
+  const cookie = String(headers.cookie || '');
+  const match = cookie.match(/(?:^|;\s*)dok_maintenance_token=([^;]+)/);
+  if (!match) return '';
+  try { return decodeURIComponent(match[1]); } catch { return ''; }
+}
+
 function authorized(req) {
   if (!MAINTENANCE_REQUIRE_TOKEN) return true;
   const expected = maintenanceToken();
   if (!expected) return false;
   const header = String(req.headers.authorization || '');
   if (header === `Bearer ${expected}`) return true;
-  const query = String(req.query?.token || '');
+  const query = String(req.query?.token || '').trim();
   if (query === expected) return true;
-  const cookie = String(req.headers.cookie || '');
-  const match = cookie.match(/(?:^|;\s*)dok_maintenance_token=([^;]+)/);
-  if (match && decodeURIComponent(match[1]) === expected) return true;
+  if (cookieToken(req.headers) === expected) return true;
   return false;
 }
 
@@ -189,14 +207,16 @@ app.post('/api/apps/:id/:action(deploy|start|stop|restart)', api(async (req, res
 
 // ---------- installer ----------
 app.get('/api/install', api(async (req, res) => {
-  const saved = readInstallation() || {};
+  const savedRecord = readInstallation();
+  const saved = savedRecord || {};
   const state = installationState();
   const dok = await dokStatus().catch(() => ({ exists: false, running: false }));
   res.json({
     ok: true,
     dok,
     installation: {
-      exists: !!readInstallation(),
+      exists: !!savedRecord,
+      fresh: !savedRecord && !state && !dok.exists,
       saved: {
         id: saved.id || '',
         created: saved.created || '',
@@ -254,8 +274,8 @@ async function configureServices(plan, log) {
   const dokDomain = normalizeDomain(plan.dokDomain || defaults.dokDomain || '');
   const authDomain = normalizeDomain(plan.authDomain || (primary ? `auth.${primary}` : ''));
   const service = plan.services || {};
-  const record = (name, ok, detail) => {
-    results.push({ name, ok, detail: String(detail || '').slice(0, 2000) });
+  const record = (name, ok, detail, extra = {}) => {
+    results.push({ name, ok, detail: String(detail || '').slice(0, 2000), ...extra });
     log(`${ok ? 'OK' : 'WARN'} ${name}: ${detail}`);
   };
 
@@ -270,7 +290,11 @@ async function configureServices(plan, log) {
           acme: { enabled: !!plan.acmeEmail, email: plan.acmeEmail || '', staging: false }
         }
       });
-      record('nginx-proxy', true, out.message || 'Launched');
+      record('nginx-proxy', true, out.message || 'Launched', {
+        httpPort: Number(out.httpPort) || 80,
+        portFallback: out.portFallback === true,
+        portFallbackFrom: Number(out.portFallbackFrom) || 0
+      });
       if (out?.selfUpdate?.scheduled) {
         log('Dok is reconnecting to nginx-proxy; waiting for the recreated container.');
         await new Promise(resolve => setTimeout(resolve, 10000));
@@ -505,7 +529,17 @@ async function runInstall(plan) {
       registries: plan.registries.map(item => ({ kind: item.kind, provider: item.provider, name: item.name, host: item.host, username: item.username }))
     };
     const completedAt = new Date().toISOString();
-    const dokRecord = { url: plan.dokDomain ? `http://${plan.dokDomain}` : `http://localhost:8080`, container: DOK_CONTAINER };
+    const finalSettings = readSettings();
+    const proxyResult = serviceResults.find(item => item.name === 'nginx-proxy' && item.ok);
+    const dokHttpPort = Number(proxyResult?.httpPort || finalSettings.services?.nginxProxy?.httpPort) || 80;
+    const proxyFailed = plan.services?.proxy === 'nginx-proxy' && !proxyResult;
+    const dokDomain = proxyFailed
+      ? ''
+      : normalizeDomain(plan.dokDomain || plan.defaults.dokDomain || finalSettings.services?.nginxProxy?.domain || '');
+    const dokUrl = dokDomain
+      ? `http://${dokDomain}${dokHttpPort !== 80 ? `:${dokHttpPort}` : ''}`
+      : `http://localhost:8080`;
+    const dokRecord = { url: dokUrl, container: DOK_CONTAINER, httpPort: dokHttpPort };
     // Write the completed record before the snapshot so restoring the initial
     // snapshot keeps the install plan, service results, and completion time.
     saveInstallation({
@@ -533,17 +567,22 @@ async function runInstall(plan) {
 
     phase('done');
     const failures = serviceResults.filter(item => !item.ok);
+    let resultMessage = failures.length
+      ? `Dok is running. ${failures.length} core service${failures.length === 1 ? '' : 's'} reported an issue; review the log.`
+      : 'Installation completed. Dok is running.';
+    if (proxyResult?.portFallbackFrom === 80) {
+      resultMessage += ` Port 80 was unavailable, so nginx-proxy is published on host port ${dokHttpPort}.`;
+    }
     job.result = {
       ok: failures.length === 0,
-      dokUrl: plan.dokDomain ? `http://${plan.dokDomain}` : `http://localhost:8080`,
+      dokUrl,
+      dokHttpPort,
       dokIp: `http://${DOK_CONTAINER}:${DOK_PORT}`,
       type: plan.type,
       services: serviceResults,
       warnings: failures,
       snapshot: snapshot ? snapshot.id : '',
-      message: failures.length
-        ? `Dok is running. ${failures.length} core service${failures.length === 1 ? '' : 's'} reported an issue; review the log.`
-        : 'Installation completed. Dok is running.'
+      message: resultMessage
     };
     job.running = false;
     job.finished = new Date().toISOString();
@@ -1358,7 +1397,7 @@ server.on('upgrade', (req, socket, head) => {
   }
   if (MAINTENANCE_REQUIRE_TOKEN) {
     const expected = maintenanceToken();
-    const token = url.searchParams.get('token') || '';
+    const token = (url.searchParams.get('token') || cookieToken(req.headers) || '').trim();
     if (!expected || token !== expected) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();

@@ -18,8 +18,14 @@
     return date.toLocaleString();
   };
   const tokenKey = 'dok.maintenance.token';
+  function storedToken() {
+    try { return localStorage.getItem(tokenKey) || ''; } catch { return ''; }
+  }
+  function rememberToken(value) {
+    try { localStorage.setItem(tokenKey, value); } catch {}
+  }
   const state = {
-    token: localStorage.getItem(tokenKey) || '',
+    token: storedToken(),
     system: null,
     install: null,
     apps: [],
@@ -33,13 +39,23 @@
     confirmResolve: null
   };
 
-  const fromUrl = new URLSearchParams(location.search).get('token');
+  const urlParams = new URLSearchParams(location.search);
+  const hashParams = new URLSearchParams(String(location.hash || '').replace(/^#/, ''));
+  const fromUrl = (urlParams.get('token') || hashParams.get('token') || '').trim();
   if (fromUrl) {
     state.token = fromUrl;
-    localStorage.setItem(tokenKey, fromUrl);
-    const url = new URL(location.href);
-    url.searchParams.delete('token');
-    history.replaceState({}, '', url.pathname + url.search + url.hash);
+    rememberToken(fromUrl);
+    try {
+      const url = new URL(location.href);
+      url.searchParams.delete('token');
+      if (url.hash) {
+        const hash = new URLSearchParams(url.hash.replace(/^#/, ''));
+        hash.delete('token');
+        const rest = hash.toString();
+        url.hash = rest ? `#${rest}` : '';
+      }
+      history.replaceState({}, '', url.pathname + url.search + url.hash);
+    } catch {}
   }
 
   function withToken(url) {
@@ -136,8 +152,26 @@
 
   // ---------- tabs ----------
   const views = ['overview', 'install', 'backups', 'snapshots', 'updates', 'diagnostics', 'terminal'];
+  function installModeActive() {
+    return document.body.classList.contains('install-mode');
+  }
+  function applyInstallMode(fresh) {
+    const enabled = fresh === true;
+    document.body.classList.toggle('install-mode', enabled);
+    if (!enabled) {
+      qs('#dokPill').classList.remove('hidden');
+      return;
+    }
+    qs('#modePill').innerHTML = '<span class="dot warn"></span> Installation mode';
+    qs('#dokPill').classList.add('hidden');
+    if (qs('#installWizard').classList.contains('hidden') && qs('#installProgress').classList.contains('hidden')) {
+      qsa('.tab-btn').forEach(button => button.classList.toggle('active', button.dataset.view === 'install'));
+      qsa('.view').forEach(view => view.classList.toggle('active', view.id === 'view-install'));
+    }
+  }
   function showView(name) {
     if (!views.includes(name)) name = 'overview';
+    if (installModeActive() && name !== 'install') name = 'install';
     qsa('.tab-btn').forEach(button => button.classList.toggle('active', button.dataset.view === name));
     qsa('.view').forEach(view => view.classList.toggle('active', view.id === `view-${name}`));
     if (name === 'overview') loadOverview();
@@ -159,20 +193,30 @@
     return `<span class="badge ${ok ? 'ok' : 'bad'}">${escapeHtml(ok ? textOk : textBad)}</span>`;
   }
 
+  function dokPublicUrl(summary = {}) {
+    const domain = String(summary.dokDomain || '').trim();
+    const port = Number(summary.dokHttpPort) || 80;
+    if (domain) return `http://${domain}${port !== 80 ? `:${port}` : ''}`;
+    return `http://${location.hostname}:8080`;
+  }
+
   function renderOverview() {
     const data = state.system;
     if (!data) return;
     const dok = data.dok || {};
     const installation = data.installation || {};
+    const installMode = state.install?.installation?.fresh === true;
     qs('#dokPill').innerHTML = `<span class="dot ${dok.running ? 'ok' : dok.exists ? 'warn' : 'bad'}"></span> Dok: ${dok.running ? 'running' : dok.exists ? dok.state || 'stopped' : 'not installed'}`;
-    qs('#modePill').innerHTML = '<span class="dot warn"></span> Maintenance active';
+    qs('#modePill').innerHTML = installMode
+      ? '<span class="dot warn"></span> Installation mode'
+      : '<span class="dot warn"></span> Maintenance active';
     qs('#dokBadge').className = `badge ${dok.running ? 'ok' : 'warn'}`;
     qs('#dokBadge').textContent = dok.running ? 'running' : dok.exists ? (dok.state || 'stopped') : 'not installed';
     qs('#dokInfo').innerHTML = `
       <div><span class="sub">Container:</span> <span class="mono">${escapeHtml(dok.id ? dok.id.slice(0, 12) : '-')}</span></div>
       <div><span class="sub">Image:</span> <span class="mono">${escapeHtml(dok.image || '-')}</span></div>
       <div><span class="sub">Started:</span> ${escapeHtml(when(dok.startedAt))}</div>
-      <div><span class="sub">Internal:</span> <a href="${withToken('http://' + location.hostname + ':8080')}" target="_blank" rel="noopener">http://${escapeHtml(location.hostname)}:8080</a></div>`;
+      <div><span class="sub">Internal:</span> <a href="${dokPublicUrl({ dokDomain: '', dokHttpPort: 80 })}" target="_blank" rel="noopener">http://${escapeHtml(location.hostname)}:8080</a></div>`;
     qs('#dokOpenBtn').disabled = !dok.running;
     qs('#dokStartBtn').disabled = !dok.exists || dok.running;
     qs('#dokRestartBtn').disabled = !dok.exists;
@@ -198,6 +242,7 @@
       <dt>Core services</dt><dd>${escapeHtml((summary.coreServices || []).join(', ') || '-')}</dd>
       <dt>Primary domain</dt><dd>${escapeHtml(summary.primaryDomain || '-')}</dd>
       <dt>Dok domain</dt><dd>${escapeHtml(summary.dokDomain || '-')}</dd>
+      <dt>nginx-proxy port</dt><dd>${escapeHtml(summary.dokHttpPort || 80)}</dd>
       <dt>Default network</dt><dd>${escapeHtml(summary.defaultNetwork || '-')}</dd>
       <dt>Registry connections</dt><dd>${escapeHtml(summary.registryConnections ?? '-')}</dd>
       <dt>Snapshots</dt><dd>${escapeHtml((data.snapshots || []).length)}</dd>
@@ -255,6 +300,7 @@
       state.install = install;
       renderOverview();
       renderLanding();
+      applyInstallMode(install?.installation?.fresh === true);
     } catch (e) {
       if (!e.needsToken) toast(e.message, 'error');
     }
@@ -293,8 +339,7 @@
   });
   qs('#dokOpenBtn').addEventListener('click', () => {
     const summary = state.system?.installation?.summary || {};
-    const url = summary.dokDomain ? `http://${summary.dokDomain}` : `http://${location.hostname}:8080`;
-    window.open(url, '_blank', 'noopener');
+    window.open(dokPublicUrl(summary), '_blank', 'noopener');
   });
   qs('#installBanner').addEventListener('click', event => {
     if (event.target.closest('[data-goto]')) { event.preventDefault(); showView(event.target.closest('[data-goto]').dataset.goto); }
@@ -418,8 +463,11 @@
     try {
       state.install = await api('/api/install');
       renderLanding();
+      applyInstallMode(state.install?.installation?.fresh === true);
+      return true;
     } catch (e) {
       if (!e.needsToken) toast(e.message, 'error');
+      return false;
     }
   }
 
@@ -557,7 +605,7 @@
   function serviceFieldInputs(category, selected) {
     const option = category.options.find(item => item.id === selected);
     if (!option) return '';
-    const skip = new Set(['adminPassword', 'adminUser', 'adminEmail', 'dokDomain']);
+    const skip = new Set(['adminPassword', 'adminUser', 'adminEmail', 'dnsProvider']);
     return (option.fields || []).filter(key => !skip.has(key)).map(key => {
       const definition = SERVICE_FIELDS[key] || { label: key };
       const value = state.wizard.fields[key] ?? '';
@@ -683,8 +731,7 @@
     if (stepName === 'Core services') {
       const count = Object.values(wizard.services).filter(Boolean).length;
       if (!count) return 'Select at least one core service, or switch to Standalone Dok.';
-      if (wizard.services.proxy === 'nginx-proxy' && !wizard.fields.dokDomain) return 'nginx-proxy needs a Dok domain. Fill it in the next step.';
-      if (wizard.services.auth && !wizard.fields.dokDomain && wizard.services.proxy === 'nginx-proxy') return 'Set the Dok domain for the reverse proxy.';
+      if (wizard.services.proxy === 'nginx-proxy' && !wizard.fields.dokDomain) return 'Enter the Dok domain for nginx-proxy in this step.';
     }
     if (stepName === 'Dok settings') {
       if (wizard.type === 'core') {
@@ -732,6 +779,7 @@
     try {
       const result = await api('/api/install/reinstall', { method: 'POST', body: {} });
       qs('#installLog').textContent += `${result.message || 'Reinstall completed.'}\n`;
+      await loadOverview();
       const coreStart = result.coreStart || {};
       const coreErrors = result.coreErrors || [];
       const coreFailed = coreStart.ok === false || coreErrors.length > 0;
@@ -744,19 +792,24 @@
         ${failedServices.length ? `<div class="small" style="margin-top:8px">${failedServices.map(item => `<div>${escapeHtml(item.service)}: ${escapeHtml(item.error || 'failed to start')}</div>`).join('')}</div>` : ''}
         ${coreErrors.length ? `<div class="small" style="margin-top:8px">${coreErrors.map(item => `<div>${escapeHtml(item)}</div>`).join('')}</div>` : ''}
         ${result.restartError ? `<div class="small" style="margin-top:8px">Restart error: ${escapeHtml(result.restartError)}</div>` : ''}
-        <div class="row" style="margin-top:10px"><a class="btn primary" href="http://${escapeHtml(location.hostname)}:8080" target="_blank" rel="noopener">Open Dok</a></div>`;
-      await loadOverview();
+        <div class="row" style="margin-top:10px"><a class="btn primary" href="${escapeHtml(dokPublicUrl(state.system?.installation?.summary || {}))}" target="_blank" rel="noopener">Open Dok</a></div>`;
     } catch (e) {
       qs('#installLog').textContent += `ERROR: ${e.message}\n`;
       qs('#installBadge').textContent = 'error';
       qs('#installBadge').className = 'badge bad';
+      qs('#installResult').classList.remove('hidden');
+      qs('#installResult').innerHTML = `<div class="notice danger">Reinstall failed: ${escapeHtml(e.message)}</div><div class="row" style="margin-top:10px"><button class="btn" id="retryReinstall">Back to installer</button></div>`;
+      qs('#retryReinstall')?.addEventListener('click', () => {
+        qs('#installProgress').classList.add('hidden');
+        qs('#installWizard').classList.remove('hidden');
+        renderWizard();
+      });
     }
   });
 
   qs('#openExistingDokBtn').addEventListener('click', () => {
     const summary = state.system?.installation?.summary || {};
-    const url = summary.dokDomain ? `http://${summary.dokDomain}` : `http://${location.hostname}:8080`;
-    window.open(url, '_blank', 'noopener');
+    window.open(dokPublicUrl(summary), '_blank', 'noopener');
   });
 
   qs('#maintenanceModeBtn').addEventListener('click', async () => {
@@ -842,6 +895,13 @@
       qs('#installBadge').textContent = 'error';
       qs('#installBadge').className = 'badge bad';
       if (e.data?.issues) qs('#installLog').textContent += e.data.issues.join('\n') + '\n';
+      qs('#installResult').classList.remove('hidden');
+      qs('#installResult').innerHTML = `<div class="notice danger">Installation could not start: ${escapeHtml(e.message)}</div><div class="row" style="margin-top:10px"><button class="btn" id="retryStart">Back to installer</button></div>`;
+      qs('#retryStart')?.addEventListener('click', () => {
+        qs('#installProgress').classList.add('hidden');
+        qs('#installWizard').classList.remove('hidden');
+        renderWizard();
+      });
     }
   }
 
@@ -1316,7 +1376,7 @@
     const value = qs('#tokenInput').value.trim();
     if (!value) { toast('Enter the maintenance token', 'error'); return; }
     state.token = value;
-    localStorage.setItem(tokenKey, value);
+    rememberToken(value);
     hideTokenModal();
     await boot();
   });
@@ -1328,12 +1388,16 @@
     try {
       const health = await fetch('/api/health').then(response => response.json()).catch(() => null);
       if (health?.tokenRequired && !state.token) {
-        showTokenModal();
-        return;
+        const probe = await fetch('/api/install').catch(() => null);
+        if (!probe || probe.status === 401) {
+          showTokenModal();
+          return;
+        }
       }
       hideTokenModal();
+      const installLoaded = await loadInstall();
+      if (!installLoaded && !qs('#tokenModal').classList.contains('hidden')) return;
       await loadOverview();
-      await loadInstall();
       await loadSessions();
       const installTab = new URLSearchParams(location.search).get('view');
       if (installTab) showView(installTab);

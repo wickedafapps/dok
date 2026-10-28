@@ -3295,7 +3295,8 @@ async function loadCoreNginx() {
     if (manage) manage.classList.toggle('hidden', !installed);
     if (installed) {
       const label = qs('#nginxManageSection .muted');
-      if (label) label.textContent = `nginx-proxy status: ${res.state || 'created'}`;
+      const httpPort = Number(res.settings?.httpPort) || 80;
+      if (label) label.textContent = `nginx-proxy status: ${res.state || 'created'}${httpPort !== 80 ? ` · HTTP host port ${httpPort}` : ''}`;
     }
     hideCoreCardUnless('coreNginxCard', installed);
     const hint = qs('#nginxCreateHint');

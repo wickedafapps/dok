@@ -194,7 +194,7 @@ function readSettings() {
     if (!fs.existsSync(settingsPath)) {
       const defaults = {
         services: {
-          nginxProxy: { enabled: false, network: 'wicked', defaultVhostPort: 80, domain: '', acme: { enabled: false, email: '', staging: false } },
+          nginxProxy: { enabled: false, network: 'wicked', defaultVhostPort: 80, httpPort: 80, domain: '', acme: { enabled: false, email: '', staging: false } },
           cloudflared: { enabled: false, token: '' },
           authentik: { enabled: false, adminEmail: '', adminPassword: '', secretKey: '', postgresPassword: '', port: 9000, httpsPort: 9443, domain: '' },
           authelia: { enabled: false, domain: '', port: 9091, adminUser: 'admin', adminEmail: '', adminPassword: '', adminPasswordHash: '', sessionSecret: '', encryptionKey: '', jwtSecret: '', theme: 'auto' },
@@ -217,7 +217,7 @@ function readSettings() {
     }
     const cur = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
     cur.services = cur.services || {};
-    cur.services.nginxProxy = { enabled: false, network: 'wicked', defaultVhostPort: 80, domain: '', acme: nginxProxyAcme(cur.services.nginxProxy?.acme || {}), ...(cur.services.nginxProxy || {}) };
+    cur.services.nginxProxy = { enabled: false, network: 'wicked', defaultVhostPort: 80, httpPort: 80, domain: '', acme: nginxProxyAcme(cur.services.nginxProxy?.acme || {}), ...(cur.services.nginxProxy || {}) };
     cur.services.nginxProxy.acme = nginxProxyAcme(cur.services.nginxProxy.acme || {});
     // Migrate the legacy default network name.
     if (!cur.services.nginxProxy.network || cur.services.nginxProxy.network === 'proxy') {
@@ -256,7 +256,7 @@ function readSettings() {
   } catch {
     return {
       services: {
-        nginxProxy: { enabled: false, network: 'wicked', defaultVhostPort: 80, domain: '', acme: { enabled: false, email: '', staging: false } },
+        nginxProxy: { enabled: false, network: 'wicked', defaultVhostPort: 80, httpPort: 80, domain: '', acme: { enabled: false, email: '', staging: false } },
         cloudflared: { enabled: false, token: '' },
         authentik: { enabled: false, adminEmail: '', adminPassword: '', secretKey: '', postgresPassword: '', port: 9000, httpsPort: 9443, domain: '' },
         authelia: { enabled: false, domain: '', port: 9091, adminUser: 'admin', adminEmail: '', adminPassword: '', adminPasswordHash: '', sessionSecret: '', encryptionKey: '', jwtSecret: '', theme: 'auto' },
@@ -468,6 +468,7 @@ function buildInstallationState(settings = readSettings()) {
       registryConnections: (readJson(registriesPath, { connections: [] })?.connections || []).length,
       primaryDomain: defaults.primaryDomain || '',
       dokDomain: defaults.dokDomain || redacted.services?.nginxProxy?.domain || '',
+      dokHttpPort: nginxProxyHttpPort(redacted.services?.nginxProxy?.httpPort),
       dataLocation: defaults.dataLocation || '',
       defaultNetwork: defaults.defaultNetwork || 'wicked'
     },
@@ -3404,9 +3405,65 @@ function nginxProxyAcme(raw = {}) {
   };
 }
 
-function nginxProxyCompose(network, domain, hostDir = '', acmeSettings = {}) {
+function nginxProxyHttpPort(value) {
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65535 || port === 443) return 80;
+  return port;
+}
+
+function nginxComposeHttpPort(compose) {
+  const match = String(compose || '').match(/^\s*-\s*["']?(?:\d{1,5}:)?(\d+):80["']?\s*$/m);
+  return match ? nginxProxyHttpPort(match[1]) : 80;
+}
+
+function nginxComposeHasHttpPort(compose, port) {
+  return new RegExp(`^\\s*-\\s*["']?(?:\\d{1,5}:)?${nginxProxyHttpPort(port)}:80["']?\\s*$`, 'm').test(String(compose || ''));
+}
+
+function setNginxComposeHttpPort(compose, port) {
+  const target = nginxProxyHttpPort(port);
+  let changed = false;
+  const next = String(compose || '').split('\n').map(line => {
+    const match = line.match(/^(\s*-\s*)(["']?)(?:\d{1,5}:)?(\d+):80\2\s*$/);
+    if (!match) return line;
+    changed = true;
+    return `${match[1]}${match[2]}${target}:80${match[2]}`;
+  }).join('\n');
+  return changed ? next : compose;
+}
+
+function nginxProxyPortConflict(error) {
+  const text = [error?.message, error?.stdout, error?.stderr].filter(Boolean).join('\n');
+  return /port is already allocated|address already in use|failed to bind|ports are not available|bind for 0\.0\.0\.0:\d+ failed/i.test(text);
+}
+
+async function publishedHostPorts() {
+  const used = new Set();
+  try {
+    const containers = await docker.listContainers({ all: true });
+    for (const container of containers) {
+      for (const port of container.Ports || []) {
+        if (port.PublicPort) used.add(Number(port.PublicPort));
+      }
+    }
+  } catch {}
+  return used;
+}
+
+function nextNginxProxyHttpPort(current, used = new Set()) {
+  const dokPort = Number(process.env.PORT) || 8080;
+  const maintenancePort = Number(process.env.MAINTENANCE_PORT) || 8090;
+  const reserved = new Set([80, 443, dokPort, maintenancePort, 8088, nginxProxyHttpPort(current)]);
+  for (let port = 8081; port <= 8180; port += 1) {
+    if (!reserved.has(port) && !used.has(port)) return port;
+  }
+  return 0;
+}
+
+function nginxProxyCompose(network, domain, hostDir = '', acmeSettings = {}, httpPort = 80) {
   let host = normalizeDomain(domain);
   if (!host) host = normalizeDomain(configuredDefaults().dokDomain || '');
+  const hostPort = nginxProxyHttpPort(httpPort);
   const acme = nginxProxyAcme(acmeSettings);
   const acmeEnabled = acme.enabled && String(acme.email || '').trim();
   const base = String(hostDir || '').trim() ? String(hostDir).replace(/[/\\]+$/, '') + '/' : './';
@@ -3448,7 +3505,7 @@ services:
     image: nginxproxy/nginx-proxy
     container_name: nginx-proxy
     ports:
-      - "80:80"
+      - "${hostPort}:80"
       - "443:443"
     volumes:
       - /var/run/docker.sock:/tmp/docker.sock:ro
@@ -4667,6 +4724,7 @@ async function ensureNginxProxyCompose({ recreate = false } = {}) {
   next = setMountSource(next, '/etc/nginx/certs', path.join(nginxHostDir, 'certs'));
   next = setMountSource(next, '/usr/share/nginx/html', path.join(nginxHostDir, 'html'));
   const configured = readSettings().services?.nginxProxy || {};
+  const httpPort = nginxProxyHttpPort(configured.httpPort);
   const acme = nginxProxyAcme(configured.acme || {});
   const wantsAcme = !!(acme.enabled && String(acme.email || '').trim());
   const hasAcme = /(^|\n)\s*acme-companion\s*:/.test(next);
@@ -4674,7 +4732,8 @@ async function ensureNginxProxyCompose({ recreate = false } = {}) {
     (wantsAcme && (!next.includes(`DEFAULT_EMAIL=${yamlScalar(String(acme.email || '').trim())}`) ||
       (acme.staging && !next.includes('acme-staging-v02.api.letsencrypt.org')) ||
       (!acme.staging && next.includes('acme-staging-v02.api.letsencrypt.org'))));
-  if (acmeStale || !next.includes('/etc/nginx/vhost.d') || !next.includes('/etc/nginx/certs') ||
+  if (acmeStale || !nginxComposeHasHttpPort(next, httpPort) ||
+      !next.includes('/etc/nginx/vhost.d') || !next.includes('/etc/nginx/certs') ||
       !next.includes('/usr/share/nginx/html')) {
     // Older managed composes have no vhost/certs/error-page volumes or the
     // certificate companion setting changed; regenerate the whole file from
@@ -4682,7 +4741,7 @@ async function ensureNginxProxyCompose({ recreate = false } = {}) {
     if (wantsAcme) {
       try { fs.mkdirSync(path.join(dir, 'acme'), { recursive: true }); } catch {}
     }
-    next = nginxProxyCompose(configured.network || 'wicked', configured.domain || '', nginxHostDir, acme);
+    next = nginxProxyCompose(configured.network || 'wicked', configured.domain || '', nginxHostDir, acme, httpPort);
   }
   const changed = next !== compose;
   if (changed) writePrivateFile(composePath, next);
@@ -5411,6 +5470,54 @@ async function coreServiceStatus(project, { nameHint = '', primaryHint = '' } = 
   return { exists, running, state, containerId, lookupFailed, containers: [] };
 }
 
+async function startNginxProxyWithPortFallback() {
+  const dir = coreServiceDir('nginx-proxy');
+  const composePath = path.join(dir, 'docker-compose.yml');
+  let compose = readManagedCompose(composePath);
+  if (!compose) throw httpError(404, 'nginx-proxy has not been created yet');
+  const configured = readSettings().services?.nginxProxy || {};
+  let httpPort = nginxProxyHttpPort(configured.httpPort);
+  const managed = compose.startsWith('# managed-by: wickedafdok');
+  if (managed && !nginxComposeHasHttpPort(compose, httpPort)) {
+    const patched = setNginxComposeHttpPort(compose, httpPort);
+    if (patched !== compose) {
+      compose = patched;
+      writePrivateFile(composePath, compose);
+    }
+  } else if (!managed) {
+    httpPort = nginxComposeHttpPort(compose);
+  }
+  const usedHostPorts = await publishedHostPorts();
+  let portFallback = false;
+  let portFallbackFrom = 0;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const out = await run('docker', ['compose', '-f', composePath, '-p', 'nginx-proxy', 'up', '-d', '--remove-orphans'], { cwd: dir });
+      if (httpPort !== nginxProxyHttpPort(configured.httpPort)) {
+        const settings = readSettings();
+        settings.services = settings.services || {};
+        settings.services.nginxProxy = { ...(settings.services.nginxProxy || {}), httpPort };
+        writeSettings(settings);
+      }
+      return { ...out, httpPort, portFallback, portFallbackFrom };
+    } catch (e) {
+      if (!nginxProxyPortConflict(e)) throw e;
+      const previousPort = httpPort;
+      const fallbackPort = attempt >= 10 ? 0 : nextNginxProxyHttpPort(httpPort, usedHostPorts);
+      if (!fallbackPort) throw e;
+      const patched = setNginxComposeHttpPort(compose, fallbackPort);
+      if (patched === compose) throw e;
+      usedHostPorts.add(previousPort);
+      if (!portFallbackFrom) portFallbackFrom = previousPort;
+      portFallback = true;
+      httpPort = fallbackPort;
+      compose = patched;
+      appendServerLog('WARN', `nginx-proxy could not bind host port ${previousPort}; retrying on ${fallbackPort}`);
+      writePrivateFile(composePath, compose);
+    }
+  }
+}
+
 async function coreServiceAction(service, action) {
   const dnsProvider = dnsProviderName(readSettings());
   const map = {
@@ -5433,6 +5540,17 @@ async function coreServiceAction(service, action) {
   else if (action === 'stop') args.push('stop');
   else if (action === 'restart') args.push('restart');
   else throw httpError(400, `Unsupported action: ${action}`);
+  if (service === 'nginx-proxy' && (action === 'up' || action === 'start')) {
+    return startNginxProxyWithPortFallback();
+  }
+  if (service === 'nginx-proxy' && action === 'restart') {
+    try {
+      return await run('docker', args, { cwd: dir });
+    } catch (e) {
+      if (!nginxProxyPortConflict(e)) throw e;
+      return startNginxProxyWithPortFallback();
+    }
+  }
   return run('docker', args, { cwd: dir });
 }
 
@@ -8514,6 +8632,15 @@ app.post('/api/settings', (req, res) => {
       }
       ng.defaultVhostPort = vp;
     }
+    if (ng.httpPort === undefined || ng.httpPort === null || ng.httpPort === '') {
+      ng.httpPort = 80;
+    } else {
+      const hp = Number(ng.httpPort);
+      if (!Number.isInteger(hp) || hp < 1 || hp > 65535 || hp === 443) {
+        return res.status(400).json({ error: 'nginx-proxy HTTP port must be between 1 and 65535 and cannot be 443' });
+      }
+      ng.httpPort = hp;
+    }
     writeSettings(next);
     res.json(redactSettingsSecrets(next));
   } catch (e) {
@@ -9286,6 +9413,15 @@ app.post('/api/core/nginx-proxy/run', async (req, res) => {
       return res.status(400).json({ error: 'A valid certificate email is required for acme-companion' });
     }
     const port = process.env.PORT || 8080;
+    if (body.httpPort !== undefined && body.httpPort !== null && body.httpPort !== '') {
+      const requestedPort = Number(body.httpPort);
+      if (!Number.isInteger(requestedPort) || requestedPort < 1 || requestedPort > 65535 || requestedPort === 443) {
+        return res.status(400).json({ error: 'nginx-proxy HTTP port must be between 1 and 65535 and cannot be 443' });
+      }
+    }
+    let httpPort = nginxProxyHttpPort(body.httpPort !== undefined ? body.httpPort : configured.httpPort);
+    let portFallback = false;
+    let portFallbackFrom = 0;
     await ensureNetwork(network);
 
     const nginxDir = path.join(coreDir, 'nginx-proxy');
@@ -9315,6 +9451,7 @@ app.post('/api/core/nginx-proxy/run', async (req, res) => {
       !existingCompose.includes('/etc/nginx/vhost.d') ||
       !existingCompose.includes('/etc/nginx/certs') ||
       !existingCompose.includes('/usr/share/nginx/html') ||
+      !nginxComposeHasHttpPort(existingCompose, httpPort) ||
       acmeStale
     );
     // Docker resolves bind sources on the daemon's side, so a compose file in
@@ -9329,22 +9466,43 @@ app.post('/api/core/nginx-proxy/run', async (req, res) => {
       nextCompose = setMountSource(nextCompose, '/etc/nginx/certs', path.join(nginxHostDir, 'certs'));
       nextCompose = setMountSource(nextCompose, '/usr/share/nginx/html', path.join(nginxHostDir, 'html'));
     }
+    if (!managedCompose) httpPort = nginxComposeHttpPort(existingCompose);
     if (!nextCompose || staleCompose) {
-      nextCompose = nginxProxyCompose(network, domain, nginxHostDir, acme);
+      nextCompose = nginxProxyCompose(network, domain, nginxHostDir, acme, httpPort);
     }
     if (nextCompose !== existingCompose) writePrivateFile(composePath, nextCompose);
 
-    let resOut = { stdout: '', stderr: '' };
     try {
       const list = await docker.listContainers({ all: true });
       const stale = list.find(c => (c.Names || []).some(n => n.replace(/^\//, '') === 'nginx-proxy') &&
         c.State !== 'running' && c.Labels?.['com.docker.compose.project'] !== 'nginx-proxy');
       if (stale) await docker.getContainer(stale.Id).remove({ force: true });
     } catch {}
-    try {
-      resOut = await run('docker', ['compose', '-f', composePath, '-p', 'nginx-proxy', 'up', '-d', '--remove-orphans'], { cwd: nginxDir });
-    } catch (e2) {
-      resOut = await run('docker', ['compose', '-f', composePath, '-p', 'nginx-proxy', 'up', '-d'], { cwd: nginxDir });
+
+    const usedHostPorts = await publishedHostPorts();
+    let resOut = { stdout: '', stderr: '' };
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        resOut = await run('docker', ['compose', '-f', composePath, '-p', 'nginx-proxy', 'up', '-d', '--remove-orphans'], { cwd: nginxDir });
+        break;
+      } catch (upError) {
+        if (!nginxProxyPortConflict(upError)) {
+          resOut = await run('docker', ['compose', '-f', composePath, '-p', 'nginx-proxy', 'up', '-d'], { cwd: nginxDir });
+          break;
+        }
+        const previousPort = httpPort;
+        const fallbackPort = attempt >= 10 ? 0 : nextNginxProxyHttpPort(httpPort, usedHostPorts);
+        if (!fallbackPort) throw upError;
+        usedHostPorts.add(previousPort);
+        if (!portFallbackFrom) portFallbackFrom = previousPort;
+        portFallback = true;
+        httpPort = fallbackPort;
+        appendServerLog('WARN', `nginx-proxy could not bind host port ${previousPort}; retrying on ${fallbackPort}`);
+        nextCompose = managedCompose && nginxHostDir
+          ? nginxProxyCompose(network, domain, nginxHostDir, acme, httpPort)
+          : setNginxComposeHttpPort(nextCompose, httpPort);
+        writePrivateFile(composePath, nextCompose);
+      }
     }
     try { await syncAuthVhosts(); } catch {}
 
@@ -9355,6 +9513,7 @@ app.post('/api/core/nginx-proxy/run', async (req, res) => {
       enabled: true,
       network,
       domain,
+      httpPort,
       acme
     };
     writeSettings(nextSettings);
@@ -9396,17 +9555,21 @@ app.post('/api/core/nginx-proxy/run', async (req, res) => {
     }
 
     const host = req.hostname || 'localhost';
+    const domainOrigin = domain ? `http://${domain}${httpPort !== 80 ? `:${httpPort}` : ''}` : '';
     let message = 'nginx-proxy launched';
     if (selfUpdate?.scheduled) {
-      message = `WickedAFDok will be updated with the new domain and recreated. Access it at http://${domain} or http://${host}:${port} if the domain is not working yet.`;
+      message = `WickedAFDok will be updated with the new domain and recreated. Access it at ${domainOrigin} or http://${host}:${port} if the domain is not working yet.`;
     } else if (selfUpdate?.connected) {
-      message = `nginx-proxy launched. WickedAFDok joined the ${network} network. Access it at http://${domain} or http://${host}:${port}.`;
+      message = `nginx-proxy launched. WickedAFDok joined the ${network} network. Access it at ${domainOrigin} or http://${host}:${port}.`;
     } else if (selfUpdate?.already) {
-      message = `nginx-proxy launched. WickedAFDok is already configured for http://${domain}. It is also available at http://${host}:${port}.`;
+      message = `nginx-proxy launched. WickedAFDok is already configured for ${domainOrigin}. It is also available at http://${host}:${port}.`;
     } else if (selfUpdate?.error) {
       message = `nginx-proxy launched, but WickedAFDok could not be reconfigured: ${selfUpdate.error}`;
     } else if (domain) {
       message = `nginx-proxy launched. Access WickedAFDok at http://${host}:${port}.`;
+    }
+    if (httpPort !== 80) {
+      message += ` nginx-proxy is published on host port ${httpPort}${portFallbackFrom === 80 ? ' because port 80 was unavailable' : ''}; include the port in domain links.`;
     }
 
     return res.json({
@@ -9415,6 +9578,9 @@ app.post('/api/core/nginx-proxy/run', async (req, res) => {
       stderr: resOut.stderr,
       message,
       domain,
+      httpPort,
+      portFallback,
+      portFallbackFrom,
       port,
       selfUpdate
     });

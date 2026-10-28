@@ -706,6 +706,7 @@ export function baseSettings(plan) {
       enabled: false,
       network: defaults.defaultNetwork || DEFAULT_NETWORK,
       defaultVhostPort: 80,
+      httpPort: 80,
       domain: normalizeDomain(defaults.dokDomain || ''),
       acme: { enabled: false, email: '', staging: false }
     },
@@ -851,6 +852,7 @@ export function installationSummary() {
     registryConnections: readRegistries().connections.length,
     primaryDomain: settings.defaults?.primaryDomain || '',
     dokDomain: settings.defaults?.dokDomain || settings.services?.nginxProxy?.domain || '',
+    dokHttpPort: Number(settings.services?.nginxProxy?.httpPort) || 80,
     dataLocation: settings.defaults?.dataLocation || '',
     defaultNetwork: settings.defaults?.defaultNetwork || DEFAULT_NETWORK
   };
