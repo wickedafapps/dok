@@ -812,6 +812,15 @@
     return text ? text.charAt(0).toUpperCase() + text.slice(1) : 'Field';
   }
 
+  function cleanFieldTitle(value) {
+    let text = String(value || '').trim();
+    text = text.replace(/\s*[,;:]?\s*(?:e\.g\.|for example|for instance).*$/i, '');
+    for (let i = 0; i < 3; i++) {
+      text = text.replace(/\s*\([^()]*\)\s*$/i, '').trim();
+    }
+    return text.replace(/\s{2,}/g, ' ').replace(/[,;:\s]+$/g, '').trim();
+  }
+
   function decorateField(control) {
     if (!control || control.dataset.helpDecorated) return;
     if (control.closest('.xterm')) return;
@@ -826,7 +835,10 @@
     const originalAria = (control.getAttribute('aria-label') || '').trim();
     const explicitLabel = (labelFor?.textContent || wrappingLabel?.textContent || originalAria || '').trim();
     const placeholder = (control.getAttribute('placeholder') || '').trim();
-    const fieldName = FIELD_LABEL[id] || explicitLabel || placeholder || humanizeFieldName(control.getAttribute('name') || id);
+    const explicitTitle = FIELD_LABEL[id] || explicitLabel || placeholder;
+    const cleanTitle = cleanFieldTitle(explicitTitle);
+    const titleIsExample = !cleanTitle || cleanTitle.length > 60 || /^(https?:\/\/|git@|ssh:\/\/|[^\s]+@)/i.test(cleanTitle);
+    const fieldName = titleIsExample ? humanizeFieldName(control.getAttribute('name') || id) : cleanTitle;
     const help = FIELD_HELP[id] || FIELD_HELP[control.getAttribute('name')] || (() => {
       if (type === 'checkbox' || type === 'radio') return `Enable or disable ${fieldName.toLowerCase()}.`;
       if (type === 'file') return `Choose a file for ${fieldName.toLowerCase()}.`;
