@@ -2075,10 +2075,10 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
     hideAppCfgProgress();
     pendingAppConfig = null;
     pendingSaveAction = null;
-    if (res.launchError) toast(`${payload.appName} created, but launch failed: ${res.launchError}`, true);
-    else if (res.launchPending) toast(res.message || `${payload.appName} is still starting`);
-    else if (launchNow) toast(`${payload.appName} is running`);
-    else toast(`${payload.appName} created`);
+    if (res.launchError) toast(`${payload.appName} created, but launch failed: ${res.launchError}${res.dataNotice ? ` ${res.dataNotice}` : ''}`, true, 12000);
+    else if (res.launchPending) toast(`${res.message || `${payload.appName} is still starting`}${res.dataNotice ? ` ${res.dataNotice}` : ''}`, false, 12000);
+    else if (launchNow) toast(`${payload.appName} is running${res.dataNotice ? `. ${res.dataNotice}` : ''}`, false, res.dataNotice ? 12000 : undefined);
+    else toast(`${payload.appName} created${res.dataNotice ? `. ${res.dataNotice}` : ''}`, false, res.dataNotice ? 12000 : undefined);
     if (res.stdout) console.log(res.stdout, res.stderr || '');
     refreshAll();
     loadApps();
@@ -2135,6 +2135,14 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
     if (e.status === 409 && e.data?.needsOverwrite) {
       appCfgOverwritePending = { launchNow, force };
       qs('#appOverwriteName').textContent = e.data.appName || payload.appName;
+      const dataEl = qs('#appOverwriteData');
+      const existingData = Array.isArray(e.data.existingData) ? e.data.existingData : [];
+      if (dataEl) {
+        dataEl.textContent = existingData.length
+          ? `Existing app data at ${existingData.join(', ')} will be preserved and reused. Choose a different app name or data location for fresh data, or delete the existing data manually first.`
+          : '';
+        dataEl.classList.toggle('hidden', !existingData.length);
+      }
       qs('#appOverwriteModal').classList.remove('hidden');
       msg.textContent = e.message;
       return;
@@ -2772,13 +2780,13 @@ if (qs('#libraryImportFile')) {
       } catch (e) {
         if (e.status === 409 && e.data?.needsOverwrite) {
           const names = Array.isArray(e.data.apps) ? e.data.apps.join(', ') : 'the selected apps';
-          if (!confirm(`${names} already exist. Overwrite their app files?`)) throw e;
+          if (!confirm(`${names} already exist. Overwrite their app files? Existing app data is preserved and reused.`)) throw e;
           result = await importLibraryFile(file, true);
         } else {
           throw e;
         }
       }
-      toast(result.message || `Imported ${result.imported?.length || 0} app${result.imported?.length === 1 ? '' : 's'}`, false, 9000);
+      toast(result.message || `Imported ${result.imported?.length || 0} app${result.imported?.length === 1 ? '' : 's'}`, false, result.reuseData?.length ? 14000 : 9000);
       await loadApps();
       refreshAll();
     } catch (e) {
@@ -2840,14 +2848,14 @@ if (qs('#libraryRepoDo')) {
       } catch (e) {
         if (e.status === 409 && e.data?.needsOverwrite) {
           const names = Array.isArray(e.data.apps) ? e.data.apps.join(', ') : 'the selected apps';
-          if (!confirm(`${names} already exist. Overwrite their app files?`)) throw e;
+          if (!confirm(`${names} already exist. Overwrite their app files? Existing app data is preserved and reused.`)) throw e;
           result = await importLibraryRepo(payload, true);
         } else {
           throw e;
         }
       }
       setBusy(false, result.message || 'Import complete');
-      toast(result.message || `Imported ${result.imported?.length || 0} app${result.imported?.length === 1 ? '' : 's'}`, false, 9000);
+      toast(result.message || `Imported ${result.imported?.length || 0} app${result.imported?.length === 1 ? '' : 's'}`, false, result.reuseData?.length ? 14000 : 9000);
       closeModal('libraryRepoModal');
       await loadApps();
       refreshAll();
@@ -5234,7 +5242,7 @@ if (qs('#importBackupBtn')) {
         res = await submit(false);
       } catch (e) {
         if (e.status !== 409 || !e.data?.needsOverwrite || !e.data?.backupId) throw e;
-        if (!confirm(e.message + '\n\nOverwrite the existing app or installation data?')) throw e;
+        if (!confirm(e.message + '\n\nContinue with the overwrite? Existing app data is preserved by app restores.')) throw e;
         res = await api(`/api/backups/${encodeURIComponent(e.data.backupId)}/restore`, jsonBody({ overwrite: true }));
         res.backups = null;
       }

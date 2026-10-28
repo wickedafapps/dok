@@ -42,6 +42,8 @@ Open `http://localhost:8080`. The UI has no built-in login — put it behind a r
 - Create full, single-app, or custom backups. Custom backups can mix data, apps, core services, sources, and logs, and optionally include only selected apps or core services.
 - Store encrypted credentials for Docker Hub, GHCR, GitLab, Quay, and other registries in **Settings → Dok Settings**, and use them automatically for pulls and compose launches.
 - App creation shows a live progress bar and closes the configuration window when the app is created.
+- Persistent app data is never overwritten or deleted by app creation, library import, or app backup restore. Existing data is reused with a notice; fresh data requires a new app name or data location, or manual deletion first.
+- OC Assist follows `apps/AGENTS.md`, a generated app-library contract covering layout, compose, routing, secrets, and persistent-data rules.
 
 ## Dok Settings: Designer, groups, and registry connections
 

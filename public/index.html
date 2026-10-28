@@ -1079,7 +1079,8 @@
         <button class="btn" data-close="appOverwriteModal">Close</button>
       </div>
       <div class="app-config">
-        <p class="muted">An app named <strong id="appOverwriteName"></strong> already exists. Overwriting replaces its compose file and app files. This cannot be undone.</p>
+        <p class="muted">An app named <strong id="appOverwriteName"></strong> already exists. Overwriting replaces its compose file and app files. Persistent app data and existing environment files are preserved.</p>
+        <p id="appOverwriteData" class="muted hidden" style="color:#ffb400"></p>
         <div class="row">
           <button id="appOverwriteConfirm" class="btn btn-danger">Overwrite app</button>
           <button class="btn" data-close="appOverwriteModal">Cancel</button>

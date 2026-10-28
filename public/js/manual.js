@@ -170,6 +170,7 @@
         <p>Missing input networks must be mapped to an existing network or explicitly created. Missing bind paths must be chosen or created; protected system paths cannot be newly created, though existing safe paths such as <code>/var/run/docker.sock</code> remain selectable.</p>
         <h4>Finalise</h4>
         <p><strong>Complete Creation</strong> saves the app to the library without starting it. <strong>Complete Creation and Launch</strong> saves and starts it. If the target app directory already exists, Dok asks for overwrite confirmation. Progress is shown in stages: prepare, build, validate, save, and launch.</p>
+        <p>Persistent app data is never overwritten or deleted. If the new app targets an existing data directory, Dok tells you that it will connect to the existing data. Overwriting app files preserves <code>data/</code> and existing <code>.env</code> files. For fresh data, use a new app name or data location, or delete the existing data manually first.</p>
       `
     },
     apps: {
@@ -204,7 +205,7 @@
           <li>Open <strong>Apps</strong> and choose <strong>Import library</strong> for a downloaded archive, or <strong>Import from repository</strong> to clone a git repository directly.</li>
           <li>For a repository, enter the git URL and optionally a branch and a subfolder containing <code>dok-library.json</code>.</li>
           <li>Repositories without a library manifest but with a compose file or Dockerfile are imported as a single app.</li>
-          <li>Confirm overwrite if an app with the same name already exists.</li>
+          <li>Confirm overwrite if an app with the same name already exists. Existing app data and <code>.env</code> files are preserved and reused.</li>
         </ol>
         <p>Imported apps are marked <strong>needs setup</strong>. They do not launch automatically. Use <strong>Configure &amp; Deploy</strong> to open the compose builder and supply the information that was stripped, such as hostnames, ports, and bind paths. Saving clears the setup flag.</p>
         <h4>Structure rules</h4>
@@ -459,7 +460,7 @@
           <li><strong>Custom</strong> lets you choose data, apps, core, sources, logs, individual apps, and individual core services.</li>
         </ul>
         <h4>Restore and import</h4>
-        <p>Restore requires explicit overwrite confirmation. Custom restores only overwrite the sections recorded in their manifest. Import accepts a Dok archive and restores it through the same flow.</p>
+        <p>Restore requires explicit overwrite confirmation. Custom restores only overwrite the sections recorded in their manifest. Import accepts a Dok archive and restores it through the same flow. An app restore replaces app files but preserves existing app <code>data/</code> and <code>.env</code> files; choose a new app name or delete the data manually first for a clean restore.</p>
         <h4>Updates</h4>
         <p>Update from Git pulls the configured repository. The code root must be writable. In the default image the source is baked in, so an in-app update is lost on container recreation unless <code>/app</code> is bind-mounted; otherwise update on the host with <code>git pull</code> and rebuild.</p>
       `
@@ -809,7 +810,13 @@
       .replace(/[_-]+/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
-    return text ? text.charAt(0).toUpperCase() + text.slice(1) : 'Field';
+    if (!text) return 'Field';
+    const label = text.charAt(0).toUpperCase() + text.slice(1);
+    const acronyms = {
+      Api: 'API', Cpu: 'CPU', Dns: 'DNS', Gui: 'GUI', Id: 'ID', Imap: 'IMAP',
+      Json: 'JSON', Ram: 'RAM', Smtp: 'SMTP', Ssh: 'SSH', Sso: 'SSO', Tls: 'TLS', Url: 'URL'
+    };
+    return label.replace(/\b(?:Api|Cpu|Dns|Gui|Id|Imap|Json|Ram|Smtp|Ssh|Sso|Tls|Url)\b/g, word => acronyms[word] || word);
   }
 
   function cleanFieldTitle(value) {
@@ -834,8 +841,7 @@
     const wrappingLabel = control.closest('label');
     const originalAria = (control.getAttribute('aria-label') || '').trim();
     const explicitLabel = (labelFor?.textContent || wrappingLabel?.textContent || originalAria || '').trim();
-    const placeholder = (control.getAttribute('placeholder') || '').trim();
-    const explicitTitle = FIELD_LABEL[id] || explicitLabel || placeholder;
+    const explicitTitle = FIELD_LABEL[id] || explicitLabel;
     const cleanTitle = cleanFieldTitle(explicitTitle);
     const titleIsExample = !cleanTitle || cleanTitle.length > 60 || /^(https?:\/\/|git@|ssh:\/\/|[^\s]+@)/i.test(cleanTitle);
     const fieldName = titleIsExample ? humanizeFieldName(control.getAttribute('name') || id) : cleanTitle;

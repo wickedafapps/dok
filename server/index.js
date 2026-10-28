@@ -1307,29 +1307,37 @@ function runCommandToCompose(command, appName, opts = {}) {
   };
 }
 
-function copySourceTree(src, dest) {
+function isPreservedAppRoot(name) {
+  return name === 'data' || /^\.env($|\.)/.test(name);
+}
+
+function copySourceTree(src, dest, { preserveAppData = false } = {}) {
   if (!src || !fs.existsSync(src) || path.resolve(src) === path.resolve(dest)) return;
+  const skipEntry = (entryPath) => {
+    const base = path.basename(entryPath);
+    if (base === '.git' || base === 'node_modules' || base === 'docker-compose.wickedafdok.yml') return true;
+    if (!preserveAppData) return false;
+    const rel = path.relative(src, entryPath);
+    if (!rel || rel.startsWith('..')) return false;
+    return isPreservedAppRoot(rel.split(path.sep)[0]);
+  };
   try {
     if (typeof fs.cpSync === 'function') {
       fs.cpSync(src, dest, {
         recursive: true,
         force: true,
-        filter: (p) => {
-          const base = path.basename(p);
-          return base !== '.git' && base !== 'node_modules' && base !== 'docker-compose.wickedafdok.yml';
-        }
+        filter: (p) => !skipEntry(p)
       });
       return;
     }
   } catch {}
-  // Fallback for older Node
   const srcResolved = fs.realpathSync(src);
   const destResolved = fs.existsSync(dest) ? fs.realpathSync(dest) : path.resolve(dest);
   if (srcResolved === destResolved) return;
   fs.mkdirSync(dest, { recursive: true });
   const entries = fs.readdirSync(src, { withFileTypes: true });
   for (const entry of entries) {
-    if (entry.name === '.git' || entry.name === 'node_modules' || entry.name === 'docker-compose.wickedafdok.yml') continue;
+    if (skipEntry(path.join(src, entry.name))) continue;
     const s = path.join(src, entry.name);
     const d = path.join(dest, entry.name);
     if (entry.isDirectory()) {
@@ -1338,13 +1346,42 @@ function copySourceTree(src, dest) {
       try {
         const link = fs.readlinkSync(s);
         fs.symlinkSync(link, d);
-      } catch {
-        // skip
-      }
+      } catch {}
     } else {
       try { fs.copyFileSync(s, d); } catch {}
     }
   }
+}
+
+function directoryHasEntries(dir) {
+  try {
+    return !!dir && fs.existsSync(dir) && fs.statSync(dir).isDirectory() && fs.readdirSync(dir).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+function clearAppDirectory(target, { preserveAppData = true } = {}) {
+  if (!target || !fs.existsSync(target)) return;
+  for (const child of fs.readdirSync(target)) {
+    if (preserveAppData && isPreservedAppRoot(child)) continue;
+    fs.rmSync(path.join(target, child), { recursive: true, force: true });
+  }
+}
+
+function appDataRootForPath(source, defaults = configuredDefaults(), appDir = '') {
+  const resolved = path.resolve(String(source || ''));
+  if (!source) return '';
+  if (appDir) {
+    const localData = path.join(path.resolve(appDir), 'data');
+    if (resolved === localData || resolved.startsWith(localData + path.sep)) return localData;
+  }
+  if (!defaults?.dataLocation) return '';
+  const appsRoot = path.resolve(defaults.dataLocation, 'apps');
+  if (!resolved.startsWith(appsRoot + path.sep)) return '';
+  const parts = path.relative(appsRoot, resolved).split(path.sep);
+  if (parts.length < 2 || parts[1] !== 'data') return '';
+  return path.join(appsRoot, parts[0], 'data');
 }
 
 async function ensureNetwork(name) {
@@ -1909,10 +1946,19 @@ function analyzeComposeConfig(config, networkNames = []) {
     networks.push({ key, name, external: true, missing: !names.has(name) });
   }
 
+  const bindVolumes = [];
   const missingVolumes = [];
   for (const [service, svc] of Object.entries(config.services || {})) {
     for (const volume of svc.volumes || []) {
-      if (volume.type === 'bind' && volume.source && !fs.existsSync(volume.source)) {
+      if (volume.type !== 'bind' || !volume.source) continue;
+      bindVolumes.push({
+        service,
+        source: String(volume.source),
+        target: String(volume.target || ''),
+        readOnly: volume.read_only === true,
+        key: volumeKey(service, volume.target)
+      });
+      if (!fs.existsSync(volume.source)) {
         missingVolumes.push({
           service,
           source: String(volume.source),
@@ -1960,6 +2006,7 @@ function analyzeComposeConfig(config, networkNames = []) {
     config,
     networks,
     missingNetworks: networks.filter(net => net.missing),
+    bindVolumes,
     missingVolumes,
     vhost,
     vhostPort,
@@ -1973,13 +2020,13 @@ async function analyzeCompose(composeText, { projectDir = '', networkNames = nul
   if (model.unavailable) {
     return {
       ok: true, unavailable: true, issues: [], networks: [], missingNetworks: [],
-      missingVolumes: [], vhost: '', vhostPort: '', vhostService: '', portIssues: []
+      bindVolumes: [], missingVolumes: [], vhost: '', vhostPort: '', vhostService: '', portIssues: []
     };
   }
   if (!model.ok) {
     return {
       ok: false, issues: model.issues, networks: [], missingNetworks: [],
-      missingVolumes: [], vhost: '', vhostPort: '', vhostService: '', portIssues: []
+      bindVolumes: [], missingVolumes: [], vhost: '', vhostPort: '', vhostService: '', portIssues: []
     };
   }
   const names = networkNames || await dockerNetworkNames();
@@ -5065,14 +5112,15 @@ async function extractBackup(archivePath) {
   }
 }
 
-function copyMerge(src, dest, { skip = [] } = {}) {
+function copyMerge(src, dest, { skip = [], preserveRoot = [], preserveRootEnv = false, root = true } = {}) {
   if (!fs.existsSync(src)) return;
   fs.mkdirSync(dest, { recursive: true });
   for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
     if (skip.includes(entry.name)) continue;
+    if (root && (preserveRoot.includes(entry.name) || (preserveRootEnv && /^\.env($|\.)/.test(entry.name)))) continue;
     const from = path.join(src, entry.name);
     const to = path.join(dest, entry.name);
-    if (entry.isDirectory()) copyMerge(from, to);
+    if (entry.isDirectory()) copyMerge(from, to, { root: false });
     else if (entry.isSymbolicLink()) {
       try {
         const link = fs.readlinkSync(from);
@@ -5099,14 +5147,24 @@ async function restoreBackupArchive(archivePath, { overwrite = false } = {}) {
       if (isSymlink(target)) throw httpError(400, 'Invalid app directory');
       let occupied = false;
       try { occupied = fs.existsSync(target) && fs.readdirSync(target).length > 0; } catch { occupied = true; }
+      const preserveData = directoryHasEntries(path.join(target, 'data'));
+      const preserveEnv = (() => {
+        try { return fs.existsSync(target) && fs.readdirSync(target).some(name => /^\.env($|\.)/.test(name)); } catch { return false; }
+      })();
       if (occupied && !overwrite) {
-        const err = httpError(409, `An app named "${appName}" already exists. Confirm that you want to overwrite it.`);
+        const dataNote = preserveData
+          ? ` Existing app data at ${path.join(target, 'data')} will be preserved and reused.`
+          : '';
+        const err = httpError(409, `An app named "${appName}" already exists. Confirm that you want to overwrite its app files.${dataNote}`);
         err.needsOverwrite = true;
         err.appName = appName;
         throw err;
       }
-      fs.rmSync(target, { recursive: true, force: true });
-      copyMerge(sourceDir, target);
+      clearAppDirectory(target, { preserveAppData: true });
+      copyMerge(sourceDir, target, {
+        preserveRoot: preserveData ? ['data'] : [],
+        preserveRootEnv: preserveEnv
+      });
       const registry = manifest.registry && typeof manifest.registry === 'object' ? manifest.registry : {};
       addRegistryEntry({
         ...registry,
@@ -5115,7 +5173,13 @@ async function restoreBackupArchive(archivePath, { overwrite = false } = {}) {
         appDir: target,
         composeFile: registry.composeFile || 'docker-compose.yml'
       });
-      return { ok: true, scope, appName, manifest };
+      return {
+        ok: true, scope, appName, manifest,
+        reuseData: preserveData ? [path.join(target, 'data')] : [],
+        message: preserveData
+          ? `Restored ${appName}. Existing app data at ${path.join(target, 'data')} was preserved and will be reused.`
+          : `Restored ${appName}.`
+      };
     }
 
     const components = scope === 'custom'
@@ -5558,7 +5622,7 @@ async function composeAction(entry, action, { allowStartupGrace = false, confirm
 
   let composeFile = findComposeFile(appDir);
   if (!composeFile && entry?.appDir && fs.existsSync(entry.appDir)) {
-    try { copySourceTree(entry.appDir, appDir); } catch {}
+    try { copySourceTree(entry.appDir, appDir, { preserveAppData: true }); } catch {}
     composeFile = findComposeFile(appDir);
   }
   if (!composeFile) throw new Error('This app has no compose file in its app directory');
@@ -5913,6 +5977,22 @@ app.post('/api/images/pull', async (req, res) => {
 });
 
 // ---------- app creation ----------
+function ensureAppAgentsFile() {
+  try {
+    const source = path.join(__dirname, 'app-agents.md');
+    if (!fs.existsSync(source)) return;
+    const content = fs.readFileSync(source, 'utf-8');
+    const target = path.join(appsDir, 'AGENTS.md');
+    if (fs.existsSync(target)) {
+      try { if (fs.readFileSync(target, 'utf-8') === content) return; } catch {}
+    }
+    fs.writeFileSync(target, content, { mode: 0o644 });
+    try { fs.chmodSync(target, 0o644); } catch {}
+  } catch (e) {
+    appendServerLog('WARN', `Could not write the OC Assist AGENTS.md contract: ${e.message}`);
+  }
+}
+
 function cleanupAppPreviews() {
   try {
     for (const name of fs.readdirSync(appsDir)) {
@@ -5945,7 +6025,11 @@ function prepareAppFromDirectory(sourceDir, appName, { mode = 'auto', appDir: re
   if (isSymlink(appDir)) throw httpError(400, 'Invalid app directory');
   ensureWritableDirectory(appDir, { label: 'app directory' });
   if (!isInsideApps(appDir)) throw httpError(400, 'Invalid app directory');
-  try { copySourceTree(sourceDir, appDir); } catch {}
+  try {
+    copySourceTree(sourceDir, appDir, {
+      preserveAppData: directoryHasEntries(path.join(appDir, 'data')) || fs.existsSync(path.join(appDir, '.env'))
+    });
+  } catch {}
 
   let compose = null;
   const composeFile = findComposeFile(sourceDir);
@@ -6386,6 +6470,7 @@ app.post('/api/assist/start', upload.array('files', 100), async (req, res) => {
     }
     const info = await getOpencodeInfo();
     if (!info.installed) throw httpError(503, 'OpenCode is not installed in this container. Rebuild the WickedAFDok image and try again.');
+    ensureAppAgentsFile();
     const stamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14);
     // One-second resolution is not enough: two requests in the same second
     // would share an assist/upload directory and overwrite each other's brief.
@@ -6449,6 +6534,10 @@ app.post('/api/assist/start', upload.array('files', 100), async (req, res) => {
       '',
       prompt,
       '',
+      '## App library contract',
+      '',
+      'Follow ' + path.join(appsDir, 'AGENTS.md') + '. It defines the layout, compose, routing, persistent-data, secrets, and library-export rules for every app.',
+      '',
       '## Default admin account',
       '',
       'Username: ' + (defaultsCfg.adminUser || 'admin'),
@@ -6484,15 +6573,17 @@ app.post('/api/assist/start', upload.array('files', 100), async (req, res) => {
       uploadedList,
       '',
       'Brief: ' + briefPath,
+      'App library contract: ' + path.join(appsDir, 'AGENTS.md'),
       'App directory: ' + path.join(appsDir, appName),
       'Default network: ' + (defaultsCfg.defaultNetwork || 'wicked'),
       '',
-      'Build the app now. Create docker-compose.yml (and any needed files) in the app directory, then publish it with:',
+      'Read the app library contract before writing files. Build the app now. Create docker-compose.yml (and any needed files) in the app directory, then publish it with:',
       'node ' + register + ' --name ' + appName + ' --dir ' + path.join(appsDir, appName) + ' --launch',
       'If publishing fails, read the error, fix the compose, and retry once.',
       'If the user supplied a domain, set VIRTUAL_HOST/VIRTUAL_PORT in the compose or pass --vhost and --vhost-port to the publish command.',
       'Use --network only when the app must join a specific existing Docker network.',
       'If the publish response asks for amendment approval (needsAmendApproval), summarize the listed containers and changes to the user and wait for approval before rerunning with --confirm-amend.',
+      'If publishing reports reuseData or dataNotice, tell the user the app connects to existing app data and that it was not reset. Never delete or overwrite that data.',
       'Ask the user only when you genuinely need a domain, port, credential, or host path.',
       'When finished, tell the user the app is in the Apps tab.'
     ].join('\n');
@@ -6572,15 +6663,22 @@ app.post('/api/launch/finalize', async (req, res) => {
     } catch {
       targetOccupied = true;
     }
+    const targetDataExisted = directoryHasEntries(path.join(targetDir, 'data'));
+    const defaultsCfg = configuredDefaults();
+    const appDataDirBefore = appDefaultDataDir(name);
+    const appDataExisted = directoryHasEntries(appDataDirBefore);
+    const existingData = [...new Set([targetDataExisted ? path.join(targetDir, 'data') : '', appDataExisted ? appDataDirBefore : ''].filter(Boolean))];
     if (targetOccupied && overwrite !== true) {
+      const dataNote = existingData.length
+        ? ` Existing app data at ${existingData.join(', ')} will be preserved and reused.`
+        : '';
       const err = httpError(409,
-        `An app named "${name}" already exists. Confirm that you want to overwrite it, or choose another app name.`);
+        `An app named "${name}" already exists. Confirm that you want to overwrite its app files, or choose another app name.${dataNote}`);
       err.needsOverwrite = true;
       err.appName = name;
+      err.existingData = existingData;
       throw err;
     }
-
-    const defaultsCfg = configuredDefaults();
     const netName = String(network || defaultsCfg.defaultNetwork || 'wicked').trim();
     if (['host', 'none', 'bridge', 'default'].includes(netName) || netName.startsWith('container:') || netName.startsWith('service:')) {
       throw httpError(400, 'Choose a named Docker network. Use network_mode in the compose file for host, none, bridge, or container networks.');
@@ -6637,7 +6735,7 @@ app.post('/api/launch/finalize', async (req, res) => {
     const stagedIsAppDir = !!staged && staged !== appsRoot && path.dirname(staged) === appsRoot;
     if (stagedIsAppDir && staged !== targetReal && fs.existsSync(staged)) {
       try {
-        copySourceTree(staged, targetDir);
+        copySourceTree(staged, targetDir, { preserveAppData: targetOccupied });
         if (fs.existsSync(targetDir)) stagedToRemove = staged;
       } catch {}
     }
@@ -6648,7 +6746,7 @@ app.post('/api/launch/finalize', async (req, res) => {
     let sourceIsDir = false;
     try { sourceIsDir = !!sourceReal && fs.statSync(sourceReal).isDirectory(); } catch {}
     if (sourceIsDir && sourceReal !== sourcesRoot && isInsideDir(sourceReal, sourcesDir) && sourceReal !== targetReal) {
-      try { copySourceTree(sourceReal, targetDir); } catch {}
+      try { copySourceTree(sourceReal, targetDir, { preserveAppData: targetOccupied }); } catch {}
     }
     ensureWritableDirectory(targetDir, { label: 'app directory' });
     if (!isInsideApps(targetDir)) throw httpError(400, 'Invalid app directory');
@@ -6824,6 +6922,20 @@ app.post('/api/launch/finalize', async (req, res) => {
       });
     }
 
+    const reusedData = new Set(existingData);
+    for (const volume of analysis.bindVolumes || []) {
+      const mapped = volumeMappings.find(item => item.service === volume.service && item.target === volume.target);
+      const source = mapped?.source || volume.source;
+      const root = appDataRootForPath(source, defaultsCfg, targetDir);
+      if (!root) continue;
+      if (root === path.join(targetDir, 'data') && !targetDataExisted) continue;
+      if (directoryHasEntries(root)) reusedData.add(root);
+    }
+    const dataReuse = [...reusedData];
+    const dataNotice = dataReuse.length
+      ? `Existing app data at ${dataReuse.join(', ')} will be reused. Dok preserves app data during updates and app-file overwrites; choose a different app name or data location for fresh data, or delete the existing data manually first.`
+      : '';
+
     const validation = await validateCompose(finalCompose, { projectDir: targetDir });
     const validationIssues = [...new Set([...(validation.issues || []), ...(analysis.issues || [])])];
     if ((!validation.ok || (analysis.issues || []).length) && !force) {
@@ -6977,6 +7089,7 @@ app.post('/api/launch/finalize', async (req, res) => {
       ok: true, appDir: targetDir, appName: name, appDataPath, ...result,
       issues: [...new Set([...validationIssues, ...combinedIssues])], launchError,
       launchPending, renamed, amended: amendment?.requiresApproval ? amendment.changes : [],
+      reuseData: dataReuse, dataNotice,
       message: launchPending ? `${name} is still starting.` : ''
     });
   } catch (e) {
@@ -6985,6 +7098,7 @@ app.post('/api/launch/finalize', async (req, res) => {
       needsOverwrite: !!e.needsOverwrite,
       needsAmendApproval: !!e.needsAmendApproval,
       amendments: e.amendments || null,
+      existingData: Array.isArray(e.existingData) ? e.existingData : [],
       appName: e.appName || (registrySaved ? finalizedAppName : undefined),
       created: registrySaved
     });
@@ -7547,6 +7661,10 @@ async function importLibraryTree({ manifest, appsRoot, overwrite = false }) {
     const target = path.join(appsDir, name);
     let occupied = false;
     try { occupied = fs.existsSync(target) && fs.readdirSync(target).length > 0; } catch { occupied = true; }
+    const existingData = [
+      directoryHasEntries(path.join(target, 'data')) ? path.join(target, 'data') : '',
+      directoryHasEntries(appDefaultDataDir(name)) ? appDefaultDataDir(name) : ''
+    ].filter(Boolean);
     entries.push({
       name,
       sourceDir,
@@ -7554,26 +7672,23 @@ async function importLibraryTree({ manifest, appsRoot, overwrite = false }) {
       compose: sanitized.compose,
       target,
       occupied,
+      existingData: [...new Set(existingData)],
       description: String(app.description || '').slice(0, 500),
       requirements: app.requirements && typeof app.requirements === 'object' ? app.requirements : sanitized.requirements
     });
   }
   const conflicts = entries.filter(entry => entry.occupied).map(entry => entry.name);
   if (conflicts.length && !overwrite) {
-    const err = httpError(409, `These apps already exist: ${conflicts.join(', ')}. Confirm to overwrite them.`);
+    const err = httpError(409, `These apps already exist: ${conflicts.join(', ')}. Confirm to overwrite their app files. Existing app data is preserved and reused.`);
     err.needsOverwrite = true;
     err.apps = conflicts;
+    err.existingData = [...new Set(entries.flatMap(entry => entry.existingData))];
     throw err;
   }
   const imported = [];
   for (const entry of entries) {
     if (isSymlink(entry.target)) throw httpError(400, `Invalid app directory for ${entry.name}`);
-    if (entry.occupied) {
-      for (const child of fs.readdirSync(entry.target)) {
-        if (child === 'data' || /^\.env($|\.)/.test(child)) continue;
-        fs.rmSync(path.join(entry.target, child), { recursive: true, force: true });
-      }
-    }
+    if (entry.occupied) clearAppDirectory(entry.target, { preserveAppData: true });
     fs.mkdirSync(entry.target, { recursive: true });
     for (const rel of libraryFiles(entry.sourceDir)) {
       const from = path.join(entry.sourceDir, rel);
@@ -7618,18 +7733,23 @@ async function importLibraryTree({ manifest, appsRoot, overwrite = false }) {
     });
     imported.push(entry.name);
   }
+  const reuseData = [...new Set(entries.filter(entry => imported.includes(entry.name)).flatMap(entry => entry.existingData))];
+  const dataNotice = reuseData.length
+    ? ` Existing app data at ${reuseData.join(', ')} will be reused and was not overwritten. Choose a different app name or data location for fresh data, or delete the existing data manually first.`
+    : '';
   return {
     ok: true,
     imported,
+    reuseData,
     library: {
       schema: manifest.schema,
       name: String(manifest.name || ''),
       created: manifest.created || '',
       apps: entries.map(entry => entry.name)
     },
-    message: imported.length === 1
+    message: (imported.length === 1
       ? `Imported ${imported[0]}. Open it in Apps and configure it before launching.`
-      : `Imported ${imported.length} apps. Open each one in Apps and configure it before launching.`
+      : `Imported ${imported.length} apps. Open each one in Apps and configure it before launching.`) + dataNotice
   };
 }
 
@@ -10522,6 +10642,7 @@ function opencodeConfigForMode(mode, settings = {}) {
         prompt: [
           'You are OC Assist, the app builder inside WickedAFDok.',
           'Your working directory is ' + appsDir + '. You only create, edit, and launch application files in that directory.',
+          'Read AGENTS.md in ' + appsDir + ' before building. It defines the required app layout, compose rules, routing variables, persistent-data protection, and library export rules.',
           'Use the user request in the first message as the source of truth. Read the assistant brief it points to and any uploaded files before building.',
           'Create apps/<name>/docker-compose.yml. Prefer the configured Dok default network. Do not touch WickedAFDok source files, Docker configuration, or core services.',
           'When the app is ready, publish it to the Apps library with the command provided in the brief. Never print secrets in chat.',
@@ -11489,6 +11610,7 @@ app.use((err, req, res, next) => {
 });
 
 cleanupAppPreviews();
+ensureAppAgentsFile();
 
 const server = http.createServer(app);
 const terminalWss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });

@@ -53,6 +53,7 @@ docker run -d --name wickedafdok -p 8080:8080 \
 ├── server/index.js      # Main server with all API routes and business logic
 ├── server/host-agent.js # Optional privileged helper socket for host directory creation
 ├── server/assist-register.mjs # OC Assist helper that registers/deploys an app via finalize API
+├── server/app-agents.md # OC Assist app-library contract; written to apps/AGENTS.md on startup
 ├── public/              # Frontend
 │   ├── index.html       # UI structure
 │   ├── css/style.css    # Styles
@@ -151,7 +152,7 @@ The unified way to deploy applications. Every app is stored in `apps/<name>/` wi
 ### App Library
 - Export/import uses the `wickedafdok.library/v1` schema (`kind: wickedafdok-app-library`). The archive contains `dok-library.json` plus `apps/<name>/...`.
 - `POST /api/library/export` accepts `{ apps: [ids], name }` and returns a `.tar.gz` attachment. Apps are stripped of installation-specific data: `container_name`, `VIRTUAL_HOST`/`VIRTUAL_PORT`/`ENABLE_AUTH`/`LETSENCRYPT_*`, published host ports, absolute bind sources (except `/var/run/docker.sock`, `/etc/localtime`, `/etc/timezone`), top-level `name`, external network names (except the shared `wicked` network), external/name fields on named volumes, generated `docker-compose.wickedafdok.yml`, `.env*` (except `.env.example`), `.git`, `node_modules`, and the app's root `data` directory. Requirements metadata is sanitized the same way.
-- `POST /api/library/import` accepts the archive (multipart `file`), validates the manifest, and imports into `apps/<name>`. Existing non-empty apps return `409` with `needsOverwrite`; overwriting preserves the existing root `data` directory and `.env*` files. Imported apps are registered with `needsConfig: true` and library metadata; the Apps UI shows **Configure & Deploy**, which opens the visual compose editor so the user can supply local domains, ports, paths, and secrets.
+- `POST /api/library/import` accepts the archive (multipart `file`), validates the manifest, and imports into `apps/<name>`. Existing non-empty apps return `409` with `needsOverwrite`; overwriting preserves the existing root `data` directory and `.env*` files and reports the reused paths through `reuseData`/`message`. Imported apps are registered with `needsConfig: true` and library metadata; the Apps UI shows **Configure & Deploy**, which opens the visual compose editor so the user can supply local domains, ports, paths, and secrets.
 - `POST /api/library/import-repo` clones a git repository (`repo`, optional `branch`, `path`, `name`, `description`, `overwrite`) and reuses the same importer. A repository with `dok-library.json` imports its apps; one with only a compose file or Dockerfile becomes a single app. Conflicts return `409 needsOverwrite`. Shared helpers: `libraryManifestFromDirectory()`, `importLibraryTree()`, `synthesizeLibraryFromRepository()`.
 - UI: `#libraryExportBtn`, `#libraryImportFile`, `#libraryImportRepoBtn`, `#libraryRepoModal`, `#libraryRepoUrl`, `#libraryRepoBranch`, `#libraryRepoPath`, `#libraryRepoName`, `#libraryRepoDo`, `#libraryExportModal`, `#libraryExportList`, `#libraryExportDo`.
 
@@ -291,6 +292,7 @@ The **Core Services** subtab manages the bundled services. Each created service 
 - Scopes: `full`, `app`, and `custom`
 - Full backups include `data`, `apps`, `core`, and `sources`; `data/backups`, `data/tmp`, and the helper socket are excluded, and `data/logs` is optional
 - App backups include `apps/<name>` plus a registry snapshot
+- App backup restore preserves an existing app-root `data/` directory and `.env*` files, reports them through `reuseData`/`message`, and never deletes them during the restore
 - Custom backups accept toggles for `data`, `apps`, `core`, `sources`, and `logs`, plus optional per-app and per-core-service selections. An empty app/core selection means all of that section. The manifest is stored at `data/.backup-manifest.json` (or as the only `data` entry when data is excluded) with `scope: 'custom'`, `components`, `apps`, and `core` fields.
 - Custom restores only overwrite the sections recorded in the manifest; full and app archives remain backward compatible
 - `GET /api/backups/options` returns the app and core-service pickers used by the UI
@@ -433,6 +435,7 @@ The **Core Services** subtab manages the bundled services. Each created service 
 5. On finalize (`/api/launch/finalize`) the server resolves `networkChoices`/`volumeChoices`, validates the base compose plus generated override, saves to the registry, and optionally launches via docker compose in `apps/<name>/`. A renamed staged app is removed only after the final compose and registry entry are written successfully.
 6. Every new app preview is staged in a hidden `apps/.preview-<name>-.../` directory, including when `apps/<name>/` does not exist yet, and is copied to the target only on finalize. This prevents finalize from mistaking its own preview for an existing app. Stale previews older than 24 hours are cleaned up. Finalizing into a non-empty existing app name returns `409` with `needsOverwrite`/`appName`; the UI asks for confirmation and resubmits with `overwrite: true`.
 7. `finalizeLocks` (keyed by sanitized app name) rejects concurrent finalizes with `409 alreadyFinalizing`, and the lock is released in `finally` after the handler completes rather than when the client socket closes. Once the registry entry is written, later failures return `created: true` with the app name, so the UI closes and refreshes instead of prompting a duplicate install.
+8. App persistent data is never removed or overwritten. Finalize and library import skip app-root `data/` and `.env*` when copying over an existing app, and app backup restore preserves them. Responses include `reuseData`/`dataNotice` when the new app will connect to existing data; the overwrite prompt lists the preserved data paths. Fresh data requires a new app name or data location, or manual deletion by the user.
 
 ### Defaults and App Data
 - `defaultsDefaults()` owns `settings.defaults`; `configuredDefaults()` normalizes it, `defaultsForClient()` redacts the admin password as `adminPasswordSet`, and `defaultsPatch()` validates/saves input. `POST /api/settings/defaults` also applies the data location and syncs Authelia vhosts when Dok protection is enabled.
@@ -444,6 +447,7 @@ The **Core Services** subtab manages the bundled services. Each created service 
 - `POST /api/assist/start` validates the prompt/name, rejects concurrent starts for the same app name, saves uploads under `sources/oc-assist-<stamp>-<random>/` (traversal-checked), writes a private brief at `data/opencode/assist/<stamp>-<random>/brief.md`, and starts a User-mode OpenCode session with the dedicated `assist` agent and title `OC Assist · <app>`. The random suffix keeps two requests in the same second from sharing a directory.
 - The brief includes instructions, pasted data, uploaded file paths, and default admin username/email (never the password).
 - The `assist` agent uses the User-mode permission model with external access limited to the app directory, `sources/oc-assist-*`, `data/opencode/assist/**`, and `server/assist-register.mjs`; Docker/system/privilege commands remain denied. The UI opens the returned session directly in the terminal modal.
+- OC Assist reads `apps/AGENTS.md`, generated from `server/app-agents.md` at startup and before each assist session. The contract defines the required app layout, compose/network/routing rules, secret handling, library-export hygiene, and the rule that app persistent data is never reset, deleted, or overwritten.
 - The agent registers/deploys through `server/assist-register.mjs --name <app> --dir /app/apps/<app> --launch`, which posts to `/api/launch/finalize` with `overwrite: true`; `--launch` is opt-in so a dry registration is possible, and `--confirm-amend` approves reviewed container renames.
 
 ### App Library
