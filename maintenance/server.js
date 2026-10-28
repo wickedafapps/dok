@@ -15,7 +15,8 @@ import {
   writeRegistriesFromPlan, readRegistries, readRegistry, readInstallation, saveInstallation,
   installationState, refreshInstallationState, dokOwner, chownDokPath, chownTree,
   docker, dockerInspect, dokStatus, dockerJson, containerList, ensureNetwork, dokApi,
-  waitForDok, maintenanceToken, CORE_CATEGORIES, normalizeInstallPlan, validateInstallPlan,
+  waitForDok, maintenanceToken, CORE_CATEGORIES, REGISTRY_PRESETS, normalizeRegistryHost,
+  registryPresetFor, buildInstallerPrompt, normalizeInstallPlan, validateInstallPlan,
   selectedServiceIds, baseSettings, ensurePlanDirectories, listCoreServices, listApps,
   installationSummary, writeInstallationCompose, captureSnapshot, listSnapshots,
   listBackups, createBackup, restoreArchive, repairInstallation, systemInfo, dockerInfo,
@@ -211,6 +212,7 @@ app.get('/api/install', api(async (req, res) => {
   const saved = savedRecord || {};
   const state = installationState();
   const dok = await dokStatus().catch(() => ({ exists: false, running: false }));
+  const currentSettings = readSettings();
   res.json({
     ok: true,
     dok,
@@ -230,12 +232,20 @@ app.get('/api/install', api(async (req, res) => {
       snapshots: listSnapshots().length
     },
     services: CORE_CATEGORIES,
+    registryPresets: REGISTRY_PRESETS,
     discovered: {
-      dokDomain: readSettings().defaults?.dokDomain || readSettings().services?.nginxProxy?.domain || '',
-      primaryDomain: readSettings().defaults?.primaryDomain || '',
-      dataLocation: readSettings().defaults?.dataLocation || '',
-      adminUser: readSettings().defaults?.adminUser || 'admin',
-      adminEmail: readSettings().defaults?.adminEmail || '',
+      dokDomain: currentSettings.defaults?.dokDomain || currentSettings.services?.nginxProxy?.domain || '',
+      primaryDomain: currentSettings.defaults?.primaryDomain || '',
+      authDomain: currentSettings.services?.authelia?.domain || currentSettings.services?.authentik?.domain || '',
+      dnsDomain: currentSettings.services?.technitium?.domain || currentSettings.services?.adguard?.domain || '',
+      mailDomain: currentSettings.services?.mailpit?.domain || currentSettings.services?.stalwart?.domain || '',
+      mailFrom: currentSettings.services?.mail?.sender || '',
+      acmeEmail: currentSettings.services?.nginxProxy?.acme?.email || '',
+      acmeStaging: currentSettings.services?.nginxProxy?.acme?.staging === true,
+      protectDok: currentSettings.defaults?.protectDok === true,
+      dataLocation: currentSettings.defaults?.dataLocation || '',
+      adminUser: currentSettings.defaults?.adminUser || 'admin',
+      adminEmail: currentSettings.defaults?.adminEmail || '',
       coreServices: listCoreServices()
     },
     defaults: {
@@ -251,6 +261,85 @@ app.post('/api/install/validate', api(async (req, res) => {
   const plan = normalizeInstallPlan(req.body || {});
   const issues = validateInstallPlan(plan);
   res.json({ ok: issues.length === 0, issues, plan: { type: plan.type, services: plan.services, defaults: { ...plan.defaults, adminPassword: plan.defaults.adminPassword ? 'set' : '' } } });
+}));
+
+app.get('/api/install/opencode-prompt', api(async (req, res) => {
+  const existing = readInstallation() || {};
+  const promptPath = existing.opencodePrompt ? path.resolve(existing.opencodePrompt) : '';
+  let prompt = '';
+  if (promptPath && promptPath.startsWith(MAINT_DATA + path.sep) && fs.existsSync(promptPath)) {
+    prompt = fs.readFileSync(promptPath, 'utf8');
+  } else {
+    prompt = buildInstallerPrompt({
+      plan: existing.plan || {},
+      settings: readSettings(),
+      results: existing.services || [],
+      dok: existing.dok || {}
+    });
+  }
+  res.type('text/plain').send(prompt);
+}));
+
+app.post('/api/registries/test', api(async (req, res) => {
+  const body = req.body || {};
+  const host = normalizeRegistryHost(body.host);
+  if (!host) throw Object.assign(new Error('Enter a registry or git host address first.'), { status: 400 });
+  const hostPreset = REGISTRY_PRESETS.find(entry => entry.host && entry.host === host);
+  const namePreset = registryPresetFor(body.name || '');
+  const kind = body.kind === 'git' || body.kind === 'registry' ? body.kind : (hostPreset?.kind || namePreset?.kind || 'registry');
+  const provider = String(body.provider || hostPreset?.provider || 'custom').trim();
+  const username = String(body.username || '').trim();
+  const secret = String(body.secret || '');
+  const fail = message => { throw Object.assign(new Error(message), { status: 400 }); };
+  if (kind === 'git') {
+    if (!secret) fail('Enter a token before testing this git host.');
+    if (host === 'github.com' || host === 'gitlab.com') {
+      let response;
+      try {
+        response = host === 'github.com'
+          ? await fetch('https://api.github.com/user', {
+            headers: { Authorization: `Bearer ${secret}`, Accept: 'application/vnd.github+json', 'User-Agent': 'WickedAFDok' },
+            signal: AbortSignal.timeout(15000)
+          })
+          : await fetch('https://gitlab.com/api/v4/user', {
+            headers: { 'PRIVATE-TOKEN': secret },
+            signal: AbortSignal.timeout(15000)
+          });
+      } catch (e) {
+        fail(`Could not reach ${host}: ${e.message}`);
+      }
+      if (!response.ok) fail(`${host} rejected the token (HTTP ${response.status}).`);
+      const user = await response.json().catch(() => ({}));
+      return res.json({ ok: true, host, kind, provider, message: `Authenticated with ${host}${user.login || user.username ? ` as ${user.login || user.username}` : ''}.` });
+    }
+    let response;
+    try {
+      response = await fetch(`https://${host}`, {
+        method: 'HEAD',
+        redirect: 'follow',
+        signal: AbortSignal.timeout(15000)
+      });
+    } catch (e) {
+      fail(`Could not reach ${host}: ${e.message}`);
+    }
+    return res.json({ ok: true, host, kind, provider, message: `Reached ${host} (HTTP ${response.status}). Credentials will be used for matching HTTPS git operations.` });
+  }
+  if (!secret) fail('Enter a token or password before testing this registry.');
+  const dir = fs.mkdtempSync(path.join(MAINT_DATA, 'tmp', 'registry-test-'));
+  try {
+    try {
+      await run('docker', ['login', host, '--username', username || 'token', '--password-stdin'], {
+        env: { ...process.env, DOCKER_CONFIG: dir },
+        input: secret,
+        timeout: 60000
+      });
+    } catch (e) {
+      fail(String(e.stderr || e.message || 'Registry login failed').trim());
+    }
+    res.json({ ok: true, host, kind, provider, message: `Authenticated with ${host}.` });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 }));
 
 async function launchDok({ build = true } = {}) {
@@ -273,6 +362,9 @@ async function configureServices(plan, log) {
   const primary = normalizeDomain(defaults.primaryDomain || '');
   const dokDomain = normalizeDomain(plan.dokDomain || defaults.dokDomain || '');
   const authDomain = normalizeDomain(plan.authDomain || (primary ? `auth.${primary}` : ''));
+  const acmeEmail = String(plan.acmeEmail || defaults.adminEmail || '').trim();
+  const acmeStaging = plan.acmeStaging === true;
+  const mailFrom = String(plan.mailFrom || plan.smtpFrom || (primary ? `authelia@${primary}` : '')).trim();
   const service = plan.services || {};
   const record = (name, ok, detail, extra = {}) => {
     results.push({ name, ok, detail: String(detail || '').slice(0, 2000), ...extra });
@@ -287,11 +379,13 @@ async function configureServices(plan, log) {
         body: {
           network: defaults.defaultNetwork || DEFAULT_NETWORK,
           domain: dokDomain,
-          acme: { enabled: !!plan.acmeEmail, email: plan.acmeEmail || '', staging: false }
+          acme: { enabled: !!acmeEmail, email: acmeEmail, staging: acmeStaging }
         }
       });
+      const httpPort = Number(out.httpPort) || 80;
       record('nginx-proxy', true, out.message || 'Launched', {
-        httpPort: Number(out.httpPort) || 80,
+        httpPort,
+        url: dokDomain ? `http://${dokDomain}${httpPort !== 80 ? `:${httpPort}` : ''}` : `http://localhost:${httpPort}`,
         portFallback: out.portFallback === true,
         portFallbackFrom: Number(out.portFallbackFrom) || 0
       });
@@ -318,7 +412,11 @@ async function configureServices(plan, log) {
           adminPassword: plan.adminPassword || defaults.adminPassword || ''
         }
       });
-      record('DNS', true, out.message || 'Launched');
+      const webPort = provider === 'adguard' ? Number(plan.dnsWebPort) || 3000 : 5380;
+      const dnsDomain = normalizeDomain(plan.dnsDomain || (primary ? `dns.${primary}` : ''));
+      record('DNS', true, out.message || 'Launched', {
+        url: dnsDomain ? `http://${dnsDomain}` : `http://localhost:${webPort}`
+      });
     } catch (e) { record('DNS', false, e.message); }
   }
 
@@ -334,8 +432,33 @@ async function configureServices(plan, log) {
           domain: normalizeDomain(plan.mailDomain || (primary ? `mail.${primary}` : ''))
         }
       });
-      record('Mailpit', true, out.message || 'Launched');
-      await dokApi('/api/core/mail/use-mailpit', { method: 'POST', body: {} }).catch(() => {});
+      const webPort = Number(plan.mailpitWebPort) || 8025;
+      const mailDomain = normalizeDomain(plan.mailDomain || (primary ? `mail.${primary}` : ''));
+      record('Mailpit', true, out.message || 'Launched', {
+        url: mailDomain ? `http://${mailDomain}` : `http://localhost:${webPort}`
+      });
+      try {
+        await dokApi('/api/core/mail/use-mailpit', { method: 'POST', body: {} });
+      } catch (e) {
+        log(`Mailpit notifier warning: ${e.message}`);
+      }
+      if (mailFrom) {
+        try {
+          const mailOut = await dokApi('/api/core/mail/smtp', {
+            method: 'POST',
+            timeout: 120000,
+            body: {
+              host: 'mailpit',
+              port: Number(plan.mailpitSmtpPort) || 1025,
+              tls: 'none',
+              username: '',
+              password: '',
+              sender: mailFrom
+            }
+          });
+          record('Mail notifier', true, mailOut.message || `Sender ${mailFrom}`);
+        } catch (e) { record('Mail notifier', false, e.message); }
+      }
     } catch (e) { record('Mailpit', false, e.message); }
   } else if (service.mail === 'stalwart') {
     try {
@@ -352,7 +475,12 @@ async function configureServices(plan, log) {
           imapsPort: Number(plan.stalwartImapsPort) || 993
         }
       });
-      record('Stalwart', true, out.message || 'Launched');
+      const webPort = Number(plan.stalwartWebPort) || 8088;
+      const mailDomain = normalizeDomain(plan.mailDomain || (primary ? `mail.${primary}` : ''));
+      record('Stalwart', true, out.message || 'Launched', {
+        url: mailDomain ? `http://${mailDomain}` : `http://localhost:${webPort}`
+      });
+      log(`Stalwart does not create mailboxes automatically; the OpenCode brief covers the sender ${mailFrom || '(not set)'} and admin mailbox setup.`);
     } catch (e) { record('Stalwart', false, e.message); }
   } else if (service.mail === 'smtp') {
     try {
@@ -365,7 +493,7 @@ async function configureServices(plan, log) {
           tls: plan.smtpTls || 'starttls',
           username: plan.smtpUser || '',
           password: plan.smtpPassword || '',
-          sender: plan.smtpFrom || ''
+          sender: plan.smtpFrom || mailFrom
         }
       });
       record('SMTP', true, out.message || 'Saved');
@@ -384,8 +512,10 @@ async function configureServices(plan, log) {
           adminPassword: plan.adminPassword || defaults.adminPassword || ''
         }
       });
-      record('Authelia', true, out.message || 'Launched');
-      if (plan.protectDok && dokDomain) {
+      record('Authelia', true, out.message || 'Launched', {
+        url: authDomain ? `https://${authDomain}` : ''
+      });
+      if ((plan.protectDok === true || defaults.protectDok === true) && dokDomain && service.proxy === 'nginx-proxy') {
         try {
           const protection = await dokApi('/api/core/authelia/dok-protection', { method: 'POST', body: { protect: true } });
           record('Authelia Dok protection', true, protection.message || 'Enabled');
@@ -407,7 +537,9 @@ async function configureServices(plan, log) {
           adminPassword: plan.adminPassword || defaults.adminPassword || ''
         }
       });
-      record('Authentik', true, out.message || 'Launched');
+      record('Authentik', true, out.message || 'Launched', {
+        url: authDomain ? `https://${authDomain}` : `http://localhost:${Number(plan.authPort) || 9000}`
+      });
     } catch (e) { record('Authentik', false, e.message); }
   }
 
@@ -470,7 +602,7 @@ async function runInstall(plan) {
     if (plan.acmeEmail) {
       settings.services.nginxProxy = {
         ...(settings.services.nginxProxy || {}),
-        acme: { enabled: true, email: plan.acmeEmail, staging: false }
+        acme: { enabled: true, email: plan.acmeEmail, staging: plan.acmeStaging === true }
       };
     }
     writeSettings(settings);
@@ -526,6 +658,8 @@ async function runInstall(plan) {
       defaults: { ...plan.defaults, adminPassword: plan.defaults.adminPassword ? '(stored in encrypted settings)' : '' },
       services: plan.services,
       selected: [...selectedServiceIds(plan)],
+      mailFrom: plan.mailFrom || plan.smtpFrom || '',
+      acmeStaging: plan.acmeStaging === true,
       registries: plan.registries.map(item => ({ kind: item.kind, provider: item.provider, name: item.name, host: item.host, username: item.username }))
     };
     const completedAt = new Date().toISOString();
@@ -540,6 +674,33 @@ async function runInstall(plan) {
       ? `http://${dokDomain}${dokHttpPort !== 80 ? `:${dokHttpPort}` : ''}`
       : `http://localhost:8080`;
     const dokRecord = { url: dokUrl, container: DOK_CONTAINER, httpPort: dokHttpPort };
+    let opencodePrompt = '';
+    try {
+      const promptDir = path.join(opencodeDir, 'prompts');
+      const promptFile = path.join(promptDir, `${installationId}.md`);
+      writePrivateFile(promptFile, buildInstallerPrompt({
+        plan: {
+          ...installationPlan,
+          dokDomain,
+          authDomain: normalizeDomain(plan.authDomain || finalSettings.services?.authelia?.domain || finalSettings.services?.authentik?.domain || (plan.defaults.primaryDomain ? `auth.${plan.defaults.primaryDomain}` : '')),
+          dnsDomain: normalizeDomain(plan.dnsDomain || finalSettings.services?.technitium?.domain || finalSettings.services?.adguard?.domain || (plan.defaults.primaryDomain ? `dns.${plan.defaults.primaryDomain}` : '')),
+          mailDomain: normalizeDomain(plan.mailDomain || finalSettings.services?.mailpit?.domain || finalSettings.services?.stalwart?.domain || (plan.defaults.primaryDomain ? `mail.${plan.defaults.primaryDomain}` : '')),
+          mailFrom: plan.mailFrom || plan.smtpFrom || finalSettings.services?.mail?.sender || '',
+          acmeEmail: plan.acmeEmail || finalSettings.services?.nginxProxy?.acme?.email || plan.defaults.adminEmail || '',
+          acmeStaging: plan.acmeStaging === true || finalSettings.services?.nginxProxy?.acme?.staging === true,
+          adminUser: plan.adminUser || finalSettings.defaults?.adminUser || plan.defaults.adminUser || 'admin',
+          adminEmail: plan.adminEmail || finalSettings.defaults?.adminEmail || plan.defaults.adminEmail || '',
+          protectDok: plan.protectDok === true || finalSettings.defaults?.protectDok === true
+        },
+        settings: finalSettings,
+        results: serviceResults,
+        dok: dokRecord
+      }));
+      opencodePrompt = promptFile;
+      log(`OpenCode integration brief written to ${promptFile}.`);
+    } catch (e) {
+      log(`OpenCode integration brief warning: ${e.message}`);
+    }
     // Write the completed record before the snapshot so restoring the initial
     // snapshot keeps the install plan, service results, and completion time.
     saveInstallation({
@@ -548,7 +709,8 @@ async function runInstall(plan) {
       summary: installationSummary(),
       completedAt,
       dok: dokRecord,
-      services: serviceResults
+      services: serviceResults,
+      opencodePrompt
     });
     const snapshot = await captureSnapshot({ reason: 'install', label: 'Initial installation snapshot' }).catch(e => {
       log(`Snapshot warning: ${e.message}`);
@@ -562,6 +724,7 @@ async function runInstall(plan) {
       completedAt,
       dok: dokRecord,
       services: serviceResults,
+      opencodePrompt,
       ...(snapshot ? { reinstall: { snapshot: snapshot.id, at: new Date().toISOString() } } : {})
     });
 
@@ -582,6 +745,7 @@ async function runInstall(plan) {
       services: serviceResults,
       warnings: failures,
       snapshot: snapshot ? snapshot.id : '',
+      opencodePrompt,
       message: resultMessage
     };
     job.running = false;

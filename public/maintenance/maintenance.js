@@ -108,6 +108,27 @@
     return data;
   }
 
+  async function apiText(path) {
+    const headers = {};
+    if (state.token) headers.authorization = `Bearer ${state.token}`;
+    const response = await fetch(path, { headers });
+    const text = await response.text();
+    if (response.status === 401) {
+      showTokenModal();
+      const error = new Error('Maintenance token required');
+      error.needsToken = true;
+      throw error;
+    }
+    if (!response.ok) {
+      let message = '';
+      try { message = JSON.parse(text).error || ''; } catch {}
+      const error = new Error(message || `Request failed (${response.status})`);
+      error.status = response.status;
+      throw error;
+    }
+    return text;
+  }
+
   async function apiForm(path, formData) {
     const headers = {};
     if (state.token) headers.authorization = `Bearer ${state.token}`;
@@ -378,6 +399,7 @@
   const SERVICE_FIELDS = {
     dokDomain: { label: 'Dok domain', placeholder: 'dok.example.com', help: 'Domain served by nginx-proxy for the Dok UI.' },
     acmeEmail: { label: 'Let\'s Encrypt email', placeholder: 'admin@example.com', help: 'Enables the acme-companion certificate service.' },
+    acmeStaging: { label: 'Use the Let\'s Encrypt staging endpoint', type: 'checkbox', help: 'Use staging while testing DNS and routing. Staging certificates are not trusted by browsers.' },
     cloudflareToken: { label: 'Cloudflare Tunnel token', type: 'password', help: 'Token from the Cloudflare Zero Trust tunnel dashboard.' },
     authDomain: { label: 'Authentication portal domain', placeholder: 'auth.example.com', help: 'Authelia/Authentik web address. Must share a parent domain with protected apps.' },
     authPort: { label: 'Authentik HTTP port', placeholder: '9000', type: 'number' },
@@ -386,6 +408,7 @@
     dnsPort: { label: 'DNS port', placeholder: '53', type: 'number' },
     dnsWebPort: { label: 'AdGuard web port', placeholder: '3000', type: 'number' },
     mailDomain: { label: 'Mail web domain', placeholder: 'mail.example.com' },
+    mailFrom: { label: 'Notification sender address', placeholder: 'authelia@example.com', help: 'Sender used for password resets and alerts. Defaults to authelia@<primary domain>.' },
     mailpitSmtpPort: { label: 'Mailpit SMTP port', placeholder: '1025', type: 'number' },
     mailpitWebPort: { label: 'Mailpit web port', placeholder: '8025', type: 'number' },
     mailpitMaxMessages: { label: 'Mailpit max messages', placeholder: '500', type: 'number' },
@@ -404,13 +427,13 @@
   };
 
   const DEFAULTS_FIELDS = [
-    { key: 'primaryDomain', label: 'Primary domain', placeholder: 'example.com', help: 'Used to suggest auth., dns., and mail. subdomains.' },
     { key: 'dokDomain', label: 'Dok domain', placeholder: 'dok.example.com', help: 'Public address for the Dok UI when nginx-proxy is used.' },
     { key: 'dataLocation', label: 'App data location (host path)', placeholder: '/srv/dok-data', help: 'Created on the host. Blank keeps Dok defaults.' },
     { key: 'dataMode', label: 'Data directory mode', placeholder: '0775' },
     { key: 'adminUser', label: 'Admin username', placeholder: 'admin' },
     { key: 'adminEmail', label: 'Admin email', placeholder: 'admin@example.com' },
     { key: 'adminPassword', label: 'Admin password', type: 'password', help: 'Seeds Authelia, Authentik, and Technitium. Stored encrypted.' },
+    { key: 'adminPasswordConfirm', label: 'Confirm admin password', type: 'password', help: 'Must match the admin password. This value is not saved.' },
     { key: 'defaultNetwork', label: 'Default Docker network', placeholder: 'wicked' }
   ];
 
@@ -471,6 +494,84 @@
     }
   }
 
+  function normalizeDomainClient(value) {
+    return String(value || '').trim().toLowerCase()
+      .replace(/^[a-z][a-z0-9+.-]*:\/\//i, '')
+      .replace(/\/.*$/, '');
+  }
+
+  function clientRegistryPresets() {
+    return Array.isArray(state.install?.registryPresets) && state.install.registryPresets.length
+      ? state.install.registryPresets
+      : [
+        { id: 'dockerhub', name: 'Docker Hub', kind: 'registry', provider: 'dockerhub', host: 'docker.io', aliases: [] },
+        { id: 'ghcr', name: 'GitHub Container Registry', kind: 'registry', provider: 'ghcr', host: 'ghcr.io', aliases: [] },
+        { id: 'gitlab-registry', name: 'GitLab Container Registry', kind: 'registry', provider: 'gitlab-registry', host: 'registry.gitlab.com', aliases: [] },
+        { id: 'quay', name: 'Quay.io', kind: 'registry', provider: 'quay', host: 'quay.io', aliases: [] },
+        { id: 'github', name: 'GitHub', kind: 'git', provider: 'github', host: 'github.com', aliases: [] },
+        { id: 'gitlab', name: 'GitLab', kind: 'git', provider: 'gitlab', host: 'gitlab.com', aliases: [] },
+        { id: 'gitea', name: 'Gitea / Forgejo', kind: 'git', provider: 'gitea', host: '', aliases: [] }
+      ];
+  }
+
+  function clientRegistryPreset(value) {
+    const query = normalizeDomainClient(value);
+    if (!query) return null;
+    return clientRegistryPresets().find(preset =>
+      preset.id === query ||
+      String(preset.name || '').toLowerCase() === query ||
+      (preset.aliases || []).includes(query) ||
+      (preset.host && normalizeDomainClient(preset.host) === query)
+    ) || null;
+  }
+
+  function clientRegistryHost(value) {
+    const preset = clientRegistryPreset(value);
+    if (preset?.host) return normalizeDomainClient(preset.host);
+    return /^[a-z0-9][a-z0-9.-]*\.[a-z0-9.-]+(?::\d+)?$/i.test(normalizeDomainClient(value)) ? normalizeDomainClient(value) : '';
+  }
+
+  function domainSuggestions() {
+    const primary = normalizeDomainClient(state.wizard?.fields.primaryDomain || '');
+    return {
+      dokDomain: primary ? `dok.${primary}` : '',
+      authDomain: primary ? `auth.${primary}` : '',
+      dnsDomain: primary ? `dns.${primary}` : '',
+      mailDomain: primary ? `mail.${primary}` : '',
+      mailFrom: primary ? `authelia@${primary}` : '',
+      smtpFrom: primary ? `authelia@${primary}` : ''
+    };
+  }
+
+  function initializeAutoDomains() {
+    const suggestions = domainSuggestions();
+    state.wizard.auto = {};
+    for (const [key, value] of Object.entries(suggestions)) {
+      state.wizard.auto[key] = state.wizard.fields[key] === value ? value : '';
+    }
+    applyPrimaryDefaults();
+  }
+
+  function applyPrimaryDefaults() {
+    if (!state.wizard) return;
+    const suggestions = domainSuggestions();
+    const previous = state.wizard.auto || {};
+    for (const [key, value] of Object.entries(suggestions)) {
+      const current = state.wizard.fields[key] || '';
+      if (!current || current === previous[key]) state.wizard.fields[key] = value;
+      state.wizard.auto[key] = value;
+    }
+  }
+
+  function updatePrimaryPreview() {
+    const node = qs('#primaryDomainPreview');
+    if (!node) return;
+    const suggestions = domainSuggestions();
+    node.innerHTML = suggestions.dokDomain
+      ? `Will suggest <span class="mono">${escapeHtml(suggestions.dokDomain)}</span>, <span class="mono">${escapeHtml(suggestions.authDomain)}</span>, <span class="mono">${escapeHtml(suggestions.dnsDomain)}</span>, and <span class="mono">${escapeHtml(suggestions.mailDomain)}</span>, plus the notification sender <span class="mono">${escapeHtml(suggestions.mailFrom)}</span>. You can adjust every value before installing.`
+      : 'Enter the domain you own. The installer will suggest Dok, authentication, DNS, and mail subdomains plus an authelia@ sender address.';
+  }
+
   function startWizard(type = 'standalone') {
     const data = state.install || {};
     const discovered = data.discovered || {};
@@ -482,19 +583,28 @@
       fields: {
         primaryDomain: discovered.primaryDomain || '',
         dokDomain: discovered.dokDomain || '',
+        authDomain: discovered.authDomain || '',
+        dnsDomain: discovered.dnsDomain || '',
+        mailDomain: discovered.mailDomain || '',
+        mailFrom: discovered.mailFrom || '',
+        acmeEmail: discovered.acmeEmail || '',
+        acmeStaging: discovered.acmeStaging === true,
         dataLocation: discovered.dataLocation || '',
         dataMode: defaults.dataMode || '0775',
         adminUser: discovered.adminUser || 'admin',
         adminEmail: discovered.adminEmail || '',
         adminPassword: '',
+        adminPasswordConfirm: '',
         defaultNetwork: defaults.defaultNetwork || 'wicked',
         allowOutsideData: defaults.allowOutsideData !== false,
         autoAppData: defaults.autoAppData !== false,
-        protectDok: false,
+        protectDok: discovered.protectDok === true,
         dataModeAllow: true
       },
+      auto: {},
       registries: []
     };
+    initializeAutoDomains();
     qs('#installLanding').classList.add('hidden');
     qs('#installProgress').classList.add('hidden');
     qs('#installResult').classList.add('hidden');
@@ -552,9 +662,12 @@
         const category = node.dataset.category;
         const option = node.dataset.option;
         wizard.services[category] = wizard.services[category] === option ? '' : option;
+        if (category === 'auth' && wizard.services.auth !== 'authelia') wizard.fields.protectDok = false;
+        if (category === 'proxy' && wizard.services.proxy !== 'nginx-proxy') wizard.fields.protectDok = false;
         renderWizard();
       });
     });
+    updatePrimaryPreview();
   }
 
   function renderTypeStep() {
@@ -570,6 +683,11 @@
           <div class="title">Dok with Core Services <span class="tag">full stack</span></div>
           <div class="desc">Pick reverse proxy, tunnel, authentication, DNS, and mail. Dok configures and starts them together. Required information cannot be skipped.</div>
         </div>
+      </div>
+      <div class="card" style="margin-top:14px;background:var(--bg-soft)">
+        <div class="card-head"><div><h3>Primary domain</h3><div class="card-note">${wizard.type === 'core' ? 'Required for a Dok with Core Services install.' : 'Optional, but it lets the installer suggest usable subdomains now.'}</div></div><span class="badge">${wizard.type === 'core' ? 'required' : 'optional'}</span></div>
+        ${fieldInput('primaryDomain', wizard.fields.primaryDomain, { label: 'Domain you own', placeholder: 'example.com', help: 'Used for dok., auth., dns., and mail. subdomains. Enter only the base domain, without a path.' })}
+        <div class="small sub" id="primaryDomainPreview" style="margin-top:8px"></div>
       </div>
       <div class="notice" style="margin-top:14px">
         The installer writes the Dok configuration, builds <span class="mono">wickedafdok:latest</span> if needed, launches Dok, then applies the selected core services through Dok's own APIs. A snapshot of the finished installation is saved for an exact reinstall.
@@ -615,15 +733,16 @@
 
   function renderDefaultsStep() {
     const wizard = state.wizard;
+    const fields = DEFAULTS_FIELDS.filter(field => field.key !== 'adminPasswordConfirm' || !!wizard.services.auth);
     return `
       <h3>Dok settings</h3>
       <div class="sub small" style="margin-bottom:14px">These values populate Dok Settings → Default settings. Secrets are encrypted before they are written.${wizard.type === 'core' ? ' Required fields for the selected core services must be filled.' : ' You can skip this step and configure these later in Dok.'}</div>
       <div class="grid two">
         <div>
-          ${DEFAULTS_FIELDS.slice(0, 4).map(field => fieldInput(field.key, wizard.fields[field.key], field)).join('')}
+          ${fields.slice(0, 4).map(field => fieldInput(field.key, wizard.fields[field.key], field)).join('')}
         </div>
         <div>
-          ${DEFAULTS_FIELDS.slice(4).map(field => fieldInput(field.key, wizard.fields[field.key], field)).join('')}
+          ${fields.slice(4).map(field => fieldInput(field.key, wizard.fields[field.key], field)).join('')}
           <label class="check" style="margin:8px 0"><input type="checkbox" id="wizAllowOutside" ${wizard.fields.allowOutsideData ? 'checked' : ''}> Allow bind paths outside the data location</label>
           <label class="check" style="margin:8px 0"><input type="checkbox" id="wizAutoAppData" ${wizard.fields.autoAppData ? 'checked' : ''}> Automatically create app data folders</label>
         </div>
@@ -632,21 +751,31 @@
 
   function renderRegistriesStep() {
     const rows = state.wizard.registries;
+    const presets = clientRegistryPresets();
     return `
       <h3>Repository connections</h3>
-      <div class="sub small" style="margin-bottom:14px">Optional. Container registry and Git host credentials are encrypted with Dok's credential key. You can add these later in Dok Settings. ${state.wizard.type === 'core' ? 'This step may be skipped.' : ''}</div>
+      <div class="sub small" style="margin-bottom:14px">Optional. Start with the name; the installer fills the address and provider. Test each connection before installing. Credentials are encrypted with Dok's credential key and can also be added later in Dok Settings. ${state.wizard.type === 'core' ? 'This step may be skipped.' : ''}</div>
+      <datalist id="registryNameOptions">
+        ${presets.map(preset => `<option value="${escapeHtml(preset.name)}">${escapeHtml(preset.host || 'Enter your Gitea/Forgejo address')}</option>`).join('')}
+      </datalist>
       <div class="stack" id="registryRows">
         ${rows.map((row, index) => `
-          <div class="list-row" data-registry-row="${index}">
-            <div class="grid" style="flex:1;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px">
-              <select class="select" data-registry="${index}" data-key="kind">
-                <option value="registry" ${row.kind !== 'git' ? 'selected' : ''}>Container registry</option>
-                <option value="git" ${row.kind === 'git' ? 'selected' : ''}>Git host</option>
-              </select>
-              <input class="input" data-registry="${index}" data-key="host" value="${escapeHtml(row.host)}" placeholder="registry.example.com">
-              <input class="input" data-registry="${index}" data-key="name" value="${escapeHtml(row.name)}" placeholder="Name">
-              <input class="input" data-registry="${index}" data-key="username" value="${escapeHtml(row.username)}" placeholder="Username">
-              <input class="input" type="password" data-registry="${index}" data-key="secret" value="${escapeHtml(row.secret)}" placeholder="Token / password">
+          <div class="list-row" data-registry-row="${index}" style="align-items:flex-start">
+            <div style="flex:1">
+              <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px">
+                <input class="input" list="registryNameOptions" data-registry="${index}" data-key="name" value="${escapeHtml(row.name)}" placeholder="Docker Hub">
+                <select class="select" data-registry="${index}" data-key="kind">
+                  <option value="registry" ${row.kind !== 'git' ? 'selected' : ''}>Container registry</option>
+                  <option value="git" ${row.kind === 'git' ? 'selected' : ''}>Git host</option>
+                </select>
+                <input class="input" data-registry="${index}" data-key="host" value="${escapeHtml(row.host)}" placeholder="Autofilled from name or registry.example.com">
+                <input class="input" data-registry="${index}" data-key="username" value="${escapeHtml(row.username)}" placeholder="Username">
+                <input class="input" type="password" data-registry="${index}" data-key="secret" value="${escapeHtml(row.secret)}" placeholder="Token / password">
+              </div>
+              <div class="row" style="margin-top:6px;gap:8px">
+                <button class="btn sm" data-registry-test="${index}">Test connection</button>
+                <span class="small sub" data-registry-status="${index}">${row.status ? escapeHtml(row.status) : ''}</span>
+              </div>
             </div>
             <button class="btn sm danger" data-registry-remove="${index}">Remove</button>
           </div>`).join('')}
@@ -669,13 +798,18 @@
           <div>${selected.length ? selected.map(([, value]) => `<span class="badge ok" style="margin:2px 4px 2px 0">${escapeHtml(value)}</span>`).join('') : '<span class="sub">None</span>'}</div>
           <div class="divider"></div>
           <div class="stat-label">Registries</div>
-          <div>${registries.length ? registries.map(row => `<div class="small">${escapeHtml(row.name || row.host)} <span class="sub">(${escapeHtml(row.kind)})</span></div>`).join('') : '<span class="sub">None</span>'}</div>
+          <div>${registries.length ? registries.map(row => `<div class="small">${escapeHtml(row.name || row.host)} <span class="sub">(${escapeHtml(row.provider || row.kind)}, ${escapeHtml(row.host)})</span></div>`).join('') : '<span class="sub">None</span>'}</div>
         </div>
         <div class="card" style="background:var(--bg-soft)">
           <div class="stat-label">Domains</div>
           <div class="kv small" style="grid-template-columns:110px 1fr;margin-top:6px">
             <dt>Primary</dt><dd>${escapeHtml(wizard.fields.primaryDomain || '-')}</dd>
             <dt>Dok</dt><dd>${escapeHtml(wizard.fields.dokDomain || '-')}</dd>
+            <dt>Auth</dt><dd>${escapeHtml(wizard.fields.authDomain || '-')}</dd>
+            <dt>DNS</dt><dd>${escapeHtml(wizard.fields.dnsDomain || '-')}</dd>
+            <dt>Mail</dt><dd>${escapeHtml(wizard.fields.mailDomain || '-')}</dd>
+            ${wizard.services.mail ? `<dt>Sender</dt><dd>${escapeHtml(wizard.fields.mailFrom || wizard.fields.smtpFrom || '-')}</dd>` : ''}
+            ${wizard.services.proxy === 'nginx-proxy' ? `<dt>TLS</dt><dd>${escapeHtml(wizard.fields.acmeEmail ? `ACME${wizard.fields.acmeStaging ? ' staging' : ''}` : 'Manual certificates')}</dd>` : ''}
             <dt>Data path</dt><dd>${escapeHtml(wizard.fields.dataLocation || 'Dok default')}</dd>
             <dt>Admin</dt><dd>${escapeHtml(wizard.fields.adminUser || 'admin')} ${wizard.fields.adminEmail ? `· ${escapeHtml(wizard.fields.adminEmail)}` : ''}</dd>
             <dt>Network</dt><dd>${escapeHtml(wizard.fields.defaultNetwork || 'wicked')}</dd>
@@ -689,18 +823,106 @@
       </div>`;
   }
 
+  function syncRegistryName(row) {
+    const preset = clientRegistryPreset(row.name);
+    if (preset) {
+      row.kind = preset.kind;
+      row.provider = preset.provider;
+    }
+    const host = preset?.host ? normalizeDomainClient(preset.host) : clientRegistryHost(row.name);
+    if (host && (!row.host || row.host === row.autoHost)) row.host = host;
+    row.autoHost = host || row.autoHost || '';
+  }
+
+  function syncRegistryHost(row) {
+    const host = normalizeDomainClient(row.host);
+    const preset = clientRegistryPreset(host);
+    if (preset) {
+      row.kind = preset.kind;
+      row.provider = preset.provider;
+      if (!row.name || clientRegistryPreset(row.name)) row.name = preset.name;
+    } else {
+      row.provider = 'custom';
+    }
+    row.autoHost = host;
+  }
+
+  function syncRegistryRowFields(index) {
+    const row = state.wizard?.registries?.[index];
+    const rowNode = qs(`[data-registry-row="${index}"]`);
+    if (!row || !rowNode) return;
+    const hostInput = qs('[data-key="host"]', rowNode);
+    const kindInput = qs('[data-key="kind"]', rowNode);
+    if (hostInput) hostInput.value = row.host || '';
+    if (kindInput) kindInput.value = row.kind === 'git' ? 'git' : 'registry';
+  }
+
+  async function testRegistryRow(index) {
+    const row = state.wizard?.registries?.[index];
+    if (!row) return;
+    const button = qs(`[data-registry-test="${index}"]`);
+    const status = qs(`[data-registry-status="${index}"]`);
+    const setStatus = (text, kind = '') => {
+      row.status = text;
+      if (status) {
+        status.textContent = text;
+        status.className = `small ${kind === 'ok' ? 'ok' : kind === 'bad' ? 'danger' : 'sub'}`;
+      }
+    };
+    if (!row.host) { setStatus('Enter an address first.', 'bad'); return; }
+    if (button) button.disabled = true;
+    setStatus('Testing...');
+    try {
+      const result = await api('/api/registries/test', {
+        method: 'POST',
+        body: { kind: row.kind, provider: row.provider, name: row.name, host: row.host, username: row.username, secret: row.secret }
+      });
+      if (result.kind) row.kind = result.kind;
+      if (result.provider) row.provider = result.provider;
+      syncRegistryRowFields(index);
+      row.tested = true;
+      setStatus(result.message || 'Connection OK.', 'ok');
+    } catch (e) {
+      row.tested = false;
+      setStatus(e.message, 'bad');
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
   document.addEventListener('input', event => {
     const field = event.target.closest('[data-field]');
     if (field && state.wizard) {
       const key = field.dataset.field;
       state.wizard.fields[key] = field.type === 'checkbox' ? field.checked : field.value;
+      if (key === 'primaryDomain') {
+        applyPrimaryDefaults();
+        updatePrimaryPreview();
+      }
       return;
     }
     const registry = event.target.closest('[data-registry]');
     if (registry && state.wizard) {
       const index = Number(registry.dataset.registry);
       const key = registry.dataset.key;
-      if (state.wizard.registries[index]) state.wizard.registries[index][key] = registry.value;
+      const row = state.wizard.registries[index];
+      if (row) {
+        row[key] = registry.value;
+        row.tested = false;
+        row.status = '';
+        const statusNode = qs(`[data-registry-status="${index}"]`);
+        if (statusNode) { statusNode.textContent = ''; statusNode.className = 'small sub'; }
+        if (key === 'name') {
+          syncRegistryName(row);
+          syncRegistryRowFields(index);
+        } else if (key === 'host') {
+          syncRegistryHost(row);
+          const nameInput = qs('[data-key="name"]', qs(`[data-registry-row="${index}"]`));
+          const kindInput = qs('[data-key="kind"]', qs(`[data-registry-row="${index}"]`));
+          if (nameInput) nameInput.value = row.name || '';
+          if (kindInput) kindInput.value = row.kind === 'git' ? 'git' : 'registry';
+        }
+      }
     }
   });
   document.addEventListener('change', event => {
@@ -709,13 +931,29 @@
     const registry = event.target.closest('[data-registry]');
     if (registry && state.wizard) {
       const index = Number(registry.dataset.registry);
-      if (state.wizard.registries[index]) state.wizard.registries[index][registry.dataset.key] = registry.value;
+      const row = state.wizard.registries[index];
+      if (row) {
+        row[registry.dataset.key] = registry.value;
+        row.tested = false;
+        row.status = '';
+        if (registry.dataset.key === 'kind') {
+          const preset = clientRegistryPreset(row.name);
+          row.provider = preset && preset.kind === row.kind ? preset.provider : 'custom';
+          const status = qs(`[data-registry-status="${index}"]`);
+          if (status) { status.textContent = ''; status.className = 'small sub'; }
+        }
+      }
     }
   });
   document.addEventListener('click', event => {
     if (event.target.id === 'registryAdd' && state.wizard) {
-      state.wizard.registries.push({ kind: 'registry', provider: 'custom', name: '', host: '', username: '', secret: '' });
+      state.wizard.registries.push({ kind: 'registry', provider: 'custom', name: '', host: '', username: '', secret: '', autoHost: '', status: '' });
       qs('#wizardBody').innerHTML = renderRegistriesStep();
+    }
+    const test = event.target.closest('[data-registry-test]');
+    if (test && state.wizard) {
+      testRegistryRow(Number(test.dataset.registryTest));
+      return;
     }
     const remove = event.target.closest('[data-registry-remove]');
     if (remove && state.wizard) {
@@ -728,15 +966,26 @@
     const wizard = state.wizard;
     const steps = wizardSteps();
     const stepName = steps[wizard.step - 1];
+    if (stepName === 'Type') {
+      const primary = normalizeDomainClient(wizard.fields.primaryDomain);
+      if (wizard.type === 'core' && !primary) return 'Enter the primary domain you own before continuing.';
+      if (primary && !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/.test(primary)) return 'The primary domain is invalid. Enter a base domain such as example.com.';
+    }
     if (stepName === 'Core services') {
       const count = Object.values(wizard.services).filter(Boolean).length;
       if (!count) return 'Select at least one core service, or switch to Standalone Dok.';
       if (wizard.services.proxy === 'nginx-proxy' && !wizard.fields.dokDomain) return 'Enter the Dok domain for nginx-proxy in this step.';
+      const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (wizard.fields.acmeEmail && !emailPattern.test(wizard.fields.acmeEmail)) return 'The Let\'s Encrypt email is invalid.';
+      if (wizard.fields.mailFrom && !emailPattern.test(wizard.fields.mailFrom)) return 'The notification sender address is invalid.';
+      if (wizard.fields.smtpFrom && !emailPattern.test(wizard.fields.smtpFrom)) return 'The SMTP sender address is invalid.';
     }
     if (stepName === 'Dok settings') {
       if (wizard.type === 'core') {
         if (wizard.services.proxy === 'nginx-proxy' && !wizard.fields.dokDomain) return 'A Dok domain is required when nginx-proxy is selected.';
         if (wizard.services.auth && !wizard.fields.adminPassword) return 'The authentication service requires an admin password.';
+        if (wizard.services.auth && String(wizard.fields.adminPassword).length < 8) return 'Use an admin password with at least 8 characters.';
+        if (wizard.services.auth && wizard.fields.adminPasswordConfirm !== wizard.fields.adminPassword) return 'The admin password confirmation does not match.';
         if (wizard.services.auth && !wizard.fields.authDomain) return 'The authentication portal domain is required.';
         if (wizard.services.tunnel === 'cloudflared' && !wizard.fields.cloudflareToken) return 'A Cloudflare Tunnel token is required.';
         if (wizard.services.mail === 'smtp' && (!wizard.fields.smtpHost || !wizard.fields.smtpFrom)) return 'SMTP host and sender address are required.';
@@ -745,6 +994,10 @@
       if (wizard.fields.dataLocation && !wizard.fields.dataLocation.startsWith('/')) return 'The data location must be an absolute host path.';
       if (wizard.fields.dataMode && !/^0?[0-7]{3,4}$/.test(wizard.fields.dataMode)) return 'Data directory mode must be octal, for example 0775.';
       if (wizard.fields.adminEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(wizard.fields.adminEmail)) return 'Admin email is invalid.';
+      for (const [key, label] of [['dokDomain', 'Dok domain'], ['authDomain', 'authentication domain'], ['dnsDomain', 'DNS domain'], ['mailDomain', 'mail domain']]) {
+        const value = normalizeDomainClient(wizard.fields[key]);
+        if (value && !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/.test(value)) return `The ${label} is invalid.`;
+      }
     }
     return '';
   }
@@ -835,21 +1088,23 @@
         adminEmail: wizard.fields.adminEmail || '',
         adminPassword: wizard.fields.adminPassword || '',
         defaultNetwork: wizard.fields.defaultNetwork || 'wicked',
-        protectDok: !!wizard.fields.protectDok
+        protectDok: wizard.services.auth === 'authelia' && wizard.services.proxy === 'nginx-proxy' && !!wizard.fields.protectDok
       },
       services: { ...wizard.services },
       dokDomain: wizard.fields.dokDomain || '',
       acmeEmail: wizard.fields.acmeEmail || '',
+      acmeStaging: wizard.fields.acmeStaging === true,
       authDomain: wizard.fields.authDomain || '',
       adminUser: wizard.fields.adminUser || 'admin',
       adminEmail: wizard.fields.adminEmail || '',
       adminPassword: wizard.fields.adminPassword || '',
       authPort: wizard.fields.authPort || '',
-      protectDok: !!wizard.fields.protectDok,
+      protectDok: wizard.services.auth === 'authelia' && wizard.services.proxy === 'nginx-proxy' && !!wizard.fields.protectDok,
       dnsDomain: wizard.fields.dnsDomain || '',
       dnsPort: wizard.fields.dnsPort || '',
       dnsWebPort: wizard.fields.dnsWebPort || '',
       mailDomain: wizard.fields.mailDomain || '',
+      mailFrom: wizard.fields.mailFrom || '',
       mailpitSmtpPort: wizard.fields.mailpitSmtpPort || '',
       mailpitWebPort: wizard.fields.mailpitWebPort || '',
       mailpitMaxMessages: wizard.fields.mailpitMaxMessages || '',
@@ -868,7 +1123,7 @@
       cloudflareToken: wizard.fields.cloudflareToken || '',
       registries: wizard.registries.filter(row => row.host).map(row => ({
         kind: row.kind === 'git' ? 'git' : 'registry',
-        provider: row.kind === 'git' ? 'custom' : 'custom',
+        provider: row.provider || (row.kind === 'git' ? 'custom' : 'custom'),
         name: row.name || '',
         host: row.host,
         username: row.username || '',
@@ -1347,17 +1602,26 @@
   qs('#openOpencodeBtn').addEventListener('click', () => openTerminal('opencode'));
   qs('#openAssistBtn').addEventListener('click', () => openMaintenanceOpenCode());
 
-  function openMaintenanceOpenCode() {
-    const description = state.install?.installation?.saved?.plan
-      ? `The saved installation plan is ${JSON.stringify(state.install.installation.saved.plan)}.`
-      : 'Dok is being installed or maintained.';
-    const prompt = [
-      'You are the Dok Maintenance configuration assistant.',
-      description,
-      'Read /dok/AGENTS.md first. Inspect the current /dok/data/settings.json (values are decrypted only through the Dok API; do not print secrets), the generated core service composes under /dok/core, and the running containers.',
-      'Verify that the selected core services work together: nginx-proxy domains and certificates, Authelia/Authentik portals and cookie domains, DNS ports, and mail delivery. Use the Dok API at http://wickedafdok:8080 where possible and verify with docker compose and curl.',
-      'Make the smallest safe changes, preserve app data, and report what you changed and any remaining manual steps.'
-    ].join('\n');
+  async function openMaintenanceOpenCode() {
+    let prompt = '';
+    try {
+      prompt = (await apiText('/api/install/opencode-prompt')).trim();
+    } catch (e) {
+      if (e.needsToken) return;
+      toast(e.message, 'error');
+    }
+    if (!prompt) {
+      const description = state.install?.installation?.saved?.plan
+        ? `The saved installation plan is ${JSON.stringify(state.install.installation.saved.plan)}.`
+        : 'Dok is being installed or maintained.';
+      prompt = [
+        'You are the Dok Maintenance configuration assistant.',
+        description,
+        'Read /dok/AGENTS.md first. Inspect the current /dok/data/settings.json (values are decrypted only through the Dok API; do not print secrets), the generated core service composes under /dok/core, and the running containers.',
+        'Verify that the selected core services work together: nginx-proxy domains and certificates, Authelia/Authentik portals and cookie domains, DNS ports, and mail delivery. Use the Dok API at http://wickedafdok:8080 where possible and verify with docker compose and curl.',
+        'Make the smallest safe changes, preserve app data, and report what you changed and any remaining manual steps.'
+      ].join('\n');
+    }
     openTerminal('opencode', prompt);
   }
 

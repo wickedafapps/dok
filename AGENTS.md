@@ -371,7 +371,8 @@ The **Core Services** subtab manages installed bundled services. Installation no
 - Separate privileged container `wickedafdok-maintenance` built from the same image, started by `setup.sh`, by Dok's **Settings → Maintenance** tab, or on demand when a host directory must be created. It replaces the Host Helper (its socket/token remain compatible) and is managed from `maintenance/docker-compose.yml` or the generated copy at `data/wickedafdok/maintenance/docker-compose.yml`.
 - Web UI/API on port `8090` (browser entry `/?token=<data/.maintenance-token>`). API routes require the token when `MAINTENANCE_REQUIRE_TOKEN=1`; `/api/health` and static files are public. WS uses `?token=`.
 - Persistent state lives in `maintenance-data/` (never inside `data/`, never exported with apps): `installation.json`, `installation-state.json`, snapshots, backups, OpenCode state, logs. The installer records the sanitized Dok installation state and takes a snapshot when Maintenance opens, after install/update/backup, and on request; reinstall restores the newest snapshot, starts Dok, and starts every installed core service.
-- Installer types are **Standalone Dok** (defaults/registrations may be skipped) and **Dok with Core Services** (choose at most one option per core category; required fields are enforced). It writes Dok settings/registries, launches Dok from the root compose, configures selected core services through Dok's APIs (nginx-proxy, cloudflared, Authentik, Authelia, DNS, Mailpit/Stalwart, SMTP), writes `data/wickedafdok/installation-compose.yml` with Dok plus every installed core service, and saves the record. OpenCode Admin is available inside Maintenance to reconcile the selected stack.
+- Installer types are **Standalone Dok** (defaults/registrations may be skipped) and **Dok with Core Services** (choose at most one option per core category; required fields are enforced). The primary domain is requested first and fills `dok.`, `auth.`, `dns.`, and `mail.` subdomains plus the `authelia@<primary>` sender; every value stays editable. Repository connections lead with the name, autofill the preset address (or custom host), and can be tested with `POST /api/registries/test` before saving. The installer writes Dok settings/registries, launches Dok from the root compose, configures selected core services through Dok's APIs (nginx-proxy, cloudflared, Authentik, Authelia, DNS, Mailpit/Stalwart, SMTP), wires Mailpit's sender explicitly, applies ACME staging, writes `data/wickedafdok/installation-compose.yml` with Dok plus every installed core service, and saves the record. Dok protection is forced off unless Authelia and nginx-proxy are both selected. OpenCode Admin is available inside Maintenance to reconcile the selected stack.
+- The installer writes an integration brief under `maintenance-data/opencode/prompts/<installation>.md` and stores its path as `opencodePrompt`; `GET /api/install/opencode-prompt` serves it (or regenerates it). The brief contains the selected service wiring matrix, expected nginx routes, current non-secret settings, launch results, per-service integration tasks (TLS/ACME staging, Authelia notifier and sender, DNS, Mailpit/Stalwart mailboxes, tunnel routes), port checks, and verification commands. Secrets are never included.
 - Built-in tools cover overview/containers, app deploy/start/stop/restart proxying, backups/snapshots/import/export, updates (git pull/build/recreate then refresh Maintenance), diagnostics/repair, logs, terminal shells, and OpenCode Admin. Admin OpenCode is rejected in the Dok container (`409`); Dok UI buttons open Maintenance instead. User-mode OpenCode remains available in Dok.
 - `setup.sh` takes host ownership as before, builds `wickedafdok:latest` (set `SKIP_BUILD=1` to skip), creates `data/.maintenance-token`, creates `maintenance-data/`, starts the Maintenance compose with host checkout/socket mounts, and prints its token URL. `maintenance-data/` is mode `700`.
 
@@ -505,6 +506,9 @@ The **Core Services** subtab manages installed bundled services. Installation no
 - `GET /api/maintenance` - Maintenance container status, token URL, port, and compose path
 - `POST /api/maintenance/start|stop|mode` - Start/stop Maintenance or toggle maintenance mode (`{ active }`) and start Dok when leaving
 - `GET /api/installation` / `POST /api/installation/sync` - Read or write the sanitized `data/installation-state.json` snapshot used by Maintenance
+- `GET /api/install` / `POST /api/install/validate` / `POST /api/install/run` - Maintenance installer state, plan validation, and installation job (Maintenance API)
+- `GET /api/install/opencode-prompt` - Serve the saved installation integration brief or regenerate it from the saved plan/settings
+- `POST /api/registries/test` - Test a registry login or git host before the installer saves the connection
 - `GET /api/maintenance` also backs the Settings → Maintenance card; Admin OpenCode is rejected in Dok with `409`
 
 ### Core Services
@@ -807,32 +811,16 @@ The **Core Services** subtab manages installed bundled services. Installation no
 
 ##------------------------------------------Your current task--------------------------------------
 
-New Admin/Maintenance Section/Container
-
-Create an app that runs in it's own container for Dok maintenance and management. It will be multipurpose and manage Installation, Updates, Upgrades, Backups, Troubleshooting, Repairs and be the Admin over the whole containerverse.
-The Dok Maintenance container replaces and takes over the functions of the Host Helper.
-This container will only run when Maintenance Mode is activated, when triggered by Host Helper functions or when launched by the user for installation etc..
-It will have built in opencode and contain tools for troubleshooting and repairing the Dok installation
-It should have a persistent storage location that is kept seperate from everything for safety. It will use that location to store the details of the Dok installation and everything needed to repair and restore the installation if needed. Whith these files an exact reinstall can be done without the user having to re-enter any information. 
-The installation information should be updated with every change, app creation etc.. to keep it up to date.
-The backup and update section will be moved to this container. Admin Opencode can only be run from this container. 
-A tag should be added automatically to all apps created by Dok to ensure all their info is available to the maintenanca container.
-
-Dok Installation:
-When the container is launched and no Dok container exists it will check it's persistent storage for previous installation data. If none is found it will assume Installation and present the start installation button. It will have another button in the bottom corner for maintenance mode in case the installation wasn't auto detected.  
-Core Services will now only be installed here to make the whole setup more stable. The user can pick what services they want and this installer will make a single compose file for the Dok app that includes all selected Core Services. The Core Services section currently in dok will now only show the installed core services with the same options it does now but the install mode will be gone.
+These changes have been started but are incomplete.
 
 
+Maintenance Container:
+  The installer needs to take the information, settings, services the user entered and create a prompt for opencode to configure all the containers to work together. It needs configure settings for each service to work with each other service out of the box. Creating the most stable and functional install.
 
-The current setup.sh will now launch this container with sudo allowing the Maintenance Apps GUI installation to setup the host and install and launch Dok.
-Once the apps GUI is available in the users web browser they can select to start the installation. 
- Installation Steps:
-  1. Installation type - Choices will be "Standalone Dok" and "Dok with Core Services". 
-      "Standalone Dok" Guides the user to filling out the fields from Dok Settings/default settings. Then Repository connections. Both sections can be skipped by the user. The installer then launches the dok app with the needed settings, configurations and permissions. When done it points the user to the apps URL, Saves the install configuration and informs the user of how to activate maintenance mode, and displays a button to shutdown the installation container.
-     
-      "Dok with Core Serrvices" Guides the user through selecting Core services. Explains what each service does and if there are multiple options in that service category it lets them select one. Then it guides them through filling out the fields from Dok Settings/default settings and any other information needed for the Core Services they selected. The installer then launches the dok app and configures and starts the Core Services they selected with the needed settings, configurations and permissions. When done it points the user to the apps URL, Has a button to save the install configuration and displays a button to shutdown the installation container. Steps can not be skipped for this installation type because of required information.
-	  
-The installer should have opencode built in for configuring Dok with the selected Core Services. Opencode should take the information provided by the user and configure the selected Core Services to work together making all configurations needed for them to function as a single server.
+  The registry section should put the registry name before the address and autofill the address based on the name. There needs to be a test button to test each service before saving.
 
-Review all code for errors, loose ends etc..
-Push to github
+  Ask for the primary domain at the start of the installation and autofill any domain fields with defaults such as auth.domain.name and dok.domain.name
+
+  If any other information is needed from the user to make a better mmore functional install, add the needed fields for the user to fill in the information.
+
+Review all code and push to github

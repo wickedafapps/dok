@@ -40,6 +40,7 @@ export const tokenPath = process.env.MAINTENANCE_TOKEN_FILE || path.join(dataDir
 
 export function ensureDirs() {
   for (const dir of [MAINT_DATA, backupsDir, snapshotsDir, logsDir, opencodeDir,
+    path.join(MAINT_DATA, 'tmp'),
     path.join(opencodeDir, 'home'), path.join(opencodeDir, 'config'),
     path.join(opencodeDir, 'state'), path.join(opencodeDir, 'data'), path.join(opencodeDir, 'cache')]) {
     fs.mkdirSync(dir, { recursive: true });
@@ -505,7 +506,7 @@ export const CORE_CATEGORIES = [
         label: 'nginx-proxy',
         description: 'Virtual-host reverse proxy with optional Let\'s Encrypt certificates.',
         requiredFields: ['dokDomain'],
-        fields: ['dokDomain', 'acmeEmail']
+        fields: ['dokDomain', 'acmeEmail', 'acmeStaging']
       }
     ]
   },
@@ -571,13 +572,13 @@ export const CORE_CATEGORIES = [
         id: 'mailpit',
         label: 'Mailpit (test sink)',
         description: 'Captures mail locally so you can inspect password resets and alerts.',
-        fields: ['mailDomain', 'mailpitSmtpPort', 'mailpitWebPort', 'mailpitMaxMessages']
+        fields: ['mailDomain', 'mailFrom', 'mailpitSmtpPort', 'mailpitWebPort', 'mailpitMaxMessages']
       },
       {
         id: 'stalwart',
         label: 'Stalwart Mail Server',
         description: 'Full IMAP/JMAP/SMTP mail server with a web admin.',
-        fields: ['mailDomain', 'stalwartAdminUser', 'stalwartAdminPassword', 'stalwartWebPort', 'stalwartSmtpPort', 'stalwartSubmissionPort', 'stalwartImapsPort']
+        fields: ['mailDomain', 'mailFrom', 'stalwartAdminUser', 'stalwartAdminPassword', 'stalwartWebPort', 'stalwartSmtpPort', 'stalwartSubmissionPort', 'stalwartImapsPort']
       },
       {
         id: 'smtp',
@@ -591,6 +592,41 @@ export const CORE_CATEGORIES = [
 ];
 
 export const SERVICE_OPTION_IDS = new Set(CORE_CATEGORIES.flatMap(category => category.options.map(option => option.id)));
+
+export const REGISTRY_PRESETS = [
+  { id: 'dockerhub', name: 'Docker Hub', kind: 'registry', provider: 'dockerhub', host: 'docker.io', aliases: ['docker', 'dockerhub', 'docker hub'] },
+  { id: 'ghcr', name: 'GitHub Container Registry', kind: 'registry', provider: 'ghcr', host: 'ghcr.io', aliases: ['ghcr', 'github packages', 'github container registry'] },
+  { id: 'gitlab-registry', name: 'GitLab Container Registry', kind: 'registry', provider: 'gitlab-registry', host: 'registry.gitlab.com', aliases: ['gitlab registry', 'gitlab container registry'] },
+  { id: 'quay', name: 'Quay.io', kind: 'registry', provider: 'quay', host: 'quay.io', aliases: ['quay', 'quay.io'] },
+  { id: 'github', name: 'GitHub', kind: 'git', provider: 'github', host: 'github.com', aliases: ['github.com'] },
+  { id: 'gitlab', name: 'GitLab', kind: 'git', provider: 'gitlab', host: 'gitlab.com', aliases: ['gitlab.com'] },
+  { id: 'gitea', name: 'Gitea / Forgejo', kind: 'git', provider: 'gitea', host: '', aliases: ['gitea', 'forgejo', 'gitea / forgejo'] }
+];
+
+export function normalizeRegistryHost(value) {
+  return String(value || '').trim()
+    .replace(/^[a-z][a-z0-9+.-]*:\/\//i, '')
+    .replace(/\/.*$/, '')
+    .toLowerCase();
+}
+
+export function registryPresetFor(value) {
+  const query = String(value || '').trim().toLowerCase();
+  if (!query) return null;
+  return REGISTRY_PRESETS.find(preset =>
+    preset.id === query ||
+    preset.name.toLowerCase() === query ||
+    preset.aliases.includes(query)
+  ) || null;
+}
+
+export function registryHostForName(value) {
+  const preset = registryPresetFor(value);
+  if (preset?.host) return preset.host;
+  const host = normalizeRegistryHost(value);
+  return /^[a-z0-9][a-z0-9.-]*\.[a-z0-9.-]+(?::\d+)?$/i.test(host) ? host : '';
+}
+
 
 export function selectedServiceIds(plan = {}) {
   const services = plan.services && typeof plan.services === 'object' ? plan.services : {};
@@ -617,27 +653,39 @@ export function normalizeInstallPlan(body = {}) {
   const plan = {
     type,
     defaults: {
-      primaryDomain: normalizeDomain(defaults.primaryDomain || ''),
-      dokDomain: normalizeDomain(defaults.dokDomain || ''),
+      primaryDomain: normalizeDomain(defaults.primaryDomain || body.primaryDomain || '').toLowerCase(),
+      dokDomain: normalizeDomain(defaults.dokDomain || '').toLowerCase(),
       dataLocation: String(defaults.dataLocation || '').trim(),
       dataMode: String(defaults.dataMode || '0775').trim(),
       allowOutsideData: defaults.allowOutsideData !== false,
       autoAppData: defaults.autoAppData !== false,
-      adminUser: String(defaults.adminUser || 'admin').trim() || 'admin',
-      adminEmail: String(defaults.adminEmail || '').trim(),
+      adminUser: String(defaults.adminUser || body.adminUser || 'admin').trim() || 'admin',
+      adminEmail: String(defaults.adminEmail || body.adminEmail || '').trim(),
       adminPassword: String(defaults.adminPassword || ''),
       defaultNetwork: String(defaults.defaultNetwork || DEFAULT_NETWORK).trim() || DEFAULT_NETWORK,
       protectDok: defaults.protectDok === true
     },
     services: {},
-    registries: registries.map(item => ({
-      kind: item.kind === 'git' ? 'git' : 'registry',
-      provider: String(item.provider || 'custom').trim(),
-      name: String(item.name || '').trim(),
-      host: String(item.host || '').trim(),
-      username: String(item.username || '').trim(),
-      secret: String(item.secret || '')
-    })).filter(item => item.host),
+    registries: registries.map(item => {
+      const itemHost = normalizeRegistryHost(item.host);
+      const hostPreset = REGISTRY_PRESETS.find(entry => entry.host && entry.host === itemHost);
+      const namePreset = registryPresetFor(item.name || '');
+      // A manually entered address wins over the name preset so changing the
+      // host to GHCR does not keep Docker Hub's provider metadata.
+      const preset = hostPreset || (itemHost ? null : namePreset);
+      const kind = item.kind === 'git' || item.kind === 'registry'
+        ? item.kind
+        : (preset?.kind || namePreset?.kind || 'registry');
+      const host = itemHost || normalizeRegistryHost(preset?.host || registryHostForName(item.name));
+      return {
+        kind,
+        provider: String(hostPreset?.provider || item.provider || preset?.provider || 'custom').trim(),
+        name: String(hostPreset && (!item.name || namePreset) ? hostPreset.name : item.name || preset?.name || host).trim(),
+        host,
+        username: String(item.username || '').trim(),
+        secret: String(item.secret || '')
+      };
+    }).filter(item => item.host),
     metadata: body.metadata && typeof body.metadata === 'object' ? body.metadata : {}
   };
   for (const category of CORE_CATEGORIES) {
@@ -653,15 +701,47 @@ export function normalizeInstallPlan(body = {}) {
   }
   // Copy raw service form fields used by the installer.
   for (const field of [
-    'cloudflareToken', 'dokDomain', 'acmeEmail', 'authDomain', 'adminUser', 'adminEmail',
-    'adminPassword', 'authPort', 'protectDok', 'dnsProvider', 'dnsDomain', 'dnsPort',
-    'dnsWebPort', 'mailDomain', 'mailpitSmtpPort', 'mailpitWebPort', 'mailpitMaxMessages',
-    'stalwartAdminUser', 'stalwartAdminPassword', 'stalwartWebPort', 'stalwartSmtpPort',
-    'stalwartSubmissionPort', 'stalwartImapsPort', 'smtpHost', 'smtpPort', 'smtpTls',
-    'smtpUser', 'smtpPassword', 'smtpFrom'
+    'cloudflareToken', 'dokDomain', 'acmeEmail', 'acmeStaging', 'authDomain', 'adminUser',
+    'adminEmail', 'adminPassword', 'authPort', 'protectDok', 'dnsProvider', 'dnsDomain',
+    'dnsPort', 'dnsWebPort', 'mailDomain', 'mailFrom', 'mailpitSmtpPort', 'mailpitWebPort',
+    'mailpitMaxMessages', 'stalwartAdminUser', 'stalwartAdminPassword', 'stalwartWebPort',
+    'stalwartSmtpPort', 'stalwartSubmissionPort', 'stalwartImapsPort', 'smtpHost', 'smtpPort',
+    'smtpTls', 'smtpUser', 'smtpPassword', 'smtpFrom'
   ]) {
     if (body[field] === undefined) continue;
     plan[field] = body[field];
+  }
+  const primary = plan.defaults.primaryDomain;
+  if (!plan.defaults.adminUser && plan.adminUser) plan.defaults.adminUser = plan.adminUser;
+  if (!plan.defaults.adminEmail && plan.adminEmail) plan.defaults.adminEmail = plan.adminEmail;
+  if (!plan.dokDomain && plan.defaults.dokDomain) plan.dokDomain = plan.defaults.dokDomain;
+  if (primary) {
+    if (plan.services.proxy === 'nginx-proxy' && !plan.dokDomain) plan.dokDomain = `dok.${primary}`;
+    if (plan.services.auth && !plan.authDomain) plan.authDomain = `auth.${primary}`;
+    if (plan.services.dns && !plan.dnsDomain) plan.dnsDomain = `dns.${primary}`;
+    if (plan.services.mail && !plan.mailDomain) plan.mailDomain = `mail.${primary}`;
+    if (plan.services.mail && !plan.mailFrom) plan.mailFrom = `authelia@${primary}`;
+    if (plan.services.mail === 'smtp' && !plan.smtpFrom) plan.smtpFrom = plan.mailFrom || `authelia@${primary}`;
+  }
+  if (plan.services.proxy === 'nginx-proxy' && !plan.acmeEmail && plan.defaults.adminEmail) {
+    plan.acmeEmail = plan.defaults.adminEmail;
+  }
+  plan.acmeStaging = plan.acmeStaging === true || plan.acmeStaging === 'true';
+  // Dok protection only works when Authelia and nginx-proxy are both part of
+  // the stack; otherwise a saved checkbox could generate an auth vhost that
+  // points at a container that does not exist.
+  if (plan.services.auth !== 'authelia' || plan.services.proxy !== 'nginx-proxy') {
+    plan.protectDok = false;
+    plan.defaults.protectDok = false;
+  } else if (plan.protectDok === true) {
+    plan.defaults.protectDok = true;
+  }
+  if (plan.dokDomain) {
+    plan.dokDomain = normalizeDomain(plan.dokDomain).toLowerCase();
+    if (!plan.defaults.dokDomain) plan.defaults.dokDomain = plan.dokDomain;
+  }
+  for (const key of ['authDomain', 'dnsDomain', 'mailDomain']) {
+    if (plan[key]) plan[key] = normalizeDomain(plan[key]).toLowerCase();
   }
   return plan;
 }
@@ -669,8 +749,20 @@ export function normalizeInstallPlan(body = {}) {
 export function validateInstallPlan(plan) {
   const issues = [];
   const defaults = plan.defaults || {};
+  if (plan.type === 'core' && !defaults.primaryDomain) issues.push('A primary domain is required for a Dok with Core Services installation.');
   if (defaults.primaryDomain && !validDomain(defaults.primaryDomain)) issues.push('Primary domain is invalid.');
   if (defaults.dokDomain && !validDomain(defaults.dokDomain)) issues.push('Dok domain is invalid.');
+  for (const [label, value] of [
+    ['Dok domain', plan.dokDomain],
+    ['Authentication portal domain', plan.authDomain],
+    ['DNS console domain', plan.dnsDomain],
+    ['Mail domain', plan.mailDomain]
+  ]) {
+    if (value && !validDomain(value)) issues.push(`${label} is invalid.`);
+  }
+  if (plan.acmeEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(plan.acmeEmail)) issues.push('Let\'s Encrypt email is invalid.');
+  if (plan.mailFrom && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(plan.mailFrom)) issues.push('Notification sender address is invalid.');
+  if (plan.smtpFrom && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(plan.smtpFrom)) issues.push('SMTP sender address is invalid.');
   if (defaults.dataLocation) {
     if (!path.isAbsolute(defaults.dataLocation)) issues.push('Data location must be an absolute host path.');
     if (/[\r\n:\0]/.test(defaults.dataLocation)) issues.push('Data location contains unsupported characters.');
@@ -1189,4 +1281,221 @@ export async function dockerInfo() {
 export function maintenanceVersion() {
   const pkg = readJson(path.join(DOK_ROOT, 'package.json'), {}) || readJson('/app/package.json', {}) || {};
   return pkg.version || '1.0.0';
+}
+
+export function buildInstallerPrompt({ plan = {}, settings = {}, results = [], dok = {} } = {}) {
+  const defaults = { ...(plan.defaults || {}), ...(settings.defaults || {}) };
+  const nginx = settings.services?.nginxProxy || {};
+  const authelia = settings.services?.authelia || {};
+  const authentik = settings.services?.authentik || {};
+  const dns = settings.services?.dns || {};
+  const technitium = settings.services?.technitium || {};
+  const adguard = settings.services?.adguard || {};
+  const mail = settings.services?.mail || {};
+  const mailpit = settings.services?.mailpit || {};
+  const stalwart = settings.services?.stalwart || {};
+  const cloudflared = settings.services?.cloudflared || {};
+  const primary = normalizeDomain(defaults.primaryDomain || '');
+  const dokDomain = normalizeDomain(defaults.dokDomain || nginx.domain || plan.dokDomain || '');
+  const authDomain = normalizeDomain(authelia.domain || authentik.domain || plan.authDomain || (primary ? `auth.${primary}` : ''));
+  const dnsDomain = normalizeDomain(technitium.domain || adguard.domain || plan.dnsDomain || (primary ? `dns.${primary}` : ''));
+  const mailDomain = normalizeDomain(mailpit.domain || stalwart.domain || plan.mailDomain || (primary ? `mail.${primary}` : ''));
+  const httpPort = Number(nginx.httpPort) || 80;
+  const network = normalizeDomain(defaults.defaultNetwork || DEFAULT_NETWORK) || DEFAULT_NETWORK;
+  const selected = new Set(Array.isArray(plan.selected) && plan.selected.length ? plan.selected : [...selectedServiceIds(plan)]);
+  const has = id => selected.has(id) || settings.services?.[id === 'nginx-proxy' ? 'nginxProxy' : id]?.enabled === true;
+  const proxySelected = has('nginx-proxy');
+  const tlsReady = nginx.acme?.enabled === true;
+  const httpUrl = (domain, port = httpPort) => normalizeDomain(domain) ? `http://${normalizeDomain(domain)}${Number(port) !== 80 ? `:${Number(port)}` : ''}` : '';
+  const httpsUrl = domain => normalizeDomain(domain) ? `https://${normalizeDomain(domain)}` : '';
+  const publicUrl = (domain, directPort) => {
+    if (proxySelected) return domain ? (tlsReady ? httpsUrl(domain) : httpUrl(domain)) : `http://host:${httpPort}`;
+    return `http://host:${Number(directPort) || 80}`;
+  };
+  const dokUrl = String(dok.url || '').trim() || (proxySelected && dokDomain ? publicUrl(dokDomain) : `http://localhost:${DOK_PORT}`);
+  const adminUser = String(plan.adminUser || defaults.adminUser || authelia.adminUser || 'admin').trim() || 'admin';
+  const adminEmail = String(plan.adminEmail || defaults.adminEmail || authelia.adminEmail || authentik.adminEmail || '').trim();
+  const acmeEmail = String(plan.acmeEmail || nginx.acme?.email || defaults.adminEmail || '').trim();
+  const acmeStaging = plan.acmeStaging === true || nginx.acme?.staging === true;
+  const protectDok = plan.protectDok === true || defaults.protectDok === true;
+  const mailSender = String(mail.sender || plan.mailFrom || plan.smtpFrom || (primary ? `authelia@${primary}` : '')).trim();
+  const certHosts = [...new Set([dokDomain, authDomain, dnsDomain, mailDomain].filter(Boolean))];
+  const statusLines = results.length
+    ? results.map(item => {
+      const parts = [`- ${item.name}: ${item.ok ? 'OK' : 'FAILED'}`];
+      if (item.detail) parts.push(item.detail);
+      if (item.url) parts.push(item.url);
+      return parts.join(' — ');
+    })
+    : ['- No core service launch results were recorded.'];
+  const registryLines = (plan.registries || []).length
+    ? plan.registries.map(item => `- ${item.name || item.host} (${item.kind || 'registry'}, ${item.host}${item.username ? `, user ${item.username}` : ''})`)
+    : ['- None configured.'];
+
+  const wiring = [];
+  wiring.push(`- Dok: container ${DOK_CONTAINER} on ${network}; internal http://${DOK_CONTAINER}:${DOK_PORT}; public ${dokUrl}`);
+  if (proxySelected) wiring.push(`- nginx-proxy: container nginx-proxy on ${network}; public :${httpPort}${tlsReady ? ' and :443' : ''} -> container :80${tlsReady ? '/:443' : ''}; config /dok/core/nginx-proxy`);
+  if (has('authelia')) wiring.push(`- Authelia: container authelia:9091 on ${network}; portal ${httpsUrl(authDomain) || 'not configured'}; config /dok/core/authelia; vhosts /dok/core/nginx-proxy/vhost.d`);
+  if (has('authentik')) wiring.push(`- Authentik: containers authentik-server:9000, authentik-worker, authentik-postgresql, authentik-redis on ${network}; portal ${publicUrl(authDomain, 9000)}`);
+  if (has('technitium')) wiring.push(`- Technitium DNS: container technitium-dns; web ${publicUrl(dnsDomain, Number(technitium.webPort) || 5380)}; DNS :53 TCP/UDP`);
+  if (has('adguard')) wiring.push(`- AdGuard Home: container adguard; web ${publicUrl(dnsDomain, Number(adguard.webPort) || 3000)}; DNS :53 TCP/UDP`);
+  if (has('mailpit')) wiring.push(`- Mailpit: container mailpit:1025 SMTP; web ${publicUrl(mailDomain, Number(mailpit.webPort) || 8025)}`);
+  if (has('stalwart')) wiring.push(`- Stalwart: container stalwart:25 SMTP, :587 submission, :993 IMAPS; web ${publicUrl(mailDomain, Number(stalwart.webPort) || 8088)}`);
+  if (has('cloudflared')) wiring.push(`- cloudflared: connector container on ${network}; public hostnames are configured in Cloudflare${proxySelected ? ' and should target http://nginx-proxy:80' : ' and must target the published host ports'}`);
+
+  const routeLines = [];
+  if (proxySelected) {
+    if (dokDomain) routeLines.push(`Dok -> ${DOK_CONTAINER}:${DOK_PORT} (VIRTUAL_HOST=${dokDomain}, VIRTUAL_PORT=${DOK_PORT})`);
+    if (has('authelia') && authDomain) routeLines.push(`Authelia -> authelia:9091 (VIRTUAL_HOST=${authDomain}, VIRTUAL_PORT=9091)`);
+    if (has('authentik') && authDomain) routeLines.push(`Authentik -> authentik-server:${Number(authentik.port) || 9000} (VIRTUAL_HOST=${authDomain}, VIRTUAL_PORT=${Number(authentik.port) || 9000})`);
+    if (has('technitium') && dnsDomain) routeLines.push(`Technitium -> technitium-dns:${Number(technitium.webPort) || 5380} (VIRTUAL_HOST=${dnsDomain}, VIRTUAL_PORT=${Number(technitium.webPort) || 5380})`);
+    if (has('adguard') && dnsDomain) routeLines.push(`AdGuard -> adguard:${Number(adguard.webPort) || 3000} (VIRTUAL_HOST=${dnsDomain}, VIRTUAL_PORT=${Number(adguard.webPort) || 3000})`);
+    if (has('mailpit') && mailDomain) routeLines.push(`Mailpit -> mailpit:${Number(mailpit.webPort) || 8025} (VIRTUAL_HOST=${mailDomain}, VIRTUAL_PORT=${Number(mailpit.webPort) || 8025})`);
+    if (has('stalwart') && mailDomain) routeLines.push(`Stalwart -> stalwart:${Number(stalwart.webPort) || 8088} (VIRTUAL_HOST=${mailDomain}, VIRTUAL_PORT=${Number(stalwart.webPort) || 8088})`);
+  }
+
+  const portChecks = [`${DOK_PORT} (Dok)`];
+  if (proxySelected) portChecks.push(`${httpPort} and 443 (nginx-proxy)`);
+  if (has('technitium')) portChecks.push(`${Number(technitium.dnsPort) || 53} TCP/UDP and ${Number(technitium.webPort) || 5380} (Technitium)`);
+  if (has('adguard')) portChecks.push(`${Number(adguard.dnsPort) || 53} TCP/UDP and ${Number(adguard.webPort) || 3000} (AdGuard)`);
+  if (has('mailpit')) portChecks.push(`${Number(mailpit.smtpPort) || 1025} and ${Number(mailpit.webPort) || 8025} (Mailpit)`);
+  if (has('stalwart')) portChecks.push(`${Number(stalwart.smtpPort) || 25}, ${Number(stalwart.submissionPort) || 587}, ${Number(stalwart.imapsPort) || 993}, ${Number(stalwart.webPort) || 8088} (Stalwart)`);
+  if (has('cloudflared')) portChecks.push('no inbound ports (cloudflared)');
+
+  const taskLines = [];
+  if (proxySelected) {
+    taskLines.push(`Reverse proxy: nginx-proxy is the public entry point. Keep it on the ${network} network and verify each expected route below. ${httpPort !== 80 ? `Host port 80 was unavailable, so plain-HTTP URLs must include :${httpPort}.` : ''}`);
+    taskLines.push(`TLS: ${acmeEmail ? `acme-companion is configured for ${acmeEmail}${acmeStaging ? ' using the Let\'s Encrypt staging endpoint' : ''}; confirm issuance and renewal for ${certHosts.join(', ') || 'the configured hosts'}.${acmeStaging ? ' Staging certificates are not trusted by browsers; switch staging off only after the user confirms the domain is ready.' : ''}` : `ACME is not enabled. If HTTPS is required, place certificates under /dok/core/nginx-proxy/certs/<host>.crt and .key for ${certHosts.join(', ') || 'the configured hosts'}, or configure acme-companion with a valid email.`} Always verify the final nginx config with nginx -t before reloading.`);
+  } else {
+    taskLines.push('Reverse proxy: none selected. Reach Dok and the web UIs through their published host ports; do not add VIRTUAL_HOST-only configuration that assumes an nginx-proxy container exists. If the user later adds nginx-proxy, create the routes then.');
+  }
+  if (has('authelia')) {
+    const notifierLine = has('mailpit')
+      ? `Authelia's notifier must use mailpit:${Number(mailpit.smtpPort) || 1025} with TLS none and sender ${mailSender || 'authelia@the primary domain'}; send a test reset and confirm it appears in Mailpit.`
+      : has('stalwart')
+        ? `Create the sender mailbox ${mailSender || 'authelia@the primary domain'} in Stalwart, then point Authelia's notifier at stalwart:${Number(stalwart.submissionPort) || 587} with STARTTLS and the mailbox credentials. Keep Authelia's startup check disabled until the mailbox works.`
+        : has('smtp')
+          ? `Authelia's notifier uses ${mail.host || 'the saved SMTP host'}:${Number(mail.port) || 587} with sender ${mail.sender || mailSender || 'not set'}; verify authentication and send a test reset.`
+          : 'No mail service was selected, so leave Authelia on the filesystem notifier. Do not invent SMTP credentials.';
+    taskLines.push(`Authelia: portal ${httpsUrl(authDomain) || 'not configured'}. Confirm the portal is reachable${proxySelected ? ', the session cookie domain covers Dok and every protected host, and ENABLE_AUTH vhosts exist under /dok/core/nginx-proxy/vhost.d' : ' on its internal port'}. Dok protection is ${protectDok ? 'enabled; verify login is required and the portal is reachable' : 'disabled unless the user asks for it'}. ${notifierLine}`);
+  } else if (has('authentik')) {
+    taskLines.push(`Authentik: portal ${publicUrl(authDomain, Number(authentik.port) || 9000)}. Confirm the server, worker, PostgreSQL, and Redis are healthy. Configure providers/applications only when needed for the selected stack; do not weaken existing policies.`);
+  } else {
+    taskLines.push('Authentication: no Authelia or Authentik instance was selected. Do not enable ENABLE_AUTH on services unless the user asks.');
+  }
+  if (has('technitium') || has('adguard')) {
+    const provider = dns.provider === 'adguard' || has('adguard') ? 'AdGuard Home' : 'Technitium DNS';
+    const dnsPort = Number(dns.provider === 'adguard' || has('adguard') ? adguard.dnsPort : technitium.dnsPort) || 53;
+    const webPort = dns.provider === 'adguard' || has('adguard') ? Number(adguard.webPort) || 3000 : Number(technitium.webPort) || 5380;
+    taskLines.push(`DNS: ${provider} on port ${dnsPort} TCP/UDP at ${publicUrl(dnsDomain, webPort)}. Confirm the container is healthy, port ${dnsPort} is free, and the hostnames for Dok, authentication, mail, and apps resolve correctly for the intended clients. Do not overwrite existing zones or records without checking them first.`);
+  }
+  if (has('mailpit')) {
+    taskLines.push(`Mail: Mailpit captures notifications at ${publicUrl(mailDomain, Number(mailpit.webPort) || 8025)}. Confirm Dok's notifier points at mailpit:${Number(mailpit.smtpPort) || 1025} with sender ${mailSender || 'not set'}, then trigger a password-reset or test notification and verify it appears in Mailpit.`);
+  } else if (has('stalwart')) {
+    taskLines.push(`Mail: Stalwart admin is at ${publicUrl(mailDomain, Number(stalwart.webPort) || 8088)} (SMTP ${Number(stalwart.smtpPort) || 25}, submission ${Number(stalwart.submissionPort) || 587}, IMAPS ${Number(stalwart.imapsPort) || 993}). Create the sender mailbox ${mailSender || 'authelia@the primary domain'} and the admin's mailbox, point Dok's notifier at the submission port with STARTTLS, and verify delivery with a test message. Stalwart does not automatically create mailboxes.`);
+  } else if (has('smtp')) {
+    taskLines.push(`Mail: external SMTP is configured at ${mail.host || 'the saved host'}:${Number(mail.port) || 587} (${mail.tls || 'starttls'}) with sender ${mail.sender || mailSender || 'not set'}. Verify authentication and send a test notification. Never print the SMTP password.`);
+  } else {
+    taskLines.push('Mail: no mail service was selected. Leave the notifier disabled or unchanged; do not invent SMTP credentials.');
+  }
+  if (has('cloudflared')) {
+    taskLines.push(`Cloudflare Tunnel: the tunnel token is configured, but public hostnames are managed in Cloudflare. Verify the tunnel is connected and that routes exist for ${certHosts.join(', ') || 'the public hostnames'}${proxySelected ? ' targeting http://nginx-proxy:80' : ' targeting the published host ports'}. Report any route that still has to be added in the Cloudflare dashboard.`);
+  }
+  taskLines.push(`Network and ports: keep every selected service on the ${network} network and check these host ports: ${portChecks.join('; ')}. Check the host firewall only if it is accessible and report required openings.`);
+  taskLines.push('Persistence: app and service data must not be reset, deleted, or overwritten. Use the existing /dok/data, /dok/apps, /dok/core, and configured data location. Do not run docker system prune, remove volumes, or recreate healthy containers without a reason.');
+  if ((plan.registries || []).length) {
+    taskLines.push('Registry access: verify each configured registry or git host with the saved credentials. Use a temporary DOCKER_CONFIG for docker login tests and never write tokens to compose files or logs.');
+  }
+
+  const commands = ["docker ps --format 'table {{.Names}}\\t{{.Status}}\\t{{.Ports}}'"];
+  if (proxySelected) {
+    commands.push('docker exec nginx-proxy nginx -t');
+    commands.push('docker compose -f /dok/core/nginx-proxy/docker-compose.yml config -q');
+  }
+  if (has('authelia')) commands.push('docker compose -f /dok/core/authelia/docker-compose.yml config -q');
+  if (has('authentik')) commands.push('docker compose -f /dok/core/auth/docker-compose.yml config -q');
+  if (has('technitium') || has('adguard')) commands.push('docker compose -f /dok/core/dns/docker-compose.yml config -q');
+  if (has('mailpit')) commands.push('docker compose -f /dok/core/mailpit/docker-compose.yml config -q');
+  if (has('stalwart')) commands.push('docker compose -f /dok/core/stalwart/docker-compose.yml config -q');
+  if (has('cloudflared')) commands.push('docker compose -f /dok/core/cloudflared/docker-compose.yml config -q');
+  if (proxySelected && dokDomain) commands.push(`curl -sI -H 'Host: ${dokDomain}' http://127.0.0.1:${httpPort}/`);
+  if (proxySelected && authDomain) {
+    commands.push(tlsReady
+      ? `curl -skI --resolve '${authDomain}:443:127.0.0.1' 'https://${authDomain}/'`
+      : `curl -sI -H 'Host: ${authDomain}' http://127.0.0.1:${httpPort}/`);
+  }
+  if (proxySelected && dnsDomain) commands.push(`curl -sI -H 'Host: ${dnsDomain}' http://127.0.0.1:${httpPort}/`);
+  if (proxySelected && mailDomain) commands.push(`curl -sI -H 'Host: ${mailDomain}' http://127.0.0.1:${httpPort}/`);
+  if (!proxySelected && has('technitium')) commands.push(`curl -sI http://127.0.0.1:${Number(technitium.webPort) || 5380}/`);
+  if (!proxySelected && has('adguard')) commands.push(`curl -sI http://127.0.0.1:${Number(adguard.webPort) || 3000}/`);
+  if (!proxySelected && has('mailpit')) commands.push(`curl -sI http://127.0.0.1:${Number(mailpit.webPort) || 8025}/`);
+  if (!proxySelected && has('stalwart')) commands.push(`curl -sI http://127.0.0.1:${Number(stalwart.webPort) || 8088}/`);
+  if (has('cloudflared')) commands.push('docker logs --tail 50 cloudflared');
+  if (has('technitium') || has('adguard')) {
+    const firstHost = certHosts[0];
+    if (firstHost) commands.push(`dig +short @127.0.0.1 ${firstHost} (if dig is available)`);
+  }
+
+  return [
+    '# Dok installation integration brief',
+    '',
+    'You are OpenCode running inside the Dok Maintenance container. Configure the installed stack so the selected services work together as one stable server, then verify every public endpoint. The installer has already written the user\'s settings and launched the selected containers; prefer those working defaults and make only the smallest changes required for integration, security, or reliability.',
+    '',
+    '## Installation context',
+    `- Installation type: ${plan.type === 'core' ? 'Dok with Core Services' : 'Standalone Dok'}`,
+    `- Primary domain: ${primary || 'not set'}`,
+    `- Dok URL: ${dokUrl}`,
+    `- nginx-proxy HTTP host port: ${httpPort}${httpPort !== 80 ? ' (alternative port in use)' : ''}`,
+    `- Default Docker network: ${network}`,
+    `- Data location: ${defaults.dataLocation || 'Dok default'}`,
+    `- Admin username: ${adminUser}`,
+    `- Admin email: ${adminEmail || 'not set'}`,
+    `- Let's Encrypt email: ${acmeEmail || 'not enabled'}${acmeStaging ? ' (staging)' : ''}`,
+    `- Protect Dok with Authelia: ${protectDok ? 'yes' : 'no'}`,
+    `- Domains: Dok ${dokDomain || '-'}, auth ${authDomain || '-'}, DNS ${dnsDomain || '-'}, mail ${mailDomain || '-'}`,
+    `- Selected services: ${[...selected].join(', ') || 'none'}`,
+    '',
+    '### Service launch results',
+    ...statusLines,
+    '',
+    '### Repository connections',
+    ...registryLines,
+    '',
+    '### Expected container wiring',
+    ...wiring,
+    ...(routeLines.length ? ['', 'Expected nginx-proxy routes:', ...routeLines.map(line => `- ${line}`)] : []),
+    '',
+    '### Current non-secret service settings',
+    `- nginx-proxy domain: ${nginx.domain || '-'}; ACME: ${nginx.acme?.enabled ? `enabled (${nginx.acme.email || 'no email'}${acmeStaging ? ', staging' : ''})` : 'disabled'}`,
+    `- Authelia domain: ${authelia.domain || '-'}; admin: ${adminUser || '-'}`,
+    `- Authentik domain: ${authentik.domain || '-'}; HTTP port: ${Number(authentik.port) || 9000}`,
+    `- DNS provider: ${dns.provider || 'technitium'}; Technitium web/DNS: ${Number(technitium.webPort) || 5380}/${Number(technitium.dnsPort) || 53}; AdGuard web/DNS: ${Number(adguard.webPort) || 3000}/${Number(adguard.dnsPort) || 53}`,
+    `- Notifier: ${mail.host ? `${mail.host}:${Number(mail.port) || 587} (${mail.tls || 'starttls'}), sender ${mail.sender || '-'}` : 'not configured'}`,
+    `- Mailpit SMTP/web: ${Number(mailpit.smtpPort) || 1025}/${Number(mailpit.webPort) || 8025}`,
+    `- Stalwart web/SMTP/submission/IMAPS: ${Number(stalwart.webPort) || 8088}/${Number(stalwart.smtpPort) || 25}/${Number(stalwart.submissionPort) || 587}/${Number(stalwart.imapsPort) || 993}`,
+    `- Cloudflare Tunnel enabled: ${cloudflared.enabled ? 'yes' : 'no'}`,
+    '',
+    '## Secrets',
+    'This brief intentionally contains no passwords or tokens. If a task needs one, read it from the running container environment (docker inspect) or the encrypted Dok settings only as needed. Never print, echo, commit, or write a secret into chat output, compose files, logs, or this brief.',
+    '',
+    '## Required integration work',
+    ...taskLines.map((line, index) => `${index + 1}. ${line}`),
+    '',
+    '## Working rules',
+    '- Read /dok/AGENTS.md before changing Dok source or managed compose files.',
+    '- Prefer the Dok API at http://wickedafdok:8080 for settings, domains, auth sync, and service actions. Verify the result with Docker and HTTP afterward.',
+    '- Make reversible changes. Do not delete app data, volumes, snapshots, or backups. Do not reset healthy services just to apply cosmetic settings.',
+    '- If a required certificate, DNS record, tunnel route, or third-party credential is missing and cannot be created safely, report the exact remaining manual step instead of inventing a workaround.',
+    '- After each change, inspect logs and health before moving to the next service.',
+    '',
+    '## Verification',
+    'Run the relevant checks and report their actual results:',
+    '```sh',
+    ...commands,
+    '```',
+    'Also verify: the Dok UI responds, the auth portal responds (if selected), DNS answers resolve for the configured hostnames, mail notifications are delivered or captured, registry logins succeed, and every selected service is running with a restart policy and no unexpected port conflicts.',
+    '',
+    '## Report back',
+    'Finish with a short table listing each service, whether it is running, its public URL, what you changed, and what still needs manual action. Mention any command that failed and the exact error.'
+  ].join('\n');
 }
