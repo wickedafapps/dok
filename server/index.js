@@ -4066,7 +4066,37 @@ function authCookieDomain(value) {
   return parts.slice(-2).join('.');
 }
 
+function argon2PhcHash(password) {
+  return new Promise((resolve, reject) => {
+    const salt = crypto.randomBytes(16);
+    crypto.argon2('argon2id', {
+      message: String(password),
+      nonce: salt,
+      parallelism: 4,
+      tagLength: 32,
+      memory: 65536,
+      passes: 3
+    }, (err, tag) => {
+      if (err) return reject(err);
+      const b64 = value => Buffer.from(value).toString('base64').replace(/=+$/, '');
+      // Authelia expects a PHC string with its default parameters.
+      resolve(`$argon2id$v=19$m=65536,t=3,p=4$${b64(salt)}$${b64(tag)}`);
+    });
+  });
+}
+
 async function autheliaPasswordHash(password) {
+  // Node 24 can compute Argon2id in-process. Prefer that over `docker run`:
+  // the Docker path starts a container from the Authelia image, which pulls on
+  // first use and can outlive a reverse proxy's request timeout, leaving the
+  // UI with a network error and no saved user.
+  if (typeof crypto.argon2 === 'function') {
+    try {
+      return await argon2PhcHash(password);
+    } catch (e) {
+      appendServerLog('WARN', `Native Argon2 hashing failed, falling back to Docker: ${e.message}`);
+    }
+  }
   const { stdout } = await run('docker', [
     'run', '--rm', '--entrypoint', 'authelia', AUTHELIA_IMAGE,
     'crypto', 'hash', 'generate', 'argon2', '--password', String(password)
@@ -8193,10 +8223,24 @@ app.post('/api/core/authelia/admin', async (req, res) => {
     settings.services = settings.services || {};
     settings.services.authelia = authelia;
     writeSettings(settings);
-    if (authelia.domain) await refreshAutheliaConfig(settings, { restart: true });
+    let applied = false;
+    let message;
+    if (authelia.domain) {
+      try {
+        await refreshAutheliaConfig(settings, { restart: true });
+        applied = true;
+        message = 'Admin account saved and Authelia restarted.';
+      } catch (e) {
+        appendServerLog('WARN', `Authelia admin refresh failed: ${e.message}`);
+        message = `Admin saved, but Authelia could not be updated: ${e.message}`;
+      }
+    } else {
+      message = 'Admin account saved. Set the Authelia portal domain in Core Services to apply it.';
+    }
     try { await syncAuthVhosts(); } catch {}
-    res.json({ ok: true, ...autheliaUsersForClient(authelia) });
+    res.json({ ok: true, applied, message, ...autheliaUsersForClient(authelia) });
   } catch (e) {
+    appendServerLog('WARN', `Authelia admin save failed: ${e.message}`);
     res.status(e.status || 500).json({ error: e.message });
   }
 });
@@ -8244,10 +8288,26 @@ app.post('/api/core/authelia/users', async (req, res) => {
     settings.services = settings.services || {};
     settings.services.authelia = authelia;
     writeSettings(settings);
-    if (authelia.domain && authelia.adminPasswordHash) await refreshAutheliaConfig(settings, { restart: true });
+    let applied = false;
+    let message;
+    if (authelia.domain && authelia.adminPasswordHash) {
+      try {
+        await refreshAutheliaConfig(settings, { restart: true });
+        applied = true;
+        message = 'Saved. Authelia was refreshed.';
+      } catch (e) {
+        appendServerLog('WARN', `Authelia user refresh failed: ${e.message}`);
+        message = `Saved, but Authelia could not be updated: ${e.message}`;
+      }
+    } else {
+      message = authelia.domain
+        ? 'Saved, but the Authelia admin password is not set. Save the admin account to apply users.'
+        : 'Saved. Set the Authelia portal domain in Core Services to apply users.';
+    }
     try { await syncAuthVhosts(); } catch {}
-    res.json({ ok: true, ...autheliaUsersForClient(authelia) });
+    res.json({ ok: true, applied, message, ...autheliaUsersForClient(authelia) });
   } catch (e) {
+    appendServerLog('WARN', `Authelia user save failed: ${e.message}`);
     res.status(e.status || 500).json({ error: e.message });
   }
 });
@@ -8265,10 +8325,24 @@ app.delete('/api/core/authelia/users/:username', async (req, res) => {
     settings.services = settings.services || {};
     settings.services.authelia = authelia;
     writeSettings(settings);
-    if (authelia.domain && authelia.adminPasswordHash) await refreshAutheliaConfig(settings, { restart: true });
+    let applied = false;
+    let message;
+    if (authelia.domain && authelia.adminPasswordHash) {
+      try {
+        await refreshAutheliaConfig(settings, { restart: true });
+        applied = true;
+        message = 'User removed. Authelia was refreshed.';
+      } catch (e) {
+        appendServerLog('WARN', `Authelia user refresh failed: ${e.message}`);
+        message = `User removed, but Authelia could not be updated: ${e.message}`;
+      }
+    } else {
+      message = 'User removed. Set the Authelia portal domain and admin password to apply users.';
+    }
     try { await syncAuthVhosts(); } catch {}
-    res.json({ ok: true, ...autheliaUsersForClient(authelia) });
+    res.json({ ok: true, applied, message, ...autheliaUsersForClient(authelia) });
   } catch (e) {
+    appendServerLog('WARN', `Authelia user delete failed: ${e.message}`);
     res.status(e.status || 500).json({ error: e.message });
   }
 });

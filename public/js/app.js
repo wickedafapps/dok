@@ -35,7 +35,15 @@ function escapeHtml(value) {
 }
 
 async function api(url, opts = {}) {
-  const res = await fetch(url, opts);
+  let res;
+  try {
+    res = await fetch(url, opts);
+  } catch {
+    // Fetch rejects only for connection-level failures (server restart, DNS,
+    // proxy drop). Say what the user can do instead of surfacing the browser's
+    // opaque "network error".
+    throw new Error('The server did not respond. Check that WickedAFDok is running, then reload the page.');
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     const err = new Error(data.error || res.statusText || 'Request failed');
@@ -4137,9 +4145,10 @@ async function loadAutheliaUsers() {
 async function deleteAutheliaUser(username) {
   if (!confirm(`Delete Authelia user "${username}"?`)) return;
   try {
-    await api(`/api/core/authelia/users/${encodeURIComponent(username)}`, { method: 'DELETE' });
+    const res = await api(`/api/core/authelia/users/${encodeURIComponent(username)}`, { method: 'DELETE' });
     if (autheliaUsersEditing === username) resetAutheliaUserForm();
-    toast('Authelia user deleted');
+    toast(res.message || 'Authelia user deleted');
+    if (qs('#autheliaUsersMsg')) qs('#autheliaUsersMsg').textContent = res.message || '';
     await loadAutheliaUsers();
     loadCoreAuthelia();
   } catch (e) {
@@ -4176,10 +4185,10 @@ if (qs('#autheliaUserSave')) {
         disabled: !!qs('#autheliaUserDisabled')?.checked
       };
       if (password) payload.password = password;
-      await api('/api/core/authelia/users', jsonBody(payload));
+      const res = await api('/api/core/authelia/users', jsonBody(payload));
       resetAutheliaUserForm();
-      if (msg) msg.textContent = 'Saved. Authelia was refreshed.';
-      toast('Authelia user saved');
+      if (msg) msg.textContent = res.message || 'Saved.';
+      toast(res.applied ? 'Authelia user saved' : 'Authelia user saved (not applied yet)');
       await loadAutheliaUsers();
     } catch (e) {
       if (msg) msg.textContent = e.message;
@@ -4200,10 +4209,10 @@ if (qs('#autheliaAdminSave')) {
       };
       const password = qs('#autheliaAdminPassword')?.value || '';
       if (password) payload.password = password;
-      await api('/api/core/authelia/admin', jsonBody(payload));
+      const res = await api('/api/core/authelia/admin', jsonBody(payload));
       if (qs('#autheliaAdminPassword')) qs('#autheliaAdminPassword').value = '';
-      if (qs('#autheliaUsersMsg')) qs('#autheliaUsersMsg').textContent = 'Admin account saved and Authelia restarted.';
-      toast('Authelia admin account saved');
+      if (qs('#autheliaUsersMsg')) qs('#autheliaUsersMsg').textContent = res.message || 'Admin account saved.';
+      toast(res.applied ? 'Authelia admin account saved' : 'Authelia admin account saved (not applied yet)');
       await loadAutheliaUsers();
       loadCoreAuthelia();
     } catch (e) {
