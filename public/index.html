@@ -291,7 +291,11 @@
           <h2>Apps</h2>
           <p class="muted">All apps managed by compose from their own directory.</p>
         </div>
-        <button id="appsRefresh" class="btn">Refresh</button>
+        <div class="inline">
+          <button id="libraryExportBtn" class="btn">Export library</button>
+          <label class="file-label">Import library<input type="file" id="libraryImportFile" accept=".tar.gz,.tgz,application/gzip"></label>
+          <button id="appsRefresh" class="btn">Refresh</button>
+        </div>
       </div>
       <div id="appsList" class="list"></div>
     </section>
@@ -303,7 +307,10 @@
           <h2>Settings</h2>
           <p class="muted">Dok Settings, core services, logs, backups, and application updates.</p>
         </div>
-        <button id="settingsRefresh" class="btn">Refresh</button>
+        <div class="inline">
+          <button id="openManualBtn" class="btn">User manual</button>
+          <button id="settingsRefresh" class="btn">Refresh</button>
+        </div>
       </div>
 
       <div class="subtabs" id="settingsSubtabs">
@@ -668,6 +675,15 @@
       </div>
 
       <div id="settings-pane-dok" class="settings-pane">
+        <div class="card" id="manualCard">
+          <div class="row" style="margin-top:0; justify-content:space-between">
+            <div>
+              <h3 style="margin:0">User manual</h3>
+              <p class="muted">Detailed instructions for every Dok section, including app creation, the compose builder, core services, the app library, backups, and troubleshooting.</p>
+            </div>
+            <button class="btn" data-open-manual>Open user manual</button>
+          </div>
+        </div>
         <div class="card" id="defaultsCard">
           <div class="row" style="margin-top:0; justify-content:space-between">
             <div>
@@ -1007,6 +1023,45 @@
     </div>
   </div>
 
+  <div id="libraryExportModal" class="modal hidden">
+    <div class="modal-backdrop" data-close="libraryExportModal"></div>
+    <div class="modal-card" style="max-width:760px">
+      <div class="modal-header">
+        <h3>Export app library</h3>
+        <button class="btn" data-close="libraryExportModal">Close</button>
+      </div>
+      <div class="app-config">
+        <p class="muted">Choose the apps to include. The archive uses the Dok app library format, removes this installation's domains, published host ports, host paths, container names, and generated files, and can be imported into any Dok installation. App data and environment files are excluded; review other app files for secrets before sharing the archive.</p>
+        <label class="muted" for="libraryExportName">Library name</label>
+        <input id="libraryExportName" class="input" placeholder="My Dok app library">
+        <div id="libraryExportList" class="list" style="margin-top:12px"></div>
+        <div class="row">
+          <button id="libraryExportDo" class="btn btn-primary">Export selected apps</button>
+          <button class="btn" data-close="libraryExportModal">Cancel</button>
+          <span id="libraryExportMsg" class="muted"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="amendApprovalModal" class="modal hidden">
+    <div class="modal-backdrop" data-close="amendApprovalModal"></div>
+    <div class="modal-card" style="max-width:860px">
+      <div class="modal-header">
+        <h3>Approve app changes</h3>
+        <button class="btn" data-close="amendApprovalModal">Close</button>
+      </div>
+      <div class="app-config">
+        <p class="muted" id="amendApprovalIntro">Dok needs to amend existing containers before this app can start. Other instances of the app are listed below. Review the changes and approve them to continue.</p>
+        <div id="amendApprovalBody"></div>
+        <div class="row">
+          <button id="amendApprove" class="btn btn-primary">Approve and continue</button>
+          <button class="btn" data-close="amendApprovalModal">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div id="authContainersModal" class="modal hidden">
     <div class="modal-backdrop" data-close="authContainersModal"></div>
     <div class="modal-card" style="max-width:820px">
@@ -1138,10 +1193,28 @@
     </div>
   </div>
 
+  <div id="manualModal" class="modal hidden">
+    <div class="modal-backdrop" data-close="manualModal"></div>
+    <div class="modal-card manual-modal-card">
+      <div class="modal-header">
+        <div>
+          <h3 id="manualTitle">Dok User Manual</h3>
+          <p id="manualSubtitle" class="muted" style="margin:4px 0 0">Complete instructions for every section of Dok.</p>
+        </div>
+        <button class="btn" data-close="manualModal">Close</button>
+      </div>
+      <div class="manual-layout">
+        <nav id="manualNav" class="manual-nav" aria-label="Manual sections"></nav>
+        <div id="manualContent" class="manual-content"></div>
+      </div>
+    </div>
+  </div>
+
   <div id="toast" class="toast hidden"></div>
 
   <script src="/vendor/xterm/lib/xterm.js"></script>
   <script src="/vendor/xterm-fit/lib/addon-fit.js"></script>
   <script src="/js/app.js"></script>
+  <script src="/js/manual.js"></script>
 </body>
 </html>

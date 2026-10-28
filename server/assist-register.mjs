@@ -15,7 +15,7 @@ const option = (name, fallback = '') => {
 
 const name = String(option('--name') || '').trim();
 if (!name || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) {
-  console.error('Usage: node /app/server/assist-register.mjs --name <app> [--dir /app/apps/<app>] [--compose <file>] [--launch] [--vhost <host>] [--vhost-port <port>] [--network <name>]');
+  console.error('Usage: node /app/server/assist-register.mjs --name <app> [--dir /app/apps/<app>] [--compose <file>] [--launch] [--confirm-amend] [--vhost <host>] [--vhost-port <port>] [--network <name>]');
   process.exit(2);
 }
 
@@ -39,6 +39,7 @@ const payload = {
   launchNow: flag('--launch') && !flag('--no-launch'),
   overwrite: true,
   force: flag('--force'),
+  confirmAmend: flag('--confirm-amend'),
   network: option('--network'),
   vhost: option('--vhost'),
   vhostPort: option('--vhost-port'),

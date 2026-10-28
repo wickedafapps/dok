@@ -836,6 +836,7 @@ function appCfgBuilderFieldRow(service, field, serviceIndex, fieldIndex) {
     <div class="builder-field-name">
       <select class="input builder-field-type" data-field-type aria-label="Field type">${typeOptions}</select>
       <input class="input builder-field-key ${def.keyEditable ? '' : 'hidden'}" data-field-key value="${escapeHtml(field.key)}" placeholder="Field key" aria-label="Field key">
+      ${appCfgFieldHelp(field.key, field.key || 'Field')}
       ${required ? '<span class="builder-required">required</span>' : ''}
     </div>
     <div class="builder-field-value">${appCfgBuilderFieldValue(field)}</div>
@@ -844,9 +845,15 @@ function appCfgBuilderFieldRow(service, field, serviceIndex, fieldIndex) {
   </div>`;
 }
 
-function appCfgSection(label, body) {
+function appCfgFieldHelp(key, label) {
+  const help = String(window.DokManual?.helpFor?.(key) || '').trim() ||
+    `Sets the ${String(label || key || 'field').toLowerCase()} value for this service.`;
+  return `<span class="field-help" tabindex="0" role="img" aria-label="Help: ${escapeHtml(help)}" data-tip="${escapeHtml(help)}" title="${escapeHtml(help)}">?</span>`;
+}
+
+function appCfgSection(label, body, helpKey = '') {
   return `<div class="builder-section">
-    <div class="builder-section-head"><strong>${escapeHtml(label)}</strong></div>
+    <div class="builder-section-head"><strong>${escapeHtml(label)}${helpKey ? appCfgFieldHelp(helpKey, label) : ''}</strong></div>
     <div class="builder-section-body">${body}</div>
   </div>`;
 }
@@ -869,7 +876,7 @@ function appCfgStaticRow(service, def) {
     control = `<input class="input builder-static-input" data-static-key="${def.key}" data-static-type="${def.type}" value="${escapeHtml(value)}" placeholder="${escapeHtml(def.placeholder || '')}">`;
   }
   return `<div class="builder-row builder-static-row" data-builder-key="${def.key}">
-    <label class="builder-row-label">${escapeHtml(def.label)}${required ? ' <span class="builder-required">required</span>' : ''}</label>
+    <label class="builder-row-label">${escapeHtml(def.label)}${required ? ' <span class="builder-required">required</span>' : ''}${appCfgFieldHelp(def.key, def.label)}</label>
     <div class="builder-row-control">${control}</div>
     <div class="builder-field-error hidden" data-field-error></div>
   </div>`;
@@ -898,7 +905,7 @@ function appCfgListEditor(service, def) {
   }
   return `<div class="builder-section builder-list-section" data-builder-list="${def.key}">
     <div class="builder-section-head">
-      <strong>${escapeHtml(def.label)}</strong>
+      <strong>${escapeHtml(def.label)}${appCfgFieldHelp(def.key, def.label)}</strong>
       <button class="btn builder-add-list" data-list-kind="${def.key}" data-list-kv="${def.kv ? '1' : ''}" type="button">+ Add ${escapeHtml(def.label.toLowerCase().replace(/s$/, ''))}</button>
     </div>
     <div class="builder-section-body builder-list-rows" data-list-rows="${def.key}">${rows}</div>
@@ -922,7 +929,7 @@ function appCfgAdditionalSection(service) {
         ${addTypes.map(item => `<option value="${item.type}">${escapeHtml(item.label)}</option>`).join('')}
       </select>
       <button class="btn builder-add-field" type="button">+ Add field</button>
-    </div>`);
+    </div>`, 'Additional settings');
 }
 
 function appCfgBuilderServiceCard(service, serviceIndex) {
@@ -931,7 +938,7 @@ function appCfgBuilderServiceCard(service, serviceIndex) {
   const listSections = APP_CFG_LIST_FIELDS.map(def => appCfgListEditor(service, def)).join('');
   return `<div class="builder-service" data-service-index="${serviceIndex}">
     <div class="builder-service-head">
-      <span class="builder-service-number">Service ${serviceIndex + 1}</span>
+      <span class="builder-service-number">Service ${serviceIndex + 1}${appCfgFieldHelp('service', 'Service name')}</span>
       <input class="input builder-service-name" data-service-name value="${escapeHtml(service.name)}" placeholder="Service name" aria-label="Service name">
       <button class="btn btn-danger builder-remove builder-remove-service" type="button">Remove service</button>
     </div>
@@ -962,7 +969,7 @@ function renderAppCfgBuilder() {
   }
   const metaGroups = `<div class="builder-group">
     <div class="row" style="margin-top:0; justify-content:space-between">
-      <strong>Named Volumes</strong>
+      <strong>Named Volumes${appCfgFieldHelp('Named Volumes', 'Named Volumes')}</strong>
       <button class="btn builder-add-volume" type="button">+ Add volume</button>
     </div>
     <p class="muted">Top-level named volumes used by service volume mappings.</p>
@@ -972,7 +979,7 @@ function renderAppCfgBuilder() {
   </div>
   <div class="builder-group">
     <div class="row" style="margin-top:0; justify-content:space-between">
-      <strong>Networks</strong>
+      <strong>Networks${appCfgFieldHelp('Networks', 'Networks')}</strong>
       <button class="btn builder-add-network" type="button">+ Add network</button>
     </div>
     <p class="muted">Top-level network definitions. Add a network here, then reference it in the service Networks section.</p>
@@ -981,7 +988,7 @@ function renderAppCfgBuilder() {
       : '<p class="muted">No named networks. The app network field above is still used for the deployment override.</p>'}
   </div>
   <div class="builder-group">
-    <strong>Other top-level settings</strong>
+    <strong>Other top-level settings${appCfgFieldHelp('Other top-level settings', 'Other top-level settings')}</strong>
     <p class="muted">Optional JSON for configs, secrets, or x-* extensions.</p>
     <textarea class="textarea code" data-builder-other rows="4" spellcheck="false" placeholder="{}">${escapeHtml(appCfgBuilderModel.other || '')}</textarea>
   </div>`;
@@ -1722,9 +1729,6 @@ function openAppConfig(data) {
   updateAppCfgRequired();
   qs('#appCfgBuilderCard')?.classList.remove('hidden');
   loadAppCfgBuilder(initialCompose);
-  // Alter State is about editing the compose file directly, so skip the visual
-  // builder and open the raw editor immediately.
-  if (data.editAppId) setComposeEditable(true);
   const summary = qs('#appCfgSummary');
   if (data.command) {
     summary.textContent = data.command;
@@ -1734,8 +1738,9 @@ function openAppConfig(data) {
     summary.textContent = '';
   }
   const editing = !!data.editAppId;
+  if (qs('#appCfgName')) qs('#appCfgName').disabled = editing;
   qs('#appConfigTitle').textContent = editing
-    ? `Alter state: ${data.appName || 'app'}`
+    ? (data.needsConfiguration ? `Configure imported app: ${data.appName || 'app'}` : `Alter state: ${data.appName || 'app'}`)
     : `Configure ${data.appName || 'app'}`;
   if (qs('#appCfgComplete')) qs('#appCfgComplete').textContent = editing ? 'Save base config' : 'Complete Creation';
   if (qs('#appCfgCompleteRun')) qs('#appCfgCompleteRun').textContent = editing ? 'Save and deploy' : 'Complete Creation and Launch';
@@ -1835,7 +1840,7 @@ async function recentlyCreatedApp(name) {
   return null;
 }
 
-async function doAppComplete(launchNow = false, force = false, overwrite = false) {
+async function doAppComplete(launchNow = false, force = false, overwrite = false, confirmAmend = false) {
   if (!pendingAppConfig || appCfgCompleting) return;
   appCfgCompleting = true;
   const data = pendingAppConfig;
@@ -1889,6 +1894,8 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
       }
     }
     setAppCfgProgress(62, launchNow ? 'Saving and deploying…' : 'Saving base configuration…');
+    const editQuick = appCfgBuilderManual ? { vhost: '' } : appCfgBuilderQuickValues();
+    const editInitialVhost = String(data.initialVhost ?? data.vhost ?? '').trim();
     setLoading(btn, true, launchNow ? 'Deploying…' : 'Saving…');
     if (otherBtn) otherBtn.disabled = true;
     msg.textContent = '';
@@ -1896,7 +1903,9 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
       const res = await api(`/api/apps/${encodeURIComponent(data.editAppId)}/compose`, jsonBody({
         compose,
         deploy: launchNow,
-        force
+        force,
+        confirmAmend,
+        vhostTouched: editQuick.vhost !== editInitialVhost
       }));
       finishAppCfgProgress(launchNow ? (res.pending ? 'Starting' : 'Deployed') : 'Saved');
       await new Promise(resolve => setTimeout(resolve, 600));
@@ -1912,7 +1921,14 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
       loadApps();
     } catch (e) {
       hideAppCfgProgress();
-      if (e.data?.saved) {
+      if (e.data?.needsAmendApproval) {
+        msg.textContent = e.message;
+        showAmendApproval(
+          e.data.amendments,
+          () => doAppComplete(launchNow, force, overwrite, true),
+          `${data.appName} would amend existing containers. Review the other instances and changes below before approving.`
+        );
+      } else if (e.data?.saved) {
         // The new compose is already on disk; only the deploy step failed.
         // Say so explicitly instead of making it look like the edit was lost.
         msg.textContent = `${e.message} The compose file was saved.`;
@@ -1920,8 +1936,7 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
         refreshAll();
         loadApps();
         return;
-      }
-      if (e.data && Array.isArray(e.data.issues) && e.data.issues.length) {
+      } else if (e.data && Array.isArray(e.data.issues) && e.data.issues.length) {
         msg.textContent = e.message;
         showComposeIssues(e.data.issues, () => doAppComplete(launchNow, true));
       } else {
@@ -1964,7 +1979,8 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
     vhostService: data.vhostService || '',
     launchNow,
     force,
-    overwrite
+    overwrite,
+    confirmAmend
   };
 
   if (!force) {
@@ -2042,6 +2058,15 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
     if (e.data?.alreadyFinalizing) {
       msg.textContent = e.message;
       toast('This app is already being created. Wait for it to finish.', true);
+      return;
+    }
+    if (e.data?.needsAmendApproval) {
+      msg.textContent = e.message;
+      showAmendApproval(
+        e.data.amendments,
+        () => doAppComplete(launchNow, force, overwrite, true),
+        `${payload.appName} would amend existing containers. Review the other instances and changes below before approving.`
+      );
       return;
     }
     if (e.status === 409 && e.data?.needsOverwrite) {
@@ -2400,6 +2425,53 @@ qs('#newFileBtn').addEventListener('click', () => {
 // ---------------- Registry ----------------
 const typeLabels = { run: 'docker run', compose: 'compose', source: 'project', git: 'git', upload: 'upload', container: 'container' };
 
+let amendApprovalAction = null;
+
+function renderAmendApproval(amendments, intro) {
+  const body = qs('#amendApprovalBody');
+  if (!body) return;
+  const data = amendments || {};
+  const instances = Array.isArray(data.instances) ? data.instances : [];
+  const changes = Array.isArray(data.changes) ? data.changes : [];
+  qs('#amendApprovalIntro').textContent = intro || 'Dok needs to amend existing containers before this app can start. Other instances of the app are listed below. Review the changes and approve them to continue.';
+  const instanceRows = instances.length
+    ? instances.map(item => `
+      <div class="item">
+        <div class="item-header">
+          <div>
+            <div class="item-title mono">${escapeHtml(item.name)} ${item.action === 'rename' ? badge('other instance', 'type') : badge('this app', 'type')}</div>
+            <div class="item-sub">${escapeHtml(item.project || 'standalone')}${item.service ? ` · service ${escapeHtml(item.service)}` : ''}${item.state ? ` · ${escapeHtml(item.state)}` : ''}</div>
+            <div class="item-sub mono">${escapeHtml(item.image || '')}${item.nextName ? ` → ${escapeHtml(item.nextName)}` : ''}</div>
+          </div>
+        </div>
+      </div>`).join('')
+    : '<p class="muted">No running containers were found for this app.</p>';
+  body.innerHTML = `
+    <div class="builder-group">
+      <strong>Affected app instances</strong>
+      ${instanceRows}
+    </div>
+    <div class="builder-group">
+      <strong>Changes to apply</strong>
+      ${changes.length ? `<ul>${changes.map(change => `<li>${escapeHtml(change)}</li>`).join('')}</ul>` : '<p class="muted">No container changes are needed.</p>'}
+    </div>`;
+  qs('#amendApprovalModal')?.classList.remove('hidden');
+}
+
+function showAmendApproval(amendments, action, intro) {
+  amendApprovalAction = typeof action === 'function' ? action : null;
+  renderAmendApproval(amendments, intro);
+}
+
+if (qs('#amendApprove')) {
+  qs('#amendApprove').addEventListener('click', async () => {
+    const action = amendApprovalAction;
+    amendApprovalAction = null;
+    qs('#amendApprovalModal')?.classList.add('hidden');
+    if (action) await action();
+  });
+}
+
 async function loadRegistry() {
   const list = qs('#appsList') || qs('#registryList');
   if (!list) return;
@@ -2423,16 +2495,16 @@ async function loadRegistry() {
         <div class="item" data-id="${escapeHtml(entry.id)}">
           <div class="item-header">
             <div>
-              <div class="item-title">${escapeHtml(entry.name)} ${badge(typeLabels[entry.type] || entry.type, 'type')}</div>
+              <div class="item-title">${escapeHtml(entry.name)} ${badge(typeLabels[entry.type] || entry.type, 'type')} ${entry.needsConfig ? badge('needs setup', 'type') : (entry.library ? badge('library', 'type') : '')}</div>
               <div class="item-sub mono">${escapeHtml(detail)}</div>
-              <div class="item-sub">${meta ? escapeHtml(meta) + ' · ' : ''}Saved ${entry.created ? new Date(entry.created).toLocaleString() : 'unknown'}</div>
+              <div class="item-sub">${meta ? escapeHtml(meta) + ' · ' : ''}${entry.needsConfig ? 'Configure before launching · ' : ''}Saved ${entry.created ? new Date(entry.created).toLocaleString() : 'unknown'}</div>
             </div>
             <div class="item-actions">
-              <button class="btn btn-primary" data-act="deploy">Quick Deploy</button>
+              <button class="btn btn-primary" data-act="${entry.needsConfig ? 'configure' : 'deploy'}">${entry.needsConfig ? 'Configure & Deploy' : 'Quick Deploy'}</button>
               <button class="btn" data-act="alter">Alter State</button>
-              <button class="btn" data-act="start">Start</button>
+              ${entry.needsConfig ? '' : '<button class="btn" data-act="start">Start</button>'}
               <button class="btn" data-act="stop">Stop</button>
-              <button class="btn" data-act="restart">Restart</button>
+              ${entry.needsConfig ? '' : '<button class="btn" data-act="restart">Restart</button>'}
               ${entry.sourcePath && !String(entry.sourcePath).startsWith('/') ? '<button class="btn" data-act="browse">Browse</button>' : ''}
               <button class="btn btn-danger" data-act="delete">Remove</button>
             </div>
@@ -2461,18 +2533,28 @@ async function loadRegistry() {
             openTab('sources');
             return;
           }
-          if (act === 'alter') {
+          if (act === 'alter' || act === 'configure') {
             setLoading(btn, true, 'Loading…');
             try {
               const res = await api(`/api/apps/${encodeURIComponent(entry.id)}/compose`);
+              const issues = Array.isArray(res.issues) ? [...res.issues] : [];
+              if (Array.isArray(res.missingNetworks) && res.missingNetworks.length) {
+                issues.push(`Networks not found on this server: ${res.missingNetworks.map(net => net.name || net.key || net).join(', ')}. Update the network fields or create the networks before deploying.`);
+              }
+              if (Array.isArray(res.missingVolumes) && res.missingVolumes.length) {
+                issues.push(`Host paths not found: ${res.missingVolumes.map(item => item.source || item).join(', ')}. Update the volume sources before deploying.`);
+              }
               openAppConfig({
                 appName: entry.name,
                 appDir: res.appDir,
                 compose: res.compose,
                 editAppId: entry.id,
-                network: entry.launch?.network || 'wicked',
-                vhost: entry.launch?.vhost || '',
-                vhostPort: entry.launch?.vhostPort || ''
+                network: res.network || entry.launch?.network || 'wicked',
+                vhost: res.vhost || entry.launch?.vhost || '',
+                vhostPort: res.vhostPort || entry.launch?.vhostPort || '',
+                vhostService: res.vhostService || '',
+                issues,
+                needsConfiguration: !!entry.needsConfig
               });
             } catch (e) {
               toast(e.message, true);
@@ -2486,21 +2568,34 @@ async function loadRegistry() {
             ? `/api/registry/${encodeURIComponent(entry.id)}/deploy`
             : `/api/registry/${encodeURIComponent(entry.id)}/${act}`;
           const label = act === 'deploy' ? 'Deploying…' : `${act[0].toUpperCase()}${act.slice(1)}…`;
-          setLoading(btn, true, label);
-          try {
-            const res = await api(url, { method: 'POST' });
-            if (res.pending) toast(res.message || `${entry.name} is still starting`);
-            else if (res.renamed && res.renamed.length) {
-              const names = res.renamed.map(item => item.to).join(', ');
-              toast(`${entry.name} deployed. Renamed conflicting container${res.renamed.length === 1 ? '' : 's'} to ${names}.`);
-            } else toast(act === 'deploy' ? `${entry.name} deployed` : `${entry.name}: ${act} requested`);
-            loadApps();
-            refreshAll();
-          } catch (e) {
-            toast(e.message, true);
-          } finally {
-            setLoading(btn, false);
-          }
+          const runAction = async (confirmAmend = false) => {
+            setLoading(btn, true, confirmAmend ? 'Applying approved changes…' : label);
+            try {
+              const res = await api(url, jsonBody({ confirmAmend }));
+              if (res.pending) toast(res.message || `${entry.name} is still starting`);
+              else if (Array.isArray(res.amended) && res.amended.length) {
+                toast(`${entry.name} deployed. ${res.amended.join(' ')}`, false, 8000);
+              } else if (res.renamed && res.renamed.length) {
+                const names = res.renamed.map(item => item.to).join(', ');
+                toast(`${entry.name} deployed. Renamed conflicting container${res.renamed.length === 1 ? '' : 's'} to ${names}.`);
+              } else toast(act === 'deploy' ? `${entry.name} deployed` : `${entry.name}: ${act} requested`);
+              loadApps();
+              refreshAll();
+            } catch (e) {
+              if (e.data?.needsAmendApproval) {
+                showAmendApproval(
+                  e.data.amendments,
+                  () => runAction(true),
+                  `${entry.name} would amend existing containers. Review the other instances and changes below before approving.`
+                );
+              } else {
+                toast(e.message, true);
+              }
+            } finally {
+              setLoading(btn, false);
+            }
+          };
+          runAction(false);
         });
       });
     });
@@ -2514,6 +2609,122 @@ async function loadApps() {
 }
 if (qs('#registryRefresh')) qs('#registryRefresh').addEventListener('click', loadApps);
 if (qs('#appsRefresh')) qs('#appsRefresh').addEventListener('click', loadApps);
+
+// ---------------- App library export/import ----------------
+async function openLibraryExport() {
+  const modal = qs('#libraryExportModal');
+  const list = qs('#libraryExportList');
+  if (!modal || !list) return;
+  modal.classList.remove('hidden');
+  if (qs('#libraryExportName')) qs('#libraryExportName').value = `Dok app library ${new Date().toLocaleDateString()}`;
+  if (qs('#libraryExportMsg')) qs('#libraryExportMsg').textContent = '';
+  list.innerHTML = '<div class="empty">Loading apps…</div>';
+  try {
+    const data = await api('/api/registry');
+    if (!Array.isArray(data) || !data.length) {
+      list.innerHTML = '<div class="empty">No apps are available to export.</div>';
+      return;
+    }
+    list.innerHTML = data.map(entry => `
+      <label class="item" style="cursor:pointer">
+        <div class="item-header">
+          <div>
+            <div class="item-title"><input type="checkbox" value="${escapeHtml(entry.id)}" checked> ${escapeHtml(entry.name)} ${badge(typeLabels[entry.type] || entry.type, 'type')}</div>
+            <div class="item-sub mono">${escapeHtml(entry.appDir || entry.path || '')}</div>
+            ${entry.library?.name ? `<div class="item-sub">Exported from ${escapeHtml(entry.library.name)}</div>` : ''}
+          </div>
+        </div>
+      </label>`).join('');
+  } catch (e) {
+    list.innerHTML = `<div class="empty">Unable to load apps: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+if (qs('#libraryExportBtn')) qs('#libraryExportBtn').addEventListener('click', openLibraryExport);
+if (qs('#libraryExportDo')) {
+  qs('#libraryExportDo').addEventListener('click', async () => {
+    const btn = qs('#libraryExportDo');
+    const msg = qs('#libraryExportMsg');
+    const ids = qsa('#libraryExportList input[type="checkbox"]').filter(input => input.checked).map(input => input.value);
+    if (!ids.length) {
+      if (msg) msg.textContent = 'Select at least one app.';
+      return;
+    }
+    setLoading(btn, true, 'Exporting…');
+    if (msg) msg.textContent = '';
+    try {
+      const res = await fetch('/api/library/export', jsonBody({
+        apps: ids,
+        name: qs('#libraryExportName')?.value.trim() || 'Dok app library'
+      }));
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || res.statusText || 'Export failed');
+      }
+      const blob = await res.blob();
+      const disposition = res.headers.get('content-disposition') || '';
+      const match = disposition.match(/filename="?([^";]+)"?/i);
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = match ? match[1] : 'dok-library.tar.gz';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(link.href), 5000);
+      qs('#libraryExportModal')?.classList.add('hidden');
+      toast(`Exported ${ids.length} app${ids.length === 1 ? '' : 's'}`, false, 6000);
+    } catch (e) {
+      if (msg) msg.textContent = e.message;
+      toast(e.message, true);
+    } finally {
+      setLoading(btn, false, 'Export selected apps');
+    }
+  });
+}
+
+async function importLibraryFile(file, overwrite = false) {
+  const form = new FormData();
+  form.append('file', file);
+  form.append('overwrite', overwrite ? 'true' : 'false');
+  const res = await fetch('/api/library/import', { method: 'POST', body: form });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(data.error || res.statusText || 'Import failed');
+    err.status = res.status;
+    err.data = data;
+    throw err;
+  }
+  return data;
+}
+
+if (qs('#libraryImportFile')) {
+  qs('#libraryImportFile').addEventListener('change', async (event) => {
+    const input = event.target;
+    const file = input.files?.[0];
+    if (!file) return;
+    try {
+      let result;
+      try {
+        result = await importLibraryFile(file, false);
+      } catch (e) {
+        if (e.status === 409 && e.data?.needsOverwrite) {
+          const names = Array.isArray(e.data.apps) ? e.data.apps.join(', ') : 'the selected apps';
+          if (!confirm(`${names} already exist. Overwrite their app files?`)) throw e;
+          result = await importLibraryFile(file, true);
+        } else {
+          throw e;
+        }
+      }
+      toast(result.message || `Imported ${result.imported?.length || 0} app${result.imported?.length === 1 ? '' : 's'}`, false, 9000);
+      await loadApps();
+      refreshAll();
+    } catch (e) {
+      toast(e.message, true, 8000);
+    } finally {
+      input.value = '';
+    }
+  });
+}
 
 // ---------------- Settings ----------------
 let coreCfData = null;

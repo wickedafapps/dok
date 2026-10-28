@@ -56,7 +56,8 @@ docker run -d --name wickedafdok -p 8080:8080 \
 ├── public/              # Frontend
 │   ├── index.html       # UI structure
 │   ├── css/style.css    # Styles
-│   └── js/app.js        # Frontend logic
+│   ├── js/app.js        # Frontend logic
+│   └── js/manual.js     # In-app manual, section help, and field labels/tooltips
 ├── apps/                # Deployed apps (each app in its own subdirectory with compose)
 ├── core/                # Core services (nginx-proxy, cloudflared, authentik, authelia, dns, mailpit, host-helper)
 ├── data/                # Persistent data (registry, settings, backups, logs, managed compose)
@@ -109,7 +110,7 @@ The unified way to deploy applications. Every app is stored in `apps/<name>/` wi
 2. **Docker Compose** - Paste `docker-compose.yml`/`compose.yaml` content. Stored in the app's own managed compose file and opened in App Configuration modal.
 3. **Git Clone** - Provide any git URL (generic git, not limited to GitHub API). If repo contains `docker-compose.yml`/`compose.yaml` or `Dockerfile`, files are copied to `apps/<name>` and opened in App Configuration modal; Dockerfile-only projects get a generated compose file. If no compose/Dockerfile found, routed to **Projects**.
 4. **Local Upload** - Upload files/folders via multipart form. If compose or Dockerfile present, files are copied to `apps/<name>` and opened in App Configuration modal; Dockerfile-only uploads get a generated compose file. Otherwise routed to **Projects**.
-5. **OC Assist** - Describe the app in a required prompt, optionally paste data (docker run, compose, repository/page URL) and upload files. WickedAFDok writes a private brief plus the uploads under `sources/oc-assist-<stamp>-<random>/`, starts an Admin OpenCode session with that brief, and the agent creates the compose, registers the app through `server/assist-register.mjs`, and deploys it. Use `#assistPrompt`, `#assistData`, `#assistName`, `#assistFiles`, `#assistFolder`, `#assistStartBtn`, and `#assistOutput`.
+5. **OC Assist** - Describe the app in a required prompt, optionally paste data (docker run, compose, repository/page URL) and upload files. WickedAFDok writes a private brief plus the uploads under `sources/oc-assist-<stamp>-<random>/`, starts a **User-mode** OpenCode session with the dedicated `assist` agent and the creator fields already in the first prompt, and immediately opens the chat in the terminal modal. The assist agent is restricted to app files, the OC Assist source/brief folders, and the registration helper; it creates the compose, registers the app through `server/assist-register.mjs`, and deploys it. Use `#assistPrompt`, `#assistData`, `#assistName`, `#assistFiles`, `#assistFolder`, `#assistStartBtn`, and `#assistOutput`.
 
 **App Configuration Modal:**
 - Opens with a visual Compose builder (`#appCfgBuilder`) populated from the managed compose via `/api/compose/parse`
@@ -140,11 +141,17 @@ The unified way to deploy applications. Every app is stored in `apps/<name>/` wi
 ### Apps
 - Lists all apps from `data/registry.json`
 - Each app managed from `apps/<name>/` via docker compose
-- Actions: **Quick Deploy** (one-click compose up), **Alter State** (opens the compose editor for the app's base config), start, stop, restart, and remove
-- Quick Deploy resolves duplicate `container_name` conflicts by renaming the stale non-core container to `<name>-previous-<shortid>`; conflicts with protected core services abort with `409`
-- Alter State saves the edited compose as the new base `docker-compose.yml` (or the app's existing compose filename), removes the generated `docker-compose.wickedafdok.yml` override, re-adds the `wicked` default network and prior `VIRTUAL_HOST`/`VIRTUAL_PORT` when needed, and can save only or save and deploy
+- Actions: **Quick Deploy** (one-click compose up), **Alter State** (opens the visual compose builder for the app's base config), start, stop, restart, and remove
+- Quick Deploy resolves duplicate `container_name` conflicts by renaming the stale non-core container to `<name>-previous-<shortid>`; conflicts with protected core services abort with `409`. Before renaming, the API returns `409 needsAmendApproval` with an `amendments` list, and the UI shows `#amendApprovalModal` so the user can review every affected instance (including `this app` vs `other instance`) and approve or cancel. Approval resubmits with `confirmAmend: true`.
+- Alter State saves the edited compose as the new base `docker-compose.yml` (or the app's existing compose filename), removes the generated `docker-compose.wickedafdok.yml` override, re-adds the `wicked` default network and prior `VIRTUAL_HOST`/`VIRTUAL_PORT` when needed, and can save only or save and deploy. It loads the visual builder from `/api/apps/:id/compose`; the response surfaces the saved routing env from the generated override in the editable base compose and includes parsed network/vhost data and issues, but missing networks/volumes are reported as guidance because this route edits the base compose directly.
 - A first start that reports failure while project containers already exist is returned as `launchPending` instead of a failure so slow builds are not misreported
 - UI element: `#tab-apps`, `#appsList`, `#appsRefresh`
+
+### App Library
+- Export/import uses the `wickedafdok.library/v1` schema (`kind: wickedafdok-app-library`). The archive contains `dok-library.json` plus `apps/<name>/...`.
+- `POST /api/library/export` accepts `{ apps: [ids], name }` and returns a `.tar.gz` attachment. Apps are stripped of installation-specific data: `container_name`, `VIRTUAL_HOST`/`VIRTUAL_PORT`/`ENABLE_AUTH`/`LETSENCRYPT_*`, published host ports, absolute bind sources (except `/var/run/docker.sock`, `/etc/localtime`, `/etc/timezone`), top-level `name`, external network names (except the shared `wicked` network), external/name fields on named volumes, generated `docker-compose.wickedafdok.yml`, `.env*` (except `.env.example`), `.git`, `node_modules`, and the app's root `data` directory. Requirements metadata is sanitized the same way.
+- `POST /api/library/import` accepts the archive (multipart `file`), validates the manifest, and imports into `apps/<name>`. Existing non-empty apps return `409` with `needsOverwrite`; overwriting preserves the existing root `data` directory and `.env*` files. Imported apps are registered with `needsConfig: true` and library metadata; the Apps UI shows **Configure & Deploy**, which opens the visual compose editor so the user can supply local domains, ports, paths, and secrets.
+- UI: `#libraryExportBtn`, `#libraryImportFile`, `#libraryExportModal`, `#libraryExportList`, `#libraryExportDo`.
 
 ### Projects / Sources
 - Browse and edit files under `sources/` directory
@@ -166,6 +173,13 @@ Settings is split into four subtabs: **Core Services**, **Dok Settings**, **Logs
 - `defaultNetwork` is used by app creation and may be auto-created on first use
 - `protectDok` adds the Dok host to the Authelia protected set without recreating the Dok container; the Dok domain must already route through nginx-proxy, the Authelia portal domain must be set, and both must share a cookie domain for the protection to take effect. Enabling it is rejected (and the setting reverted) when sync cannot generate the auth vhost
 - Saving defaults creates the configured data location and apps folder, validates domains/modes, and triggers Authelia vhost sync when `protectDok` changes
+
+**User manual and field help:**
+- `public/js/manual.js` renders the in-app manual from `MANUAL_GROUPS`/`MANUAL`, opens `#manualModal`, and wires the Settings header **User manual** button plus every `[data-open-manual]` section button.
+- The manual covers every section (dashboard, containers, images, app creation, apps/library, sources, terminal/OpenCode, core services, Dok settings, logs, backups, troubleshooting) and includes a field reference.
+- Top-level tab headers, App Creation panes, Settings panes, and settings/app-creation card headings have a `?` section-help button that opens the matching manual section.
+- `decorateFields()` wraps unlabeled inputs/selects/textareas in `.field-wrap` with a visible label and adds a `.field-help` `?` tooltip using `FIELD_LABEL`/`FIELD_HELP`. A MutationObserver decorates dynamically rendered fields and syncs hidden wrappers; builder/terminal controls are excluded.
+- `#openManualBtn`, `[data-open-manual]`, `#manualModal`, `#manualTitle`, `#manualContent`, `#manualNav` are the main UI hooks.
 
 **Designer:**
 - `#openDesigner` in Dok Settings opens `#designerModal`
@@ -311,7 +325,7 @@ The **Core Services** subtab manages the bundled services. Each created service 
 - `POST /api/launch/git` - Clone git repo and process
 - `POST /api/launch/upload` - Upload files and process
 - `POST /api/launch/source` - Deploy from sources directory
-- `POST /api/assist/start` - Upload optional files, write the OC Assist brief, and start an Admin OpenCode session (`prompt`, optional `data`, `name`, `files`, `paths`)
+- `POST /api/assist/start` - Upload optional files, write the OC Assist brief, and start a User-mode `assist` OpenCode session (`prompt`, optional `data`, `name`, `files`, `paths`)
 - `POST /api/launch/finalize` - Complete creation (save to apps dir, update registry, optionally launch); a per-app lock returns `409 alreadyFinalizing` and failures after the registry write return `created: true`
 - `POST /api/compose/validate` - Validate compose file content
 - `POST /api/compose/parse` - Parse a compose file into editable builder fields
@@ -368,9 +382,13 @@ The **Core Services** subtab manages the bundled services. Each created service 
 - `GET /api/registry` - List apps in registry
 - `POST /api/registry/:id/deploy` - Quick Deploy: compose up, resolving duplicate container names
 - `POST /api/registry/:id/:action(start|stop|restart)` - App compose lifecycle actions
-- `GET /api/apps/:id/compose` - Read the app's base compose file
-- `POST /api/apps/:id/compose` - Save an edited compose as the new base (`deploy: true` re-deploys; `force: true` saves despite validation issues)
+- `GET /api/apps/:id/compose` - Read the app's base compose file (with saved routing env surfaced) plus network/vhost analysis and issues
+- `POST /api/apps/:id/compose` - Save an edited compose as the new base (`deploy: true` re-deploys; `force: true` saves despite validation issues; `confirmAmend: true` approves container renames)
 - `DELETE /api/registry/:id` - Remove from registry
+
+### App Library
+- `POST /api/library/export` - Export selected registry apps as a `wickedafdok.library/v1` `.tar.gz`
+- `POST /api/library/import` - Import a library archive; returns `409 needsOverwrite` when the target app exists
 
 ### Designer
 - `GET /api/designer` / `POST /api/designer` - Read or save name, tagline, CSS, and logo state
@@ -415,9 +433,16 @@ The **Core Services** subtab manages the bundled services. Each created service 
 - `POST /api/settings/defaults/apply` re-creates the data location and `<dataLocation>/apps` through `ensureHostDirectory()` (direct or Host Helper), applying the octal mode.
 
 ### OC Assist
-- `POST /api/assist/start` validates the prompt/name, rejects concurrent starts for the same app name, saves uploads under `sources/oc-assist-<stamp>-<random>/` (traversal-checked), writes a private brief at `data/opencode/assist/<stamp>-<random>/brief.md`, and starts an Admin OpenCode session with `--prompt` and title `OC Assist · <app>`. The random suffix keeps two requests in the same second from sharing a directory.
+- `POST /api/assist/start` validates the prompt/name, rejects concurrent starts for the same app name, saves uploads under `sources/oc-assist-<stamp>-<random>/` (traversal-checked), writes a private brief at `data/opencode/assist/<stamp>-<random>/brief.md`, and starts a User-mode OpenCode session with the dedicated `assist` agent and title `OC Assist · <app>`. The random suffix keeps two requests in the same second from sharing a directory.
 - The brief includes instructions, pasted data, uploaded file paths, and default admin username/email (never the password).
-- The agent registers/deploys through `server/assist-register.mjs --name <app> --dir /app/apps/<app> --launch`, which posts to `/api/launch/finalize` with `overwrite: true`; `--launch` is opt-in so a dry registration is possible.
+- The `assist` agent uses the User-mode permission model with external access limited to the app directory, `sources/oc-assist-*`, `data/opencode/assist/**`, and `server/assist-register.mjs`; Docker/system/privilege commands remain denied. The UI opens the returned session directly in the terminal modal.
+- The agent registers/deploys through `server/assist-register.mjs --name <app> --dir /app/apps/<app> --launch`, which posts to `/api/launch/finalize` with `overwrite: true`; `--launch` is opt-in so a dry registration is possible, and `--confirm-amend` approves reviewed container renames.
+
+### App Library
+- `sanitizeComposeForLibrary()` parses YAML, removes installation-specific fields, rewrites published ports to their container port (including host-IP and long syntax), maps absolute bind sources to relative `./data/...` paths, preserves the shared `wicked` external network, and strips `external`/`name` from other networks and named volumes. `libraryFiles()` walks the app directory while skipping generated/runtime files, symlinks, app data, env files, `.git`, and `node_modules`.
+- Export builds a temporary staging tree, writes `dok-library.json` (`schema`, `kind`, `version`, `name`, `created`, `apps`), archives it as `.tar.gz`, and streams it as an attachment. The registry is never modified.
+- Import validates the schema/kind, sanitizes app names, rejects traversal, extracts to a staging directory, and copies into `apps/<name>`. It preserves existing `data/` and `.env*` on overwrite, writes library metadata to the registry, and sets `needsConfig: true`.
+- Imported apps are launched through the normal App Configuration builder, which lets the user provide domains, ports, host paths, and secrets before the first deploy.
 
 ### Compose Management
 - All apps use docker compose from their own directory
@@ -532,8 +557,9 @@ The **Core Services** subtab manages the bundled services. Each created service 
 - App Creation: `#runCreateBtn`, `#composeCreateBtn`, `#gitCloneBtn`, `#uploadBtn`, OC Assist (`#assistPrompt`, `#assistData`, `#assistName`, `#assistFiles`, `#assistFolder`, `#assistStartBtn`, `#assistOutput`)
 - App Config Modal: `#appConfigModal`, `#appCfgBuilder`, `#appCfgCompose`, `#appCfgEditCompose`, `#appCfgValidate`, `#appCfgComplete`, `#appCfgCompleteRun`, `#appCfgProgress`
 - Notices: `#appCfgNetworkNotice`, `#appCfgVolumeNotice`, `#appCreationNginxNotice`, `#appCreationNginxNoticeModal`
-- Modals: `#composeEditWarningModal`, `#composeSaveConfirmModal`, `#appOverwriteModal`, `#authContainersModal`, `#autheliaUsersModal`, `#designerModal`
-- Apps List: `#appsList`, `#appsRefresh`
+- Modals: `#composeEditWarningModal`, `#composeSaveConfirmModal`, `#appOverwriteModal`, `#amendApprovalModal`, `#libraryExportModal`, `#manualModal`, `#authContainersModal`, `#autheliaUsersModal`, `#designerModal`
+- Apps List: `#appsList`, `#appsRefresh`, `#libraryExportBtn`, `#libraryImportFile`, `#libraryExportList`, `#libraryExportDo`
+- Manual: `#openManualBtn`, `[data-open-manual]`, `#manualTitle`, `#manualContent`, `#manualNav`
 - Settings: `#tab-settings`, `#settingsSubtabs`, `#settings-pane-core`, `#settings-pane-dok`, `#settings-pane-logs`, `#settings-pane-backups`, `#coreAllStart`, `#coreAllStop`, `#coreAllRestart`, `#nginxNetwork`, `#runNginxProxyCore`, `#authRunBtn`, `#dnsRunBtn`, `#mailSmtpHost`, `#mailSmtpPort`, `#mailSmtpTls`, `#mailSmtpUser`, `#mailSmtpPassword`, `#mailSmtpSender`, `#mailSaveSmtp`, `#mailUseMailpit`, `#mailStatus`, `#mailpitRunBtn`, `#mailpitStatus`, `#mailpitOpenBtn`, `#helperRunBtn`
 - Designer: `#openDesigner`, `#designerName`, `#designerTagline`, `#designerCss`, `#designerLogoFile`, `#designerLogoUpload`, `#designerLogoRemove`, `#designerFilePath`, `#designerFileContent`, `#designerFileSave`
 - Auth picker: `#authContainersList`, `#authApplySelected`, `#authSelectAll`, `#authSelectNone`, `#authApplyMsg`
@@ -600,33 +626,24 @@ The **Core Services** subtab manages the bundled services. Each created service 
 
 ##------------------------------------------Your current task--------------------------------------
 
-To hopefully simplify things create a new section for the user to define default/fallback settings and anything you think should be set to make everything function smoother.
-When launching the auth service it didn't find any of the containers that were running to list for selection so the wickedafdok is still without auth.
-Still showing failures on apps that install successfully leaving the window open. It's confusing and the app gets installed over and over when it was successful in the first place.
+These changes have been started but not completed
+Apps:
+ When clicking alter state to configure an existing app for redeploy under different settings. The compose editor does not load for editing the fields. Just the raw compose file.
 
-Settings:
- Dok Settings:
-  Add a section for the user to define default/fallback settings.
-   1. set a Primary Domain
-   2. set doks domain - autofilled if set with nginx first
-   3. Set a data location and its permissions - User defined app storage location. This becomes the default as /user/defined/path/apps/appname/data.
-   4. Choose if volume paths can be set outside the data location. Allowing paths outside the data location allows creation and setting permissions with sudo.
-   5. Set default admin creds and email - when set autofills admin info for apps and services
-If there is anything you think should be set here to make everything function smoother, suggest it so we can add it.
+ App creation with OC Assist is confusing and the opencode chat never opens. OC Assist is for app creation and should always be in usermode with only the permissions needed to create, edit and launch apps and add them to the apps library. Once the user hits create app with OC Assist the chat interface should be open directly with the infornmation from the creator fields already passed without the user having to do anything else unless opencode needs more information or actions from the user.
 
- Core Services:
-  Add an edit button to each service after its created that opens the compose editor to manually update changes if needed like adding auth etc..
-  Group the wickedafdok container with core services
+ When apps are amended by the system with quick deploy or any other means. There should be a notification to the user listing other instances of the app and what is being amended to avoid conflicts for the user to approve.
 
- Authentication:
-   Create a management interface for Authelia for administration, user management, and configuration. Add a button to access it.
+Apps:
+ Library Export/Import:
+  Define a Structure and rules that all apps added to the library adhere to.
+  Create an export feature for the app library. The user can select which apps to include in the exported library. The library can then be imported into any installation of Dok.
+  The apps should be stripped of any information or settings specific to the current Dok installation when exported.
+  When apps from imported libraries are launched they open the compose editor for the user to provide the information needed just like the alter state button used when manually deploying another container of an existing app.
 
- App Creator:
-  Create a new section called "OC Assist". This will be the most versitile and cool creation option.
-  It will have a required prompt field to state your app instructions.
-  It will have an optional data input field to paste whatever you need, such as docker run, compose, link to repository or web page whatever
-  Optional local upload
-  A Create App button
-The Create App button launches open code and passes the prompt, data and local upload info if any. Opencode and the user use the chat to go over any other details and Opencode creates your app and adds it to the Apps Section.
+Dok:
+ Add labels to all fields and add a "?" that when hovered over gives a brief explanation of the fields function
+ Create a detailed instruction manual for each individual section in Dok and add a "?" in the top corner of each section that when clicked opens detailed instructions for that section.
+ Compile all the instructions into a detailed user manual. Add a button in settings to open the manual.
 
 Push to github

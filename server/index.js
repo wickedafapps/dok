@@ -5247,7 +5247,7 @@ function composeContainerNames(compose) {
   const names = {};
   let service = '';
   for (const line of String(compose || '').split('\n')) {
-    const header = line.match(/^  ([A-Za-z0-9_.-]+):\s*$/);
+    const header = line.match(/^  ([A-Za-z0-9_.-]+):\s*(?:#.*)?$/);
     if (header) { service = header[1]; continue; }
     const value = line.match(/^\s+container_name:\s*['"]?([^'"#\s]+)/);
     if (value && service) names[service] = value[1];
@@ -5255,44 +5255,123 @@ function composeContainerNames(compose) {
   return names;
 }
 
-// Compose refuses to start when a container_name already belongs to another
-// container. Rename the stale container instead of deleting it, which keeps
-// its data and makes Quick Deploy succeed on the first try.
-async function resolveProjectNameConflicts(project, compose) {
+function containerListNames(container) {
+  return (container?.Names || []).map(name => String(name).replace(/^\//, ''));
+}
+
+function nextContainerRename(name, id, containers, reserved = new Set()) {
+  const shortId = String(id || '').slice(0, 8);
+  let nextName = `${name}-previous-${shortId}`;
+  let suffix = 1;
+  while (reserved.has(nextName) ||
+    containers.some(c => containerListNames(c).includes(nextName))) {
+    nextName = `${name}-previous-${shortId}-${suffix++}`;
+  }
+  reserved.add(nextName);
+  return nextName;
+}
+
+// Builds the list of changes Quick Deploy would make to existing containers so
+// the UI can ask for approval before the system renames another app's
+// container or recreates running instances.
+async function inspectComposeAmendments(project, compose) {
   const desired = composeContainerNames(compose);
-  if (!Object.keys(desired).length) return [];
   let containers = [];
-  try { containers = await docker.listContainers({ all: true }); } catch { return []; }
-  const renamed = [];
+  try { containers = await docker.listContainers({ all: true }); } catch {}
+  const own = containers.filter(c => c.Labels?.['com.docker.compose.project'] === project);
+  const renames = [];
+  const blocked = [];
+  const reserved = new Set();
   for (const [service, containerName] of Object.entries(desired)) {
-    const existing = containers.find(c => (c.Names || []).some(n => n.replace(/^\//, '') === containerName));
+    const existing = containers.find(c => containerListNames(c).includes(containerName));
     if (!existing) continue;
     const labels = existing.Labels || {};
     if (labels['com.docker.compose.project'] === project) continue;
     const protection = coreContainerInfo({ name: containerName, Labels: labels });
     if (protection.protected) {
-      throw httpError(409,
-        `"${containerName}" belongs to a protected core service and cannot be reused by ${project}. ` +
-        'Change container_name in the compose file or remove the conflicting service first.');
+      blocked.push({
+        service,
+        name: containerName,
+        project: labels['com.docker.compose.project'] || '',
+        state: existing.State || '',
+        image: existing.Image || ''
+      });
+      continue;
     }
-    const shortId = existing.Id.slice(0, 8);
-    let nextName = `${containerName}-previous-${shortId}`;
-    let suffix = 1;
-    while (containers.some(c => (c.Names || []).some(n => n.replace(/^\//, '') === nextName))) {
-      nextName = `${containerName}-previous-${shortId}-${suffix++}`;
-    }
+    renames.push({
+      service,
+      from: containerName,
+      to: nextContainerRename(containerName, existing.Id, containers, reserved),
+      containerId: existing.Id,
+      state: existing.State || '',
+      project: labels['com.docker.compose.project'] || '',
+      image: existing.Image || ''
+    });
+  }
+  const instances = [
+    ...own.map(container => {
+      const name = containerListNames(container)[0] || container.Id.slice(0, 12);
+      return {
+        name,
+        state: container.State || '',
+        project,
+        service: container.Labels?.['com.docker.compose.service'] || '',
+        image: container.Image || '',
+        action: 'recreate'
+      };
+    }),
+    ...renames.map(rename => ({
+      name: rename.from,
+      state: rename.state,
+      project: rename.project,
+      service: rename.service,
+      image: rename.image,
+      action: 'rename',
+      nextName: rename.to
+    }))
+  ];
+  const changes = [
+    ...renames.map(rename => `Rename container "${rename.from}"${rename.project ? ` (project ${rename.project})` : ''} to "${rename.to}".`),
+    ...own.map(container => {
+      const name = containerListNames(container)[0] || container.Id.slice(0, 12);
+      return `Recreate or update "${name}" in project "${project}".`;
+    })
+  ];
+  return {
+    app: project,
+    requiresApproval: renames.length > 0,
+    blocked,
+    renames,
+    instances,
+    changes
+  };
+}
+
+// Compose refuses to start when a container_name already belongs to another
+// container. Rename the stale container instead of deleting it, which keeps
+// its data and makes Quick Deploy succeed after the user approves the change.
+async function resolveProjectNameConflicts(project, compose, plan = null) {
+  const amendment = plan || await inspectComposeAmendments(project, compose);
+  if (amendment.blocked.length) {
+    const item = amendment.blocked[0];
+    throw httpError(409,
+      `"${item.name}" belongs to a protected core service and cannot be reused by ${project}. ` +
+      'Change container_name in the compose file or remove the conflicting service first.');
+  }
+  const renamed = [];
+  for (const rename of amendment.renames) {
     try {
-      await docker.getContainer(existing.Id).rename({ name: nextName });
-      renamed.push({ service, from: containerName, to: nextName });
-      appendServerLog('INFO', `Quick Deploy renamed conflicting container ${containerName} to ${nextName}`);
+      await docker.getContainer(rename.containerId).rename({ name: rename.to });
+      renamed.push({ service: rename.service, from: rename.from, to: rename.to });
+      appendServerLog('INFO', `Quick Deploy renamed conflicting container ${rename.from} to ${rename.to}`);
     } catch (e) {
-      throw httpError(409, `Unable to resolve the container name conflict for "${containerName}": ${e.message}`);
+      throw httpError(409, `Unable to resolve the container name conflict for "${rename.from}": ${e.message}`);
     }
   }
   return renamed;
 }
 
-async function composeAction(entry, action, { allowStartupGrace = false } = {}) {
+async function composeAction(entry, action, { allowStartupGrace = false, confirmAmend = false } = {}) {
   const name = projectName(entry?.name, 'app');
   let appDir = appDirFor(entry);
   if (isSymlink(appDir)) throw httpError(400, 'Invalid app directory');
@@ -5307,8 +5386,25 @@ async function composeAction(entry, action, { allowStartupGrace = false } = {}) 
   if (!composeFile) throw new Error('This app has no compose file in its app directory');
 
   let renamed = [];
+  let amendment = null;
   if (action === 'up' || action === 'start') {
-    renamed = await resolveProjectNameConflicts(name, fs.readFileSync(composeFile, 'utf-8'));
+    const composeText = fs.readFileSync(composeFile, 'utf-8');
+    amendment = await inspectComposeAmendments(name, composeText);
+    if (amendment.blocked.length) {
+      const item = amendment.blocked[0];
+      throw httpError(409,
+        `"${item.name}" belongs to a protected core service and cannot be reused by ${name}. ` +
+        'Change container_name in the compose file or remove the conflicting service first.');
+    }
+    if (amendment.requiresApproval && !confirmAmend) {
+      const err = httpError(409,
+        `${entry?.name || name} would amend existing containers. Review the changes and approve them to continue.`);
+      err.needsAmendApproval = true;
+      err.amendments = amendment;
+      err.appName = name;
+      throw err;
+    }
+    renamed = await resolveProjectNameConflicts(name, composeText, amendment);
   }
 
   const args = ['compose', '-f', composeFile, '-p', name];
@@ -5319,7 +5415,7 @@ async function composeAction(entry, action, { allowStartupGrace = false } = {}) 
 
   try {
     const { stdout, stderr } = await run('docker', args, { cwd: appDir });
-    return { stdout, stderr, appDir, composeFile, renamed };
+    return { stdout, stderr, appDir, composeFile, renamed, amended: amendment?.requiresApproval ? amendment.changes : [], amendment };
   } catch (e) {
     if (allowStartupGrace) {
       // A build or a slow first start can fail the compose command while the
@@ -5332,7 +5428,8 @@ async function composeAction(entry, action, { allowStartupGrace = false } = {}) 
       if (projectContainers.length) {
         return {
           stdout: e.stdout || '', stderr: e.stderr || e.message || '',
-          appDir, composeFile, renamed, pending: true,
+          appDir, composeFile, renamed, amended: amendment?.requiresApproval ? amendment.changes : [], amendment,
+          pending: true,
           message: `${entry?.name || name} is still starting.`
         };
       }
@@ -6191,18 +6288,39 @@ app.post('/api/assist/start', upload.array('files', 100), async (req, res) => {
     ].join('\n');
     writePrivateFile(briefPath, brief);
     const register = path.join(root, 'server', 'assist-register.mjs');
+    const uploadedList = savedFiles.length
+      ? 'Uploaded files:\n' + savedFiles.map(file => '- ' + file).join('\n')
+      : 'Uploaded files: none';
+    const dataPreview = data
+      ? (data.length > 6000 ? data.slice(0, 6000) + '\n… (truncated; full text is in the brief)' : data)
+      : '(none)';
     const startPrompt = [
-      'You are OC Assist, the app builder inside WickedAFDok.',
-      'Read the brief at ' + briefPath + ' and any uploaded files it lists before doing anything else.',
-      'Build a working app for ' + appName + ' in ' + path.join(appsDir, appName) + ' with a valid docker-compose.yml. Use the ' + (defaultsCfg.defaultNetwork || 'wicked') + ' network by default.',
-      'Ask the user only for details you genuinely need, then create the app files and launch it.',
-      'When the compose file is ready, register and deploy it by running:',
+      'OC Assist request for app "' + appName + '".',
+      '',
+      'User instructions:',
+      prompt,
+      '',
+      'Pasted reference data:',
+      dataPreview,
+      '',
+      uploadedList,
+      '',
+      'Brief: ' + briefPath,
+      'App directory: ' + path.join(appsDir, appName),
+      'Default network: ' + (defaultsCfg.defaultNetwork || 'wicked'),
+      '',
+      'Build the app now. Create docker-compose.yml (and any needed files) in the app directory, then publish it with:',
       'node ' + register + ' --name ' + appName + ' --dir ' + path.join(appsDir, appName) + ' --launch',
-      'If registration fails, read the error, fix the compose, and retry once.',
-      'Finish by telling the user the app is in the Apps tab. Do not modify WickedAFDok source files.'
+      'If publishing fails, read the error, fix the compose, and retry once.',
+      'If the user supplied a domain, set VIRTUAL_HOST/VIRTUAL_PORT in the compose or pass --vhost and --vhost-port to the publish command.',
+      'Use --network only when the app must join a specific existing Docker network.',
+      'If the publish response asks for amendment approval (needsAmendApproval), summarize the listed containers and changes to the user and wait for approval before rerunning with --confirm-amend.',
+      'Ask the user only when you genuinely need a domain, port, credential, or host path.',
+      'When finished, tell the user the app is in the Apps tab.'
     ].join('\n');
     const session = await createTerminalSession({
-      mode: 'admin',
+      mode: 'user',
+      agent: 'assist',
       app: 'opencode',
       prompt: startPrompt,
       title: 'OC Assist · ' + appName
@@ -6252,7 +6370,7 @@ app.post('/api/launch/finalize', async (req, res) => {
       compose: composeYaml, network = '', ports = '', vhost = '', vhostPort = '',
       mode = 'auto', sourceRel = '', launchNow = true, force = false, composeEdited = false,
       networkChoices = {}, volumeChoices = {}, vhostTouched = false,
-      vhostService = '', createNetwork = false, overwrite = false
+      vhostService = '', createNetwork = false, overwrite = false, confirmAmend = false
     } = body;
     const composeBody = String(composeYaml || body.yaml || body.generatedCompose || '');
     const composeProvided = body.compose !== undefined || body.yaml !== undefined || body.generatedCompose !== undefined;
@@ -6591,6 +6709,25 @@ app.post('/api/launch/finalize', async (req, res) => {
       }
     }
 
+    let amendment = null;
+    if (launchNow !== false) {
+      amendment = await inspectComposeAmendments(name, finalCompose);
+      if (amendment.blocked.length) {
+        const item = amendment.blocked[0];
+        throw httpError(409,
+          `"${item.name}" belongs to a protected core service and cannot be reused by ${name}. ` +
+          'Change container_name in the compose file or remove the conflicting service first.');
+      }
+      if (amendment.requiresApproval && confirmAmend !== true) {
+        const err = httpError(409,
+          `${name} would amend existing containers. Review the changes and approve them to continue.`);
+        err.needsAmendApproval = true;
+        err.amendments = amendment;
+        err.appName = name;
+        throw err;
+      }
+    }
+
     const composePath = path.join(targetDir, 'docker-compose.yml');
     writePrivateFile(composePath, finalCompose);
     const overridePath = path.join(targetDir, 'docker-compose.wickedafdok.yml');
@@ -6632,7 +6769,9 @@ app.post('/api/launch/finalize', async (req, res) => {
     let result = { stdout: 'Created (not launched)', stderr: '' };
     let launchError = '';
     let launchPending = false;
+    let renamed = [];
     if (launchNow !== false) {
+      renamed = await resolveProjectNameConflicts(name, finalCompose, amendment);
       const args = ['compose', '-f', composePath, '-p', name];
       if (fs.existsSync(overridePath)) args.push('-f', overridePath);
       args.push('up', '-d', '--remove-orphans');
@@ -6659,13 +6798,16 @@ app.post('/api/launch/finalize', async (req, res) => {
     res.json({
       ok: true, appDir: targetDir, appName: name, appDataPath, ...result,
       issues: [...new Set([...validationIssues, ...combinedIssues])], launchError,
-      launchPending,
+      launchPending, renamed, amended: amendment?.requiresApproval ? amendment.changes : [],
       message: launchPending ? `${name} is still starting.` : ''
     });
   } catch (e) {
     res.status(e.status || 500).json({
       error: e.message, stdout: e.stdout, stderr: e.stderr,
-      needsOverwrite: !!e.needsOverwrite, appName: e.appName || (registrySaved ? finalizedAppName : undefined),
+      needsOverwrite: !!e.needsOverwrite,
+      needsAmendApproval: !!e.needsAmendApproval,
+      amendments: e.amendments || null,
+      appName: e.appName || (registrySaved ? finalizedAppName : undefined),
       created: registrySaved
     });
   } finally {
@@ -6735,6 +6877,533 @@ app.post('/api/sources/file', (req, res) => {
   }
 });
 
+// ---------- app library export/import ----------
+// Library archives use this manifest. Apps in a library are installation
+// neutral: Dok-specific launch data, domains, host paths, published ports,
+// container names, and generated override files are removed before export.
+const LIBRARY_SCHEMA = 'wickedafdok.library/v1';
+const LIBRARY_KEEP_HOST_PATHS = new Set([
+  '/var/run/docker.sock',
+  '/var/run/docker.sock.raw',
+  '/etc/localtime',
+  '/etc/timezone'
+]);
+const LIBRARY_SKIP_DIRS = new Set([
+  '.git', 'node_modules', '__pycache__', '.venv', 'venv', '.cache', '.npm', '.yarn', 'tmp'
+]);
+const LIBRARY_STRIP_ENV = new Set([
+  'VIRTUAL_HOST', 'VIRTUAL_PORT', 'ENABLE_AUTH', 'LETSENCRYPT_HOST', 'LETSENCRYPT_EMAIL'
+]);
+
+function libraryPortScalar(value) {
+  const text = String(value || '').trim().replace(/^['"]|['"]$/g, '');
+  const match = text.match(/^(?:(.+):)?([0-9]+(?:-[0-9]+)?)(?:\/(tcp|udp))?$/i);
+  if (!match) return { value: text, published: false };
+  const container = match[2];
+  const proto = match[3] ? `/${match[3].toLowerCase()}` : '';
+  return {
+    value: `${container}${proto}`,
+    published: !!match[1],
+    publishedValue: match[1] ? text : ''
+  };
+}
+
+function libraryVolumeSlug(target) {
+  const slug = String(target || '')
+    .replace(/^[/\\]+/, '')
+    .replace(/[^A-Za-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return slug === 'data' ? 'data' : (slug || 'data');
+}
+
+function libraryVolumeSource(source, target) {
+  const text = String(source || '').trim().replace(/^['"]|['"]$/g, '');
+  if (!text || (!text.startsWith('/') && !text.startsWith('~'))) {
+    return { source: text, changed: false };
+  }
+  if (LIBRARY_KEEP_HOST_PATHS.has(text)) return { source: text, changed: false };
+  const slug = libraryVolumeSlug(target);
+  return {
+    source: slug === 'data' ? './data' : `./data/${slug}`,
+    changed: true
+  };
+}
+
+function sanitizeComposeForLibrary(text) {
+  const lines = String(text || '').replace(/\r\n/g, '\n').split('\n');
+  const out = [];
+  const requirements = { environment: [], volumes: [], ports: [], networks: [] };
+  let top = '';
+  let service = '';
+  let sub = '';
+  let networkKey = '';
+  let networkKeepExternal = false;
+  let volumeKey = '';
+  let longVolume = null;
+  let longPort = null;
+
+  const addRequirement = (kind, value) => {
+    if (!value) return;
+    if (!requirements[kind].includes(value)) requirements[kind].push(value);
+  };
+  const applyLongVolume = () => {
+    if (!longVolume || longVolume.mapped || !longVolume.source || !longVolume.target) return;
+    if (longVolume.sourceIndex < 0) return;
+    const mapped = libraryVolumeSource(longVolume.source, longVolume.target);
+    longVolume.mapped = true;
+    if (!mapped.changed) return;
+    addRequirement('volumes', `${mapped.source} -> ${longVolume.target}`);
+    out[longVolume.sourceIndex] = out[longVolume.sourceIndex]
+      .replace(/(source\s*:\s*).+$/, `$1${yamlScalar(mapped.source)}`);
+  };
+
+  for (const original of lines) {
+    const line = original.replace(/[ \t]+$/, '');
+    if (!line.trim()) {
+      out.push(line);
+      continue;
+    }
+    if (/^[^\s#]/.test(line)) {
+      const keyMatch = line.match(/^([A-Za-z0-9_.-]+)\s*:/);
+      const key = keyMatch ? keyMatch[1] : '';
+      if (key === 'name') continue;
+      top = key;
+      service = '';
+      sub = '';
+      networkKey = '';
+      networkKeepExternal = false;
+      volumeKey = '';
+      longVolume = null;
+      longPort = null;
+      out.push(line);
+      continue;
+    }
+    if (top === 'services') {
+      const serviceMatch = line.match(/^  ([A-Za-z0-9_.-]+):\s*(?:#.*)?$/);
+      if (serviceMatch) {
+        service = serviceMatch[1];
+        sub = '';
+        longVolume = null;
+        longPort = null;
+        out.push(line);
+        continue;
+      }
+      if (/^    container_name\s*:/.test(line)) continue;
+      const subMatch = line.match(/^    ([A-Za-z0-9_.-]+):\s*(?:#.*)?$/);
+      if (subMatch) {
+        sub = subMatch[1];
+        longVolume = null;
+        longPort = null;
+        if (sub === 'container_name') continue;
+        out.push(line);
+        continue;
+      }
+      if (sub === 'environment') {
+        const listValue = line.match(/^\s+-\s*['"]?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$/);
+        const mapValue = line.match(/^\s+['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?\s*:\s*(.*)$/);
+        const listKeyOnly = line.match(/^\s+-\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?\s*$/);
+        const key = listValue ? listValue[1] : (mapValue ? mapValue[1] : (listKeyOnly ? listKeyOnly[1] : ''));
+        if (LIBRARY_STRIP_ENV.has(key) || key.startsWith('LETSENCRYPT_') || key.startsWith('VIRTUAL_')) {
+          addRequirement('environment', key);
+          continue;
+        }
+      }
+      if (sub === 'ports') {
+        const listItem = line.match(/^\s+-\s*(.+)$/);
+        if (listItem) {
+          const raw = listItem[1].trim();
+          const keyTarget = raw.match(/^target\s*:\s*(.+)$/i);
+          if (keyTarget) {
+            longPort = longPort || { target: '', published: false, requirementAdded: false };
+            longPort.target = keyTarget[1].trim().replace(/^['"]|['"]$/g, '');
+            if (longPort.published && !longPort.requirementAdded) {
+              addRequirement('ports', longPort.target);
+              longPort.requirementAdded = true;
+            }
+            out.push(line);
+            continue;
+          }
+          longPort = null;
+          const parsed = libraryPortScalar(raw);
+          if (parsed.published) {
+            addRequirement('ports', parsed.value);
+            out.push(line.replace(/(-\s*).+$/, `$1${yamlScalar(parsed.value)}`));
+            continue;
+          }
+        } else {
+          const published = line.match(/^\s+published\s*:\s*(.+)$/i);
+          if (published) {
+            longPort = longPort || { target: '', published: false, requirementAdded: false };
+            longPort.published = true;
+            if (longPort.target && !longPort.requirementAdded) {
+              addRequirement('ports', longPort.target);
+              longPort.requirementAdded = true;
+            }
+            continue;
+          }
+          const target = line.match(/^\s+target\s*:\s*(.+)$/i);
+          if (target && longPort) {
+            longPort.target = target[1].trim().replace(/^['"]|['"]$/g, '');
+            if (longPort.published && !longPort.requirementAdded) {
+              addRequirement('ports', longPort.target);
+              longPort.requirementAdded = true;
+            }
+          }
+        }
+      }
+      if (sub === 'volumes') {
+        const listItem = line.match(/^\s+-\s*(.+)$/);
+        if (listItem) {
+          const raw = listItem[1].trim();
+          const typeMatch = raw.match(/^type\s*:\s*(.+)$/i);
+          if (typeMatch) {
+            longVolume = { type: typeMatch[1].trim(), target: '', source: '', sourceIndex: -1, mapped: false };
+            out.push(line);
+            continue;
+          }
+          longVolume = null;
+          const cleaned = raw.replace(/^['"]|['"]$/g, '');
+          const firstColon = cleaned.indexOf(':');
+          if (firstColon > 0) {
+            const source = cleaned.slice(0, firstColon);
+            const rest = cleaned.slice(firstColon + 1);
+            const target = rest.split(':')[0];
+            const mode = rest.split(':').slice(1).join(':');
+            const mapped = libraryVolumeSource(source, target);
+            if (mapped.changed) {
+              addRequirement('volumes', `${mapped.source} -> ${target}`);
+              out.push(line.replace(/(-\s*).+$/, `$1${yamlScalar(`${mapped.source}:${rest}`)}`));
+              continue;
+            }
+          }
+        } else {
+          const source = line.match(/^\s+source\s*:\s*(.+)$/i);
+          if (source && longVolume) {
+            longVolume.source = source[1].trim().replace(/^['"]|['"]$/g, '');
+            longVolume.sourceIndex = out.length;
+            out.push(line);
+            applyLongVolume();
+            continue;
+          }
+          const target = line.match(/^\s+target\s*:\s*(.+)$/i);
+          if (target && longVolume) {
+            longVolume.target = target[1].trim().replace(/^['"]|['"]$/g, '');
+            out.push(line);
+            applyLongVolume();
+            continue;
+          }
+        }
+      }
+      if (sub === 'networks') {
+        const item = line.match(/^      -\s*(.+)$/);
+        if (item) addRequirement('networks', item[1].trim().replace(/^['"]|['"]$/g, ''));
+        else {
+          const mapping = line.match(/^      ([A-Za-z0-9_.-]+)\s*:/);
+          if (mapping) addRequirement('networks', mapping[1]);
+        }
+      }
+      out.push(line);
+      continue;
+    }
+    if (top === 'networks') {
+      const netMatch = line.match(/^  ([A-Za-z0-9_.-]+):\s*(?:#.*)?$/);
+      if (netMatch) {
+        networkKey = netMatch[1];
+        networkKeepExternal = networkKey === 'wicked';
+        out.push(line);
+        continue;
+      }
+      const netName = line.match(/^\s+name\s*:\s*(.+)$/i);
+      if (netName) {
+        const value = netName[1].trim().replace(/^['"]|['"]$/g, '');
+        if (networkKey === 'wicked' || value === 'wicked') {
+          networkKeepExternal = true;
+          out.push(line);
+        }
+        continue;
+      }
+      if (/^\s+external\s*:/i.test(line)) {
+        if (networkKey === 'wicked' || networkKeepExternal) out.push(line);
+        continue;
+      }
+    }
+    if (top === 'volumes') {
+      const volumeMatch = line.match(/^  ([A-Za-z0-9_.-]+):\s*(?:#.*)?$/);
+      if (volumeMatch) {
+        volumeKey = volumeMatch[1];
+        out.push(line);
+        continue;
+      }
+      if (volumeKey && /^\s+(external|name)\s*:/i.test(line)) continue;
+    }
+    out.push(line);
+  }
+
+  // Drop service sub-section headers that lost all their entries (for example
+  // an environment block that only contained VIRTUAL_HOST). Top-level network
+  // and volume definitions stay even when they become empty, because Compose
+  // uses the key itself to declare a project-scoped resource.
+  const cleaned = [];
+  for (let i = 0; i < out.length; i++) {
+    const line = out[i];
+    const header = line.match(/^(    )([A-Za-z0-9_.-]+):\s*$/);
+    if (header) {
+      let j = i + 1;
+      while (j < out.length && !out[j].trim()) j++;
+      const indent = out[j] ? (out[j].match(/^\s*/) || [''])[0].length : 0;
+      if (j >= out.length || indent <= 4) continue;
+    }
+    cleaned.push(line);
+  }
+  return {
+    compose: cleaned.join('\n').replace(/\s*$/, '') + '\n',
+    requirements
+  };
+}
+
+function libraryFiles(rootDir) {
+  const files = [];
+  const walk = (dir, rel) => {
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const relPath = rel ? `${rel}/${entry.name}` : entry.name;
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) {
+        if (LIBRARY_SKIP_DIRS.has(entry.name)) continue;
+        if (!rel && entry.name === 'data') continue;
+        walk(path.join(dir, entry.name), relPath);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (entry.name === 'docker-compose.wickedafdok.yml') continue;
+      if (entry.name === '.DS_Store') continue;
+      if (/^\.env($|\.)/.test(entry.name) && entry.name !== '.env.example') continue;
+      files.push(relPath);
+    }
+  };
+  walk(rootDir, '');
+  return files.sort();
+}
+
+function copyLibraryFile(source, dest) {
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.copyFileSync(source, dest);
+}
+
+function libraryManifestApp(entry, appDir) {
+  const composePath = findComposeFile(appDir);
+  if (!composePath) throw httpError(400, `${entry.name} has no compose file`);
+  const files = libraryFiles(appDir);
+  const composeRel = path.relative(appDir, composePath).replace(/\\/g, '/');
+  const sanitized = sanitizeComposeForLibrary(fs.readFileSync(composePath, 'utf-8'));
+  return {
+    name: projectName(entry.name, 'app'),
+    description: String(entry.description || '').slice(0, 500),
+    composeFile: composeRel,
+    files,
+    requirements: sanitized.requirements,
+    sanitizedCompose: sanitized.compose,
+    appDir
+  };
+}
+
+app.post('/api/library/export', async (req, res) => {
+  const temp = fs.mkdtempSync(path.join(tmpDir, 'library-export-'));
+  const archive = path.join(tmpDir, `library-export-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.tar.gz`);
+  try {
+    const ids = Array.isArray(req.body?.apps) ? req.body.apps.map(String) : [];
+    const registry = readRegistry();
+    const selected = ids.length
+      ? registry.filter(entry => ids.includes(String(entry.id)) || ids.includes(String(entry.name)))
+      : [];
+    if (!selected.length) throw httpError(400, 'Select at least one app to export');
+    const appsOut = path.join(temp, 'apps');
+    fs.mkdirSync(appsOut, { recursive: true });
+    const apps = [];
+    for (const entry of selected) {
+      const appDir = appDirFor(entry);
+      if (!isInsideApps(appDir) || isSymlink(appDir)) throw httpError(400, `Invalid app directory for ${entry.name}`);
+      if (!fs.existsSync(appDir)) throw httpError(404, `${entry.name} is missing from apps/`);
+      const manifestApp = libraryManifestApp(entry, appDir);
+      const destDir = path.join(appsOut, manifestApp.name);
+      for (const rel of manifestApp.files) {
+        copyLibraryFile(path.join(appDir, rel), path.join(destDir, rel));
+      }
+      const composeDest = path.join(destDir, manifestApp.composeFile);
+      fs.mkdirSync(path.dirname(composeDest), { recursive: true });
+      fs.writeFileSync(composeDest, manifestApp.sanitizedCompose, 'utf-8');
+      apps.push({
+        name: manifestApp.name,
+        description: manifestApp.description,
+        composeFile: manifestApp.composeFile,
+        files: manifestApp.files,
+        requirements: manifestApp.requirements
+      });
+    }
+    const manifest = {
+      schema: LIBRARY_SCHEMA,
+      kind: 'wickedafdok-app-library',
+      version: 1,
+      name: String(req.body?.name || 'Dok app library').slice(0, 120),
+      created: new Date().toISOString(),
+      apps
+    };
+    writePrivateFile(path.join(temp, 'dok-library.json'), JSON.stringify(manifest, null, 2) + '\n');
+    await run('tar', ['-czf', archive, '-C', temp, '.']);
+    const filename = `dok-library-${new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14)}.tar.gz`;
+    res.download(archive, filename, () => {
+      try { fs.rmSync(temp, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(archive, { force: true }); } catch {}
+    });
+  } catch (e) {
+    try { fs.rmSync(temp, { recursive: true, force: true }); } catch {}
+    try { fs.rmSync(archive, { force: true }); } catch {}
+    if (!res.headersSent) res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+app.post('/api/library/import', upload.single('file'), async (req, res) => {
+  const uploadPath = req.file?.path || '';
+  const temp = fs.mkdtempSync(path.join(tmpDir, 'library-import-'));
+  try {
+    if (!uploadPath) throw httpError(400, 'Choose a Dok library archive (.tar.gz)');
+    const list = await run('tar', ['-tzf', uploadPath]);
+    validateArchiveEntries(String(list.stdout || '').split('\n').filter(Boolean));
+    await run('tar', ['-xzf', uploadPath, '-C', temp]);
+    const manifestPath = [path.join(temp, 'dok-library.json'), path.join(temp, 'library.json')]
+      .find(candidate => fs.existsSync(candidate));
+    if (!manifestPath) throw httpError(400, 'The archive does not contain dok-library.json');
+    let manifest;
+    try { manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')); } catch {
+      throw httpError(400, 'The library manifest is not valid JSON');
+    }
+    if (manifest?.schema !== LIBRARY_SCHEMA || manifest?.kind !== 'wickedafdok-app-library' || !Array.isArray(manifest.apps)) {
+      throw httpError(400, `Unsupported library format. Expected ${LIBRARY_SCHEMA}.`);
+    }
+    const appsRoot = path.join(temp, 'apps');
+    const entries = [];
+    for (const app of manifest.apps) {
+      const name = String(app?.name || '').trim();
+      if (!/^[a-z0-9][a-z0-9._-]{0,59}$/.test(name)) {
+        throw httpError(400, `Invalid app name in library: ${name || '(empty)'}`);
+      }
+      if (entries.some(entry => entry.name === name)) throw httpError(400, `Duplicate app in library: ${name}`);
+      const sourceDir = path.join(appsRoot, name);
+      const rel = path.relative(appsRoot, sourceDir);
+      if (rel.startsWith('..') || path.isAbsolute(rel) || isSymlink(sourceDir) || !fs.existsSync(sourceDir)) {
+        throw httpError(400, `The library is missing the files for ${name}`);
+      }
+      const composeRel = String(app.composeFile || 'docker-compose.yml').replace(/\\/g, '/');
+      const composePath = path.resolve(sourceDir, composeRel);
+      if (composePath !== sourceDir && !composePath.startsWith(sourceDir + path.sep)) {
+        throw httpError(400, `Invalid compose path for ${name}`);
+      }
+      if (!fs.existsSync(composePath) || !fs.statSync(composePath).isFile()) {
+        throw httpError(400, `${name} is missing ${composeRel}`);
+      }
+      const sanitized = sanitizeComposeForLibrary(fs.readFileSync(composePath, 'utf-8'));
+      if (!sanitized.compose.trim()) throw httpError(400, `${name} has an empty compose file`);
+      const target = path.join(appsDir, name);
+      let occupied = false;
+      try { occupied = fs.existsSync(target) && fs.readdirSync(target).length > 0; } catch { occupied = true; }
+      entries.push({
+        name,
+        sourceDir,
+        composeRel,
+        compose: sanitized.compose,
+        target,
+        occupied,
+        description: String(app.description || '').slice(0, 500),
+        requirements: app.requirements && typeof app.requirements === 'object' ? app.requirements : sanitized.requirements
+      });
+    }
+    const conflicts = entries.filter(entry => entry.occupied).map(entry => entry.name);
+    if (conflicts.length && req.body?.overwrite !== 'true') {
+      const err = httpError(409, `These apps already exist: ${conflicts.join(', ')}. Confirm to overwrite them.`);
+      err.needsOverwrite = true;
+      err.apps = conflicts;
+      throw err;
+    }
+    const imported = [];
+    for (const entry of entries) {
+      if (isSymlink(entry.target)) throw httpError(400, `Invalid app directory for ${entry.name}`);
+      if (entry.occupied) {
+        for (const child of fs.readdirSync(entry.target)) {
+          if (child === 'data' || /^\.env($|\.)/.test(child)) continue;
+          fs.rmSync(path.join(entry.target, child), { recursive: true, force: true });
+        }
+      }
+      fs.mkdirSync(entry.target, { recursive: true });
+      for (const rel of libraryFiles(entry.sourceDir)) {
+        const from = path.join(entry.sourceDir, rel);
+        const to = path.resolve(entry.target, rel);
+        if (to !== entry.target && !to.startsWith(entry.target + path.sep)) continue;
+        copyLibraryFile(from, to);
+      }
+      const composeDest = path.resolve(entry.target, entry.composeRel);
+      if (composeDest !== entry.target && !composeDest.startsWith(entry.target + path.sep)) {
+        throw httpError(400, `Invalid compose path for ${entry.name}`);
+      }
+      fs.mkdirSync(path.dirname(composeDest), { recursive: true });
+      writePrivateFile(composeDest, entry.compose);
+      addRegistryEntry({
+        type: 'compose',
+        name: entry.name,
+        path: entry.target,
+        appDir: entry.target,
+        sourcePath: '',
+        composeFile: entry.composeRel,
+        command: '',
+        dataPath: '',
+        needsConfig: true,
+        description: entry.description,
+        library: {
+          schema: manifest.schema,
+          name: String(manifest.name || ''),
+          importedAt: new Date().toISOString(),
+          requirements: entry.requirements
+        },
+        launch: {
+          mode: 'compose',
+          name: entry.name,
+          command: '',
+          ports: [],
+          vhost: '',
+          vhostPort: '',
+          appDir: entry.target,
+          network: '',
+          type: 'compose'
+        }
+      });
+      imported.push(entry.name);
+    }
+    res.json({
+      ok: true,
+      imported,
+      library: {
+        schema: manifest.schema,
+        name: String(manifest.name || ''),
+        created: manifest.created || '',
+        apps: entries.map(entry => entry.name)
+      },
+      message: imported.length === 1
+        ? `Imported ${imported[0]}. Open it in Apps and configure it before launching.`
+        : `Imported ${imported.length} apps. Open each one in Apps and configure it before launching.`
+    });
+  } catch (e) {
+    res.status(e.status || 500).json({
+      error: e.message,
+      needsOverwrite: !!e.needsOverwrite,
+      apps: e.apps || [],
+      libraryName: e.libraryName || ''
+    });
+  } finally {
+    try { fs.rmSync(temp, { recursive: true, force: true }); } catch {}
+    if (uploadPath) { try { fs.rmSync(uploadPath, { force: true }); } catch {} }
+  }
+});
+
 // ---------- registry ----------
 app.get('/api/registry', (req, res) => {
   res.json(readRegistry());
@@ -6744,11 +7413,19 @@ async function registryAction(req, res, action) {
   try {
     const entry = readRegistry().find(r => r.id === req.params.id);
     if (!entry) return res.status(404).json({ error: 'App not found' });
-    const result = await composeAction(entry, action, { allowStartupGrace: action === 'up' });
+    const result = await composeAction(entry, action, {
+      allowStartupGrace: action === 'up',
+      confirmAmend: req.body?.confirmAmend === true
+    });
     try { await syncAuthVhosts(); } catch {}
     res.json({ ok: true, ...result });
   } catch (e) {
-    res.status(e.status || 500).json({ error: e.message, stdout: e.stdout, stderr: e.stderr });
+    res.status(e.status || 500).json({
+      error: e.message, stdout: e.stdout, stderr: e.stderr,
+      needsAmendApproval: !!e.needsAmendApproval,
+      amendments: e.amendments || null,
+      appName: e.appName || ''
+    });
   }
 }
 
@@ -6765,14 +7442,20 @@ function appEntryForRequest(req) {
 // new base configuration, so subsequent Quick Deploys use exactly what the
 // user sees. The generated override is removed to avoid stale volume, network,
 // or environment values winning over the edited base file.
-function normalizeEditedAppCompose(entry, compose) {
+function composeHasVhostKey(text) {
+  return /(^|\n)\s*(?:-\s*)?['"]?VIRTUAL_HOST['"]?\s*[:=]/m.test(String(text || ''));
+}
+
+function normalizeEditedAppCompose(entry, compose, { vhostTouched = false, addDefaultNetwork = true } = {}) {
   let next = String(compose || '');
-  if (!/^networks\s*:/m.test(next) && !/\bnetwork_mode\s*:/.test(next)) {
+  if (addDefaultNetwork && !/^networks\s*:/m.test(next) && !/\bnetwork_mode\s*:/.test(next)) {
     next = next.replace(/\s*$/, '') +
       '\n\nnetworks:\n  default:\n    name: wicked\n    external: true\n';
   }
   const vhost = String(entry?.launch?.vhost || '').trim();
-  if (vhost) {
+  // Keep legacy routing for apps whose saved compose predates VIRTUAL_HOST, but
+  // never overwrite a value the user just edited or deliberately removed.
+  if (vhost && !vhostTouched && !composeHasVhostKey(next)) {
     const services = serviceNamesFromCompose(next);
     const preferred = String(entry?.launch?.name || '').trim();
     const service = services.includes(preferred) ? preferred : services[0];
@@ -6787,17 +7470,33 @@ function normalizeEditedAppCompose(entry, compose) {
   return next;
 }
 
-app.get('/api/apps/:id/compose', (req, res) => {
+app.get('/api/apps/:id/compose', async (req, res) => {
   try {
     const entry = appEntryForRequest(req);
     const appDir = appDirFor(entry);
     const composeFile = findComposeFile(appDir);
     if (!composeFile) return res.status(404).json({ error: 'This app has no compose file' });
+    let compose = fs.readFileSync(composeFile, 'utf-8');
+    // The generated override may hold the routing env for compose-created apps.
+    // Surface it in the editable base compose so Alter State shows the effective
+    // domain and a deliberate clear can be detected by the frontend.
+    compose = normalizeEditedAppCompose(entry, compose, { addDefaultNetwork: false });
+    let analysis = null;
+    try {
+      analysis = await analyzeCompose(compose, { projectDir: appDir });
+    } catch {}
     res.json({
       entry,
       appDir,
       composeFile,
-      compose: fs.readFileSync(composeFile, 'utf-8')
+      compose,
+      network: entry.launch?.network || '',
+      vhost: analysis?.vhost || entry.launch?.vhost || '',
+      vhostPort: analysis?.vhostPort || entry.launch?.vhostPort || '',
+      vhostService: analysis?.vhostService || '',
+      issues: analysis?.issues || [],
+      missingNetworks: analysis?.missingNetworks || [],
+      missingVolumes: analysis?.missingVolumes || []
     });
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message });
@@ -6814,7 +7513,9 @@ app.post('/api/apps/:id/compose', async (req, res) => {
     ensureWritableDirectory(appDir, { label: 'app directory' });
     const deploy = req.body?.deploy === true;
     const force = req.body?.force === true;
-    const compose = normalizeEditedAppCompose(entry, req.body?.compose || '');
+    const vhostTouched = req.body?.vhostTouched === true;
+    const existingComposePath = findComposeFile(appDir);
+    const compose = normalizeEditedAppCompose(entry, req.body?.compose || '', { vhostTouched });
     if (!compose.trim()) return res.status(400).json({ error: 'Compose file is empty' });
     const validation = await validateCompose(compose, { projectDir: appDir });
     if (!validation.ok && !force) {
@@ -6823,13 +7524,39 @@ app.post('/api/apps/:id/compose', async (req, res) => {
         issues: validation.issues || []
       });
     }
-    const composePath = findComposeFile(appDir) || path.join(appDir, 'docker-compose.yml');
+    const composePath = existingComposePath || path.join(appDir, 'docker-compose.yml');
     writePrivateFile(composePath, compose);
     savedComposePath = composePath;
     try { fs.unlinkSync(path.join(appDir, 'docker-compose.wickedafdok.yml')); } catch {}
+    try {
+      const reg = readRegistry();
+      const current = reg.find(item => item.id === entry.id);
+      if (current) {
+        current.needsConfig = false;
+        current.composeFile = path.relative(appDir, composePath) || 'docker-compose.yml';
+        current.launch = current.launch || {};
+        let analyzed = false;
+        try {
+          const analysis = await analyzeCompose(compose, { projectDir: appDir });
+          if (!analysis.unavailable && analysis.ok) {
+            current.launch.vhost = analysis.vhost || '';
+            current.launch.vhostPort = analysis.vhostPort || '';
+            analyzed = true;
+          }
+        } catch {}
+        if (!analyzed && vhostTouched && !composeHasVhostKey(compose)) {
+          current.launch.vhost = '';
+          current.launch.vhostPort = '';
+        }
+        writeRegistry(reg);
+      }
+    } catch {}
     let result = { stdout: 'Base configuration saved', stderr: '', renamed: [] };
     if (deploy) {
-      result = await composeAction(entry, 'up', { allowStartupGrace: true });
+      result = await composeAction(entry, 'up', {
+        allowStartupGrace: true,
+        confirmAmend: req.body?.confirmAmend === true
+      });
       try { await syncAuthVhosts(); } catch {}
     }
     res.json({
@@ -6845,7 +7572,10 @@ app.post('/api/apps/:id/compose', async (req, res) => {
   } catch (e) {
     res.status(e.status || 500).json({
       error: e.message, stdout: e.stdout, stderr: e.stderr,
-      saved: !!savedComposePath, composePath: savedComposePath || undefined
+      saved: !!savedComposePath, composePath: savedComposePath || undefined,
+      needsAmendApproval: !!e.needsAmendApproval,
+      amendments: e.amendments || null,
+      appName: e.appName || ''
     });
   }
 });
@@ -9108,6 +9838,113 @@ function userOpencodePermissions() {
   };
 }
 
+function userAssistPermissions() {
+  return {
+    '*': 'deny',
+    external_directory: {
+      '*': 'deny',
+      [path.join(root, 'server', 'assist-register.mjs')]: 'allow',
+      [path.join(opencodeDir, 'assist', '**')]: 'allow',
+      [path.join(sourcesDir, 'oc-assist-*', '**')]: 'allow'
+    },
+    edit: {
+      '*': 'allow',
+      '.env': 'deny',
+      '**/.env': 'deny',
+      '*.env': 'deny',
+      '**/.env.*': 'deny',
+      '*.env.*': 'deny',
+      '**/.env.example': 'allow',
+      '*.env.example': 'allow'
+    },
+    read: {
+      '*': 'allow',
+      '.env': 'deny',
+      '**/.env': 'deny',
+      '*.env': 'deny',
+      '**/.env.*': 'deny',
+      '*.env.*': 'deny',
+      '**/.env.example': 'allow',
+      '*.env.example': 'allow',
+      '**/settings.json': 'deny',
+      '**/auth.json': 'deny'
+    },
+    glob: 'allow',
+    grep: 'allow',
+    list: 'allow',
+    bash: {
+      '*': 'deny',
+      ls: 'allow',
+      'ls *': 'allow',
+      pwd: 'allow',
+      'cat *': 'allow',
+      'head *': 'allow',
+      'tail *': 'allow',
+      'grep *': 'allow',
+      'rg *': 'allow',
+      'find *': 'allow',
+      'wc *': 'allow',
+      'du *': 'allow',
+      'df *': 'allow',
+      'file *': 'allow',
+      'stat *': 'allow',
+      'tree *': 'allow',
+      'sed *': 'allow',
+      'awk *': 'allow',
+      'sort *': 'allow',
+      'uniq *': 'allow',
+      'cut *': 'allow',
+      'mkdir *': 'allow',
+      'touch *': 'allow',
+      'cp *': 'allow',
+      'mv *': 'allow',
+      'ln *': 'allow',
+      npm: 'allow',
+      'npm *': 'allow',
+      'npx *': 'allow',
+      node: 'allow',
+      'node *': 'allow',
+      'git clone *': 'allow',
+      'git status*': 'allow',
+      'git diff*': 'allow',
+      'git log*': 'allow',
+      'git show*': 'allow',
+      'curl *': 'allow',
+      'wget *': 'allow',
+      hostname: 'allow',
+      whoami: 'allow',
+      id: 'allow',
+      date: 'allow',
+      'uname *': 'allow',
+      'echo *': 'allow',
+      'printf *': 'allow',
+      'which *': 'allow',
+      'rm *': 'deny',
+      'rmdir *': 'deny',
+      docker: 'deny',
+      'docker *': 'deny',
+      'sudo *': 'deny',
+      'su *': 'deny',
+      'apk *': 'deny',
+      'chmod *': 'deny',
+      'chown *': 'deny',
+      'mount *': 'deny',
+      'umount *': 'deny',
+      'kill *': 'deny',
+      'pkill *': 'deny',
+      'printenv*': 'deny'
+    },
+    webfetch: 'allow',
+    websearch: 'allow',
+    task: 'deny',
+    skill: 'deny',
+    lsp: 'allow',
+    todowrite: 'allow',
+    question: 'allow',
+    doom_loop: 'ask'
+  };
+}
+
 function opencodeConfigForMode(mode, settings = {}) {
   const service = settings.services?.opencode || {};
   const model = String(service.model || '').trim();
@@ -9142,6 +9979,19 @@ function opencodeConfigForMode(mode, settings = {}) {
           'If a task requires changing WickedAFDok or Docker, tell the user to switch to Admin mode.'
         ].join('\n'),
         permission: permissions
+      },
+      assist: {
+        description: 'OC Assist: create, configure, and publish one app in the WickedAFDok Apps library.',
+        mode: 'primary',
+        prompt: [
+          'You are OC Assist, the app builder inside WickedAFDok.',
+          'Your working directory is ' + appsDir + '. You only create, edit, and launch application files in that directory.',
+          'Use the user request in the first message as the source of truth. Read the assistant brief it points to and any uploaded files before building.',
+          'Create apps/<name>/docker-compose.yml. Prefer the configured Dok default network. Do not touch WickedAFDok source files, Docker configuration, or core services.',
+          'When the app is ready, publish it to the Apps library with the command provided in the brief. Never print secrets in chat.',
+          'Ask the user only for information you genuinely need (domains, ports, credentials, host paths). Otherwise finish the app and report that it is in Apps.'
+        ].join('\n'),
+        permission: userAssistPermissions()
       }
     };
   } else {
@@ -9287,6 +10137,7 @@ function terminalSessionSummary(session) {
     id: session.id,
     mode: session.mode,
     app: session.app,
+    agent: session.agent || '',
     title: session.title,
     cwd: session.cwd,
     pid: session.pty.pid,
@@ -9297,7 +10148,7 @@ function terminalSessionSummary(session) {
   };
 }
 
-async function createTerminalSession({ mode = 'admin', app = 'shell', prompt = '', title = '' } = {}) {
+async function createTerminalSession({ mode = 'admin', app = 'shell', agent = '', prompt = '', title = '' } = {}) {
   if (!TERMINAL_MODES[mode]) throw httpError(400, 'Unknown terminal mode');
   if (!['shell', 'opencode'].includes(app)) throw httpError(400, 'Unknown terminal application');
   if (terminalSessions.size >= OPENCODE_MAX_SESSIONS) {
@@ -9309,6 +10160,10 @@ async function createTerminalSession({ mode = 'admin', app = 'shell', prompt = '
   let args = ['-i'];
   let cwd = mode === 'user' ? appsDir : root;
   let version = '';
+  const selectedAgent = String(agent || mode).trim();
+  if (app === 'opencode' && !/^[A-Za-z0-9._-]+$/.test(selectedAgent)) {
+    throw httpError(400, 'Unknown OpenCode agent');
+  }
 
   if (app === 'opencode') {
     const info = await getOpencodeInfo();
@@ -9317,7 +10172,7 @@ async function createTerminalSession({ mode = 'admin', app = 'shell', prompt = '
     }
     writeOpencodeConfigs(settings);
     binary = info.path;
-    args = ['--agent', mode];
+    args = ['--agent', selectedAgent];
     if (prompt) args.push('--prompt', String(prompt));
     version = info.version;
   }
@@ -9329,6 +10184,7 @@ async function createTerminalSession({ mode = 'admin', app = 'shell', prompt = '
     id,
     mode,
     app,
+    agent: app === 'opencode' ? selectedAgent : '',
     title: sessionTitle,
     cwd,
     version,
