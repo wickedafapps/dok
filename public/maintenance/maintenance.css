@@ -221,6 +221,7 @@ tr:last-child td { border-bottom: 0; }
 .toast.show { opacity: 1; transform: none; }
 .toast.error { border-color: rgba(255, 95, 86, .5); color: #ffc9c6; }
 .toast.ok { border-color: rgba(52, 211, 153, .4); }
+.toast.warn { border-color: rgba(255, 189, 46, .5); color: #ffe4a3; }
 .spinner {
   width: 14px; height: 14px; border: 2px solid rgba(255, 255, 255, .2);
   border-top-color: var(--accent); border-radius: 50%; display: inline-block;

@@ -332,10 +332,13 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
   fi
 fi
 
+if docker inspect wickedafdok-maintenance >/dev/null 2>&1; then
+  docker rm -f wickedafdok-maintenance >/dev/null 2>&1 || true
+fi
 if ! DOK_PATH="$DIR" HOST_PATH=/ PUID="$PUID" PGID="$PGID" \
   DOCKER_SOCK="$SOCK" MAINTENANCE_PORT="$MAINTENANCE_PORT" \
   MAINTENANCE_URL="http://localhost:$MAINTENANCE_PORT" MAINTENANCE_REQUIRE_TOKEN=1 \
-  docker compose -p wickedafdok-maintenance -f "$DIR/maintenance/docker-compose.yml" up -d --remove-orphans; then
+  docker compose -p wickedafdok-maintenance -f "$DIR/maintenance/docker-compose.yml" up -d --remove-orphans --force-recreate; then
   echo "Could not start the Dok Maintenance container." >&2
   exit 1
 fi

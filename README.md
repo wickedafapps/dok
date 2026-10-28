@@ -10,9 +10,9 @@ Prepare permissions once (and again after changing the repo owner or Docker sock
 sudo ./setup.sh
 ```
 
-This creates the runtime directories and `wicked` network, gives the container access to the Docker socket, and writes `docker-compose.override.yml` so the container runs with the invoking sudo user's UID/GID plus the socket group. It also takes ownership of the whole checkout and normalizes permissions (`755` directories, `644` files, `755` for scripts, `600` for runtime state, logs, backups, and managed compose files). Use `sudo ./setup.sh --root` to keep the container running as root, or pass `--uid`/`--gid` explicitly. If setup adds your host user to the Docker group, log out and back in before running `./start.sh`. The root compose file expects the `wicked` network to exist; `setup.sh` and `start.sh` both create it when missing.
+This creates the runtime directories and `wicked` network, gives the container access to the Docker socket, and writes `docker-compose.override.yml` so the container runs with the invoking sudo user's UID/GID plus the socket group. It also takes ownership of the whole checkout, normalizes permissions (`755` directories, `644` files, `755` for scripts, `600` for runtime state, logs, backups, and managed compose files), builds `wickedafdok:latest`, creates the separate `maintenance-data/` store, and starts the privileged **Dok Maintenance** container. Use `sudo ./setup.sh --root` to keep the containers running as root, or pass `--uid`/`--gid` explicitly. If setup adds your host user to the Docker group, log out and back in before running `./start.sh`. The root compose file expects the `wicked` network to exist; `setup.sh` and `start.sh` both create it when missing.
 
-Then start WickedAFDok:
+Setup prints a Maintenance URL with its token, for example `http://localhost:8090/?token=...`. Open it and choose **Installation**; the installer writes the Dok configuration, launches Dok, and optionally installs selected core services. For an existing installation, start Dok normally:
 
 ```bash
 ./start.sh
@@ -28,22 +28,35 @@ The Compose project name is pinned to the existing internal identifier `wickedaf
 
 Open `http://localhost:8080`. The UI has no built-in login — put it behind a reverse proxy if exposed. The optional Authelia core service protects apps behind nginx-proxy; it does not gate the WickedAFDok UI itself.
 
+Reopen Maintenance from **Settings → Maintenance** for installs, updates, backups, repairs, diagnostics, or maintenance mode. Its data lives in `maintenance-data/`, outside `data/`, so it survives a damaged or replaced Dok installation.
+
 ## Highlights
 
 - Manage containers, images, apps, compose stacks, and core services from one UI. The Containers tab splits protected **Core Services** from workloads and has an **Apps interface** button.
 - Use **Quick Deploy** for one-click app redeploys (duplicate container names are renamed safely) or **Alter State** to edit an app's compose file and save it as the new base configuration.
 - Customize the installation from **Settings → Dok Settings → Designer**: logo, name, tagline, CSS override, and direct editing of nginx-proxy error pages and configuration files.
-- Open a browser terminal from the dashboard, or launch OpenCode in Admin or User mode without any setup. OpenCode starts on demand and stops when you close the terminal.
+- Install, update, back up, repair, and recover the whole installation from the on-demand **Dok Maintenance** container. It keeps an exact installation record and snapshots in `maintenance-data/`, runs Admin OpenCode, and replaces the old Host Helper.
+- Open a browser terminal from the dashboard, or launch OpenCode in User mode without any setup. Admin OpenCode runs from Dok Maintenance, where the host checkout and repair tools live. OpenCode starts on demand and stops when you close the terminal.
 - Give the Authentik, Technitium, or AdGuard Home web consoles their own domain; WickedAFDok writes the `VIRTUAL_HOST`/`VIRTUAL_PORT` reverse-proxy entries and can apply the change to an existing service.
 - Request and renew Let's Encrypt certificates automatically with the optional `nginxproxy/acme-companion` service, or place certificates manually.
 - Send outgoing mail through any SMTP provider, capture it locally with Mailpit, or run a full Stalwart mail server from the Email card.
 - Import app libraries from a local archive or directly from a git repository, including single compose/Dockerfile projects.
 - Add Authelia forward auth to any app: launch the auth service, pick containers from the window that opens, and WickedAFDok recreates them with `ENABLE_AUTH=true` or patches their compose file. Authelia runs alongside Authentik, not instead of it.
-- Create full, single-app, or custom backups. Custom backups can mix data, apps, core services, sources, and logs, and optionally include only selected apps or core services.
+- Create full backups and exact installation snapshots in Dok Maintenance. The legacy Dok backup pane still supports single-app and custom scopes for compatibility. Snapshots restore the saved install without re-entering settings.
 - Store encrypted credentials for Docker Hub, GHCR, GitLab, Quay, and other registries in **Settings → Dok Settings**, and use them automatically for pulls and compose launches.
 - App creation shows a live progress bar and closes the configuration window when the app is created.
 - Persistent app data is never overwritten or deleted by app creation, library import, or app backup restore. Existing data is reused with a notice; fresh data requires a new app name or data location, or manual deletion first.
 - OC Assist follows `apps/AGENTS.md`, a generated app-library contract covering layout, compose, routing, secrets, and persistent-data rules.
+
+## Dok Maintenance
+
+Dok Maintenance is a separate privileged container that runs only when you launch it: from `setup.sh` for installation, from **Settings → Maintenance**, or on demand when a host directory must be created. It replaces the old Host Helper.
+
+- **Installation** offers **Standalone Dok** (skip optional settings and registry connections if you want) and **Dok with Core Services** (pick at most one option per category, then supply the required domains, accounts, and secrets). The installer writes Dok's settings, registries, and compose files, launches Dok, configures the selected services, and can shut itself down when finished. OpenCode is built in to reconcile the selected stack.
+- **Backups and snapshots** are stored in `maintenance-data/` with an installation record that is refreshed whenever Dok settings, apps, registries, or services change. Restoring re-creates the saved install without asking for the same information again.
+- **Updates** pull the checkout, rebuild the image, and recreate Dok; **Diagnostics and repair** check Docker access, directories, settings, encryption keys, networks, and containers; **Terminal** and **OpenCode Admin** provide full host/Docker access for troubleshooting.
+- Apps created by Dok are labeled `dok.managed=true`, `dok.created-by=dok`, `dok.app=<name>`, and `dok.installation=<id>` so Maintenance can find every instance. App persistent data is never reset, deleted, or overwritten by Maintenance restores.
+- The browser entry is `http://localhost:8090/?token=...`; the token is in `data/.maintenance-token` and is printed by `setup.sh`. Keep `maintenance-data/` and `.maintenance-token` private and include them in host-level backups.
 
 ## Dok Settings: Designer, groups, and registry connections
 
@@ -73,7 +86,7 @@ WickedAFDok can self-update from any git remote. To manage the app through a Git
 2. Decide how the app will authenticate:
    - **HTTPS + token (recommended):** create a fine-grained PAT for the repository with **Contents: Read**, then add a **Git host** connection for `github.com` in Dok Settings. Add **Contents: Read and write** only if the same token will also push commits; WickedAFDok itself only pulls.
    - **SSH deploy key:** add a read-only deploy key to the repository and mount the matching private key for the container user. No Dok Settings git connection is needed.
-3. Open **Settings → Backups & Updates**, enter the repository URL, for example `https://github.com/wickedafapps/dok.git`, and the branch (`main`), then click **Update & Restart**.
+3. Open **Settings → Maintenance → Updates**, enter the repository URL, for example `https://github.com/wickedafapps/dok.git`, and the branch (`main`), then click **Update & Restart**.
 4. In Docker, WickedAFDok pulls the checkout, rebuilds its image from the updated source, and recreates the container with that image. The included compose file mounts the host checkout at `/app/host-source`, so the pull updates the host files and survives container recreation. If your container was created before that mount existed, run `git pull && ./start.sh` once on the host before using the in-app updater; this updates the checkout and recreates the container with the new mount.
 5. Running from a source checkout without Docker pulls the code and reports that a restart is required. Restart the server process to apply it.
 
@@ -129,27 +142,27 @@ Running a real mail server for your own mailboxes needs inbound port 25, a stati
 
 ## Browser terminal and OpenCode
 
-The **Terminal** button on the dashboard opens a shell in the WickedAFDok container. The **OpenCode** button opens the same terminal with the OpenCode AI coding agent already running. The terminal is also available from Settings → Core Services → OpenCode.
+The **Terminal** button on the dashboard opens a shell in the WickedAFDok container, and **OpenCode** opens the terminal with a User-mode OpenCode session. The terminal is also available from Settings → Core Services → OpenCode.
 
-OpenCode has two permission modes:
+OpenCode has two permission modes, split across the two containers:
 
-- **Admin mode** starts in `/app` with full access. Use it for maintenance, troubleshooting, Docker work, and changing WickedAFDok itself.
-- **User mode** starts in `/app/apps` with app-only file access and a restricted set of shell commands. Use it to create apps and get basic help. OpenCode's Docker, system package installation, privilege escalation, and WickedAFDok source access are blocked by its permission rules.
+- **User mode** runs in Dok, starts in `/app/apps`, and has app-only file access plus a restricted set of shell commands. Use it to create apps and get basic help. Docker, system package installation, privilege escalation, and WickedAFDok source access are blocked by its permission rules.
+- **Admin mode** runs only in Dok Maintenance, starts in `/dok`, and has full host and Docker access. Dok rejects Admin sessions with `409`; its Admin buttons open Maintenance instead. Use Admin mode for updates, repairs, and changing WickedAFDok itself.
 
-The Terminal button and **Apps shell** button open a normal shell as the container user. Those shells are not permission-restricted; the two modes above apply to OpenCode.
+The Terminal button and **Apps shell** button open a normal shell as the container user. Those shells are not permission-restricted; the two OpenCode modes above are.
 
-OpenCode is preconfigured, so launching it needs no input. If you want a specific provider and model, expand **Model and provider** on the OpenCode card, enter a model such as `anthropic/claude-sonnet-4-5` and an API key, then save. The provider is inferred from the model prefix, or you can set it explicitly. You can also run `/connect` inside OpenCode and complete the provider login there. Provider credentials and session state are stored under `data/opencode` and are shared between modes; generated mode configs are stored in `data/opencode/<mode>`.
+OpenCode is preconfigured, so launching it needs no input. Set a model and API key in Dok Maintenance's OpenCode card, or run `/connect` inside a session. Provider credentials and User-mode sessions are stored under `data/opencode`; Admin sessions and provider state used by Maintenance live under `maintenance-data/opencode`.
 
 Closing the terminal stops the session. OpenCode is intentionally not part of **Start all/Stop all**, because it is a launch-on-demand tool rather than a long-running service.
 
 If WickedAFDok is behind a reverse proxy, that proxy must forward WebSocket upgrades for `/api/terminal/ws`; otherwise the terminal and OpenCode cannot connect.
 
-> User mode is a guardrail for the agent, not a hard security boundary: OpenCode runs as the same container user as Admin mode. Keep the UI behind a trusted network or an authenticated reverse proxy, since an Admin shell has full container and Docker access.
+> User mode is a guardrail for the agent, not a hard security boundary: it still runs as the Dok container user. Keep the UI and Maintenance token behind a trusted network or an authenticated reverse proxy, since an Admin shell in Maintenance has full host, container, and Docker access.
 
 If a custom `docker-compose.override.yml` already exists, `setup.sh` leaves it alone and prints the `user`/`group_add` values to merge. Re-run `./start.sh` after setup to recreate the container with the new permissions.
 
 Adding nginx and letting WickedAFDok recreate itself keeps Docker access: the generated compose preserves the container user, `group_add`, and `privileged`, and the recreation helper adds the live socket GID before `docker compose up`. If an older deployment still loses access after adding nginx or after a Docker/host update, the container user is probably missing the socket's current group. Run `sudo ./setup.sh` and then `./start.sh` on the host. `setup.sh` refreshes the compose override, and `start.sh` also injects the live socket GID on every start; the server log shows the socket owner, process UID/GID, and supplementary groups when Docker is unreachable.
 
-If app creation reports `permission denied` while creating app or host directories, re-run `sudo ./setup.sh` so the checkout and runtime directories are owned by the container user. Missing bind-mount paths can only be created where that UID/GID has write access; otherwise launch the optional Host Helper from Settings → Core Services, or create the directory on the host with matching permissions.
+If app creation reports `permission denied` while creating app or host directories, re-run `sudo ./setup.sh` so the checkout and runtime directories are owned by the container user. Missing bind-mount paths can only be created where that UID/GID has write access; otherwise start Dok Maintenance, which replaces the old Host Helper and can create host paths with its privileges, or create the directory on the host with matching permissions.
 
 Git clone and update verify TLS certificates by default. For a trusted self-hosted git server with a self-signed certificate only, set `WICKEDAFDOK_GIT_INSECURE=1` in the container environment. The in-app git updater also requires the application code directory to be writable by the container user; non-root deployments from the read-only image cannot self-update.

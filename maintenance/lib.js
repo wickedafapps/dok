@@ -302,8 +302,18 @@ export function refreshInstallationState() {
   if (!state || typeof state !== 'object') return null;
   writeJson(installationStatePath, state);
   const current = readInstallation() || {};
+  const restored = readJson(dokInstallationPath, null);
+  const restoredRecord = restored && typeof restored === 'object' ? restored : {};
+  const pick = (key) => restoredRecord[key] ?? current[key];
   saveInstallation({
-    dok: state.dok || current.dok || {},
+    ...(pick('id') ? { id: pick('id') } : {}),
+    ...(pick('created') ? { created: pick('created') } : {}),
+    ...(pick('type') ? { type: pick('type') } : {}),
+    ...(pick('plan') ? { plan: pick('plan') } : {}),
+    ...(pick('completedAt') !== undefined ? { completedAt: pick('completedAt') } : {}),
+    ...(pick('services') ? { services: pick('services') } : {}),
+    ...(pick('reinstall') ? { reinstall: pick('reinstall') } : {}),
+    dok: { ...(current.dok || {}), ...(restoredRecord.dok || {}), ...(state.dok || {}) },
     summary: state.summary || current.summary || {},
     lastStateSync: new Date().toISOString()
   });
@@ -363,7 +373,7 @@ export async function docker(args, options = {}) {
 
 export async function dockerInspect(container = DOK_CONTAINER) {
   try {
-    const { stdout } = await docker(['inspect', container]);
+    const { stdout } = await docker(['container', 'inspect', container]);
     const parsed = JSON.parse(stdout);
     return Array.isArray(parsed) ? parsed[0] : parsed;
   } catch {
@@ -880,7 +890,7 @@ export async function captureSnapshot({ reason = 'manual', label = '' } = {}) {
   const args = ['-czf', archive,
     '--exclude=data/backups', '--exclude=data/tmp', '--exclude=data/logs',
     '--exclude=data/docker-config', '--exclude=data/host-helper/agent.sock', '--exclude=data/.maintenance-token',
-    '--exclude=node_modules', '--exclude=.git', ...targets];
+    '--exclude=apps/.preview-*', '--exclude=node_modules', '--exclude=.git', ...targets];
   await run('tar', args, { cwd: DOK_ROOT });
   try { fs.chmodSync(archive, 0o600); } catch {}
   const meta = {
@@ -958,7 +968,8 @@ export async function createBackup({ name = '', includeLogs = true, snapshot = t
   if (!targets.length) throw new Error('No Dok installation files were found to back up');
   const args = ['-czf', archive,
     '--exclude=data/backups', '--exclude=data/tmp', '--exclude=data/docker-config',
-    '--exclude=data/host-helper/agent.sock', '--exclude=data/.maintenance-token', '--exclude=node_modules', '--exclude=.git'];
+    '--exclude=data/host-helper/agent.sock', '--exclude=data/.maintenance-token',
+    '--exclude=apps/.preview-*', '--exclude=node_modules', '--exclude=.git'];
   if (!includeLogs) args.push('--exclude=data/logs');
   args.push(...targets);
   await run('tar', args, { cwd: DOK_ROOT });
@@ -997,15 +1008,27 @@ export async function restoreArchive(archive, { overwrite = false, restart = tru
     throw err;
   }
   const list = await run('tar', ['-tzf', archive]);
-  safeArchiveEntries(String(list.stdout || '').split('\n').filter(Boolean));
+  const entries = String(list.stdout || '').split('\n').filter(Boolean);
+  safeArchiveEntries(entries);
+  const topLevel = new Set(entries.map(entry => entry.replace(/^\.?\//, '').split('/')[0]).filter(Boolean));
   let preservedToken = '';
   try { preservedToken = fs.readFileSync(tokenPath, 'utf-8').trim(); } catch {}
+  let preservedHelperToken = '';
+  try { preservedHelperToken = fs.readFileSync(path.join(dataDir, 'host-helper', 'token'), 'utf-8').trim(); } catch {}
+  const appProjects = new Set(readRegistry().flatMap(entry => {
+    const name = projectName(entry.name || entry.appDir || entry.path || '', 'app');
+    return [name, `app-${name}`, projectName(entry.id || '', '')].filter(Boolean);
+  }));
   const stopped = [];
   const containers = await containerList().catch(() => []);
   for (const container of containers) {
     if (container.state !== 'running') continue;
-    if (container.name === DOK_CONTAINER || container.labels?.['com.docker.compose.project'] === 'wickedafdok' ||
-        container.labels?.['com.docker.compose.project'] === 'wickedafdok-installation' ||
+    const project = container.labels?.['com.docker.compose.project'] || '';
+    const managedApp = container.labels?.['dok.managed'] === 'true' &&
+      container.labels?.['dok.maintenance'] !== 'true' && container.name !== 'wickedafdok-maintenance';
+    if (container.name === DOK_CONTAINER || project === 'wickedafdok' ||
+        project === 'wickedafdok-installation' ||
+        appProjects.has(project) || managedApp ||
         ['nginx-proxy', 'cloudflared', 'authelia', 'technitium-dns', 'adguard', 'mailpit', 'stalwart',
           'authentik-server', 'authentik-worker', 'authentik-postgresql', 'authentik-redis'].includes(container.name)) {
       try {
@@ -1014,9 +1037,25 @@ export async function restoreArchive(archive, { overwrite = false, restart = tru
       } catch {}
     }
   }
+  for (const target of ['apps', 'core', 'sources']) {
+    if (!topLevel.has(target)) continue;
+    const dir = path.join(DOK_ROOT, target);
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+    try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+  }
+  if (topLevel.has('data')) {
+    let names = [];
+    try { names = fs.readdirSync(dataDir); } catch {}
+    for (const name of names.filter(item => !['backups', 'tmp', 'logs', 'docker-config', 'host-helper'].includes(item))) {
+      try { fs.rmSync(path.join(dataDir, name), { recursive: true, force: true }); } catch {}
+    }
+  }
   await run('tar', ['-xzf', archive, '-C', DOK_ROOT]);
   if (preservedToken) {
     try { writePrivateFile(tokenPath, preservedToken); } catch {}
+  }
+  if (preservedHelperToken) {
+    try { writePrivateFile(path.join(dataDir, 'host-helper', 'token'), preservedHelperToken); } catch {}
   }
   chownTree(DOK_ROOT);
   for (const file of ['settings.json', 'registries.json', 'registry.json', 'groups.json', 'auth.json', 'dns.json', '.backup-manifest.json']) {
@@ -1102,6 +1141,9 @@ export async function repairInstallation({ fix = false } = {}) {
     try { fs.chmodSync(credentialsKeyPath, 0o600); } catch {}
     chownTree(DOK_ROOT);
     if (!settingsOk) writeSettings(baseSettings(normalizeInstallPlan({ type: 'standalone' })));
+    if (!installationState()) {
+      await dokApi('/api/installation/sync', { method: 'POST', body: {}, timeout: 30000 }).catch(() => {});
+    }
     refreshInstallationState();
     add('repair', true, 'Directories, permissions, network, and encryption key repaired');
   }

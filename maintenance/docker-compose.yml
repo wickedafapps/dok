@@ -31,7 +31,7 @@ services:
         bind:
           propagation: rslave
     environment:
-      - DOK_ROOT=/dok
+      - DOK_ROOT=${DOK_PATH:-/dok}
       - MAINTENANCE_DATA=/maintenance-data
       - HOST_ROOT=/host
       - DOK_HOST_PATH=${DOK_PATH:-..}
@@ -43,7 +43,7 @@ services:
       - MAINTENANCE_PORT=8090
       - MAINTENANCE_URL=${MAINTENANCE_URL:-http://localhost:8090}
       - MAINTENANCE_REQUIRE_TOKEN=${MAINTENANCE_REQUIRE_TOKEN:-1}
-      - MAINTENANCE_TOKEN_FILE=/dok/data/.maintenance-token
+      - MAINTENANCE_TOKEN_FILE=${DOK_PATH:-/dok}/data/.maintenance-token
       - OPENCODE_BIN=/usr/local/bin/opencode
     networks:
       - wicked

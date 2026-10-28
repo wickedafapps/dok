@@ -38,7 +38,7 @@ app.use('/vendor/xterm-fit', express.static('/app/node_modules/@xterm/addon-fit'
 app.use('/vendor/xterm', express.static(path.join(DOK_ROOT, 'node_modules/@xterm/xterm')));
 app.use('/vendor/xterm-fit', express.static(path.join(DOK_ROOT, 'node_modules/@xterm/addon-fit')));
 
-const MAINTENANCE_REQUIRE_TOKEN = process.env.MAINTENANCE_REQUIRE_TOKEN === '1';
+const MAINTENANCE_REQUIRE_TOKEN = process.env.MAINTENANCE_REQUIRE_TOKEN !== '0';
 const MAINTENANCE_PORT = Number(process.env.MAINTENANCE_PORT) || 8090;
 const SESSION_LIMIT = 6;
 const SESSION_BUFFER_LIMIT = 2 * 1024 * 1024;
@@ -59,7 +59,7 @@ function logLine(level, message) {
 function authorized(req) {
   if (!MAINTENANCE_REQUIRE_TOKEN) return true;
   const expected = maintenanceToken();
-  if (!expected) return true;
+  if (!expected) return false;
   const header = String(req.headers.authorization || '');
   if (header === `Bearer ${expected}`) return true;
   const query = String(req.query?.token || '');
@@ -271,6 +271,12 @@ async function configureServices(plan, log) {
         }
       });
       record('nginx-proxy', true, out.message || 'Launched');
+      if (out?.selfUpdate?.scheduled) {
+        log('Dok is reconnecting to nginx-proxy; waiting for the recreated container.');
+        await new Promise(resolve => setTimeout(resolve, 10000));
+        await waitForDok(300000);
+        log('Dok is healthy after nginx-proxy configuration.');
+      }
     } catch (e) { record('nginx-proxy', false, e.message); }
   }
 
@@ -412,6 +418,10 @@ async function runInstall(plan) {
 
     phase('write-configuration');
     const existing = readSettings();
+    if (!plan.defaults.adminPassword && existing.defaults?.adminPassword) {
+      plan.defaults.adminPassword = existing.defaults.adminPassword;
+    }
+    const installationId = readInstallation()?.id || `dok-${Date.now().toString(36)}-${randomSecret(3)}`;
     const fresh = baseSettings(plan);
     const settings = {
       ...fresh,
@@ -420,6 +430,7 @@ async function runInstall(plan) {
       defaults: { ...fresh.defaults, ...existing.defaults, ...plan.defaults },
       designer: { ...fresh.designer, ...(existing.designer || {}) },
       installation: {
+        id: installationId,
         installedAt: existing.installation?.installedAt || new Date().toISOString(),
         installedBy: 'dok-maintenance',
         type: plan.type,
@@ -438,7 +449,6 @@ async function runInstall(plan) {
         acme: { enabled: true, email: plan.acmeEmail, staging: false }
       };
     }
-    if (plan.adminPassword) settings.services.opencode = { ...(settings.services.opencode || {}) };
     writeSettings(settings);
     if (plan.registries.length) writeRegistriesFromPlan(plan);
     if (!fs.existsSync(path.join(dataDir, 'registry.json'))) writeJson(path.join(dataDir, 'registry.json'), []);
@@ -449,6 +459,7 @@ async function runInstall(plan) {
     log('Configuration written to data/.');
 
     const saved = saveInstallation({
+      id: installationId,
       type: plan.type,
       plan: {
         type: plan.type,
@@ -484,8 +495,27 @@ async function runInstall(plan) {
     }
 
     phase('record-snapshot');
-    writeInstallationCompose();
+    try { writeInstallationCompose(); } catch (e) { log(`Installation compose warning: ${e.message}`); }
     try { refreshInstallationState(); } catch {}
+    const installationPlan = {
+      type: plan.type,
+      defaults: { ...plan.defaults, adminPassword: plan.defaults.adminPassword ? '(stored in encrypted settings)' : '' },
+      services: plan.services,
+      selected: [...selectedServiceIds(plan)],
+      registries: plan.registries.map(item => ({ kind: item.kind, provider: item.provider, name: item.name, host: item.host, username: item.username }))
+    };
+    const completedAt = new Date().toISOString();
+    const dokRecord = { url: plan.dokDomain ? `http://${plan.dokDomain}` : `http://localhost:8080`, container: DOK_CONTAINER };
+    // Write the completed record before the snapshot so restoring the initial
+    // snapshot keeps the install plan, service results, and completion time.
+    saveInstallation({
+      type: plan.type,
+      plan: installationPlan,
+      summary: installationSummary(),
+      completedAt,
+      dok: dokRecord,
+      services: serviceResults
+    });
     const snapshot = await captureSnapshot({ reason: 'install', label: 'Initial installation snapshot' }).catch(e => {
       log(`Snapshot warning: ${e.message}`);
       return null;
@@ -493,17 +523,12 @@ async function runInstall(plan) {
     if (snapshot) log(`Installation snapshot ${snapshot.id} captured.`);
     saveInstallation({
       type: plan.type,
-      plan: {
-        type: plan.type,
-        defaults: { ...plan.defaults, adminPassword: plan.defaults.adminPassword ? '(stored in encrypted settings)' : '' },
-        services: plan.services,
-        selected: [...selectedServiceIds(plan)],
-        registries: plan.registries.map(item => ({ kind: item.kind, provider: item.provider, name: item.name, host: item.host, username: item.username }))
-      },
+      plan: installationPlan,
       summary: installationSummary(),
-      completedAt: new Date().toISOString(),
-      dok: { url: plan.dokDomain ? `http://${plan.dokDomain}` : `http://localhost:8080`, container: DOK_CONTAINER },
-      services: serviceResults
+      completedAt,
+      dok: dokRecord,
+      services: serviceResults,
+      ...(snapshot ? { reinstall: { snapshot: snapshot.id, at: new Date().toISOString() } } : {})
     });
 
     phase('done');
@@ -564,7 +589,20 @@ app.post('/api/install/reinstall', api(async (req, res) => {
   const start = await dokApi('/api/core/all/start', { method: 'POST', body: {} }).catch(e => ({ error: e.message }));
   refreshInstallationState();
   saveInstallation({ completedAt: new Date().toISOString(), reinstall: { snapshot: target.id, at: new Date().toISOString() }, summary: installationSummary() });
-  res.json({ ok: true, ...result, coreStart: start.error ? { error: start.error } : { ok: true }, message: 'Exact reinstall completed from the saved installation snapshot.' });
+  const coreFailures = (start.results || []).filter(item => !item.ok);
+  const coreStart = start.error
+    ? { ok: false, error: start.error }
+    : start.ok === false || coreFailures.length
+      ? { ok: false, error: 'One or more core services failed to start.', results: start.results || [] }
+      : { ok: true, results: start.results || [] };
+  res.json({
+    ok: true,
+    ...result,
+    coreStart,
+    message: coreStart.ok
+      ? 'Exact reinstall completed from the saved installation snapshot.'
+      : `Dok was restored, but core services could not all start: ${coreStart.error}`
+  });
 }));
 
 // ---------- maintenance lifecycle ----------
@@ -660,6 +698,7 @@ app.post('/api/snapshots/:id/restore', api(async (req, res) => {
     overwrite: req.body?.overwrite === true,
     restart: req.body?.restart !== false
   });
+  refreshInstallationState();
   res.json({ ok: true, ...result });
 }));
 
@@ -705,6 +744,7 @@ app.post('/api/backups/:id/restore', api(async (req, res) => {
     overwrite: req.body?.overwrite === true,
     restart: req.body?.restart !== false
   });
+  refreshInstallationState();
   res.json({ ok: true, ...result });
 }));
 
@@ -1319,7 +1359,7 @@ server.on('upgrade', (req, socket, head) => {
   if (MAINTENANCE_REQUIRE_TOKEN) {
     const expected = maintenanceToken();
     const token = url.searchParams.get('token') || '';
-    if (expected && token !== expected) {
+    if (!expected || token !== expected) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();
       return;

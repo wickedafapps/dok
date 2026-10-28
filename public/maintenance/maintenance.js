@@ -689,7 +689,7 @@
     if (stepName === 'Dok settings') {
       if (wizard.type === 'core') {
         if (wizard.services.proxy === 'nginx-proxy' && !wizard.fields.dokDomain) return 'A Dok domain is required when nginx-proxy is selected.';
-        if (wizard.services.auth === 'authelia' && !wizard.fields.adminPassword) return 'Authelia requires an admin password.';
+        if (wizard.services.auth && !wizard.fields.adminPassword) return 'The authentication service requires an admin password.';
         if (wizard.services.auth && !wizard.fields.authDomain) return 'The authentication portal domain is required.';
         if (wizard.services.tunnel === 'cloudflared' && !wizard.fields.cloudflareToken) return 'A Cloudflare Tunnel token is required.';
         if (wizard.services.mail === 'smtp' && (!wizard.fields.smtpHost || !wizard.fields.smtpFrom)) return 'SMTP host and sender address are required.';
@@ -732,10 +732,19 @@
     try {
       const result = await api('/api/install/reinstall', { method: 'POST', body: {} });
       qs('#installLog').textContent += `${result.message || 'Reinstall completed.'}\n`;
-      qs('#installBadge').textContent = 'complete';
-      qs('#installBadge').className = 'badge ok';
+      const coreStart = result.coreStart || {};
+      const coreErrors = result.coreErrors || [];
+      const coreFailed = coreStart.ok === false || coreErrors.length > 0;
+      const failedServices = (coreStart.results || []).filter(item => !item.ok);
+      qs('#installBadge').textContent = coreFailed || result.restartError ? 'warning' : 'complete';
+      qs('#installBadge').className = `badge ${coreFailed || result.restartError ? 'warn' : 'ok'}`;
       qs('#installResult').classList.remove('hidden');
-      qs('#installResult').innerHTML = `<div class="notice ok">${escapeHtml(result.message || 'Reinstall completed.')}</div><div class="row" style="margin-top:10px"><a class="btn primary" href="http://${escapeHtml(location.hostname)}:8080" target="_blank" rel="noopener">Open Dok</a></div>`;
+      qs('#installResult').innerHTML = `
+        <div class="notice ${coreFailed || result.restartError ? 'warn' : 'ok'}">${escapeHtml(result.message || 'Reinstall completed.')}</div>
+        ${failedServices.length ? `<div class="small" style="margin-top:8px">${failedServices.map(item => `<div>${escapeHtml(item.service)}: ${escapeHtml(item.error || 'failed to start')}</div>`).join('')}</div>` : ''}
+        ${coreErrors.length ? `<div class="small" style="margin-top:8px">${coreErrors.map(item => `<div>${escapeHtml(item)}</div>`).join('')}</div>` : ''}
+        ${result.restartError ? `<div class="small" style="margin-top:8px">Restart error: ${escapeHtml(result.restartError)}</div>` : ''}
+        <div class="row" style="margin-top:10px"><a class="btn primary" href="http://${escapeHtml(location.hostname)}:8080" target="_blank" rel="noopener">Open Dok</a></div>`;
       await loadOverview();
     } catch (e) {
       qs('#installLog').textContent += `ERROR: ${e.message}\n`;
@@ -963,8 +972,9 @@
       if (!ok) return;
       restore.disabled = true;
       try {
-        await api(`/api/backups/${encodeURIComponent(id)}/restore`, { method: 'POST', body: { overwrite: true, restart: true } });
-        toast('Backup restored. Dok is starting.', 'ok');
+        const result = await api(`/api/backups/${encodeURIComponent(id)}/restore`, { method: 'POST', body: { overwrite: true, restart: true } });
+        const warning = result.restartError || result.coreErrors?.length;
+        toast(warning ? `Backup restored, but Dok or core services need attention: ${result.restartError || result.coreErrors.join('; ')}` : 'Backup restored. Dok is starting.', warning ? 'warn' : 'ok');
         await loadOverview();
       } catch (e) { toast(e.message, 'error'); }
       finally { restore.disabled = false; }
@@ -1012,7 +1022,8 @@
     if (!ok) return;
     try {
       const result = await api('/api/install/reinstall', { method: 'POST', body: {} });
-      toast(result.message || 'Exact reinstall complete', 'ok');
+      const warning = result.coreStart?.ok === false || result.restartError || result.coreErrors?.length;
+      toast(result.message || 'Exact reinstall complete', warning ? 'warn' : 'ok');
       await loadOverview();
       await loadSnapshots();
     } catch (e) { toast(e.message, 'error'); }
@@ -1026,8 +1037,9 @@
       if (!ok) return;
       restore.disabled = true;
       try {
-        await api(`/api/snapshots/${encodeURIComponent(id)}/restore`, { method: 'POST', body: { overwrite: true, restart: true } });
-        toast('Snapshot restored. Dok is starting.', 'ok');
+        const result = await api(`/api/snapshots/${encodeURIComponent(id)}/restore`, { method: 'POST', body: { overwrite: true, restart: true } });
+        const warning = result.restartError || result.coreErrors?.length;
+        toast(warning ? `Snapshot restored, but Dok or core services need attention: ${result.restartError || result.coreErrors.join('; ')}` : 'Snapshot restored. Dok is starting.', warning ? 'warn' : 'ok');
         await loadOverview();
       } catch (e) { toast(e.message, 'error'); }
       finally { restore.disabled = false; }

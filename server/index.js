@@ -3846,10 +3846,12 @@ function buildWadCompose(info, { network, domain, port, serviceName = 'app', ext
 async function scheduleSelfRecreate(domain, network) {
   const port = String(process.env.PORT || 8080);
   const containersAll = await docker.listContainers({ all: true });
-  const wad = containersAll.find(c => (c.Names || []).some(n => {
-    const nm = n.replace(/^\//, '');
-    return /wickedafdok/i.test(nm) && !/updater/i.test(nm);
-  }));
+  const dokCandidates = containersAll.filter(c => {
+    const names = (c.Names || []).map(n => n.replace(/^\//, ''));
+    if (c.Labels?.['dok.maintenance'] === 'true') return false;
+    return names.some(nm => /wickedafdok/i.test(nm) && !/updater|helper|maintenance/i.test(nm));
+  });
+  const wad = dokCandidates.find(c => (c.Names || []).some(n => n.replace(/^\//, '') === 'wickedafdok')) || dokCandidates[0];
   if (!wad) return { scheduled: false, reason: 'wickedafdok container not found' };
 
   const cont = docker.getContainer(wad.Id);
@@ -5117,8 +5119,9 @@ function maintenanceHostPort() {
 async function maintenanceHostCheckout() {
   const info = await selfContainerInfo();
   const dataMount = (info?.Mounts || []).find(m => m.Destination === '/app/data' && m.Type === 'bind' && m.Source);
-  if (dataMount) return path.dirname(dataMount.Source);
-  return await selfMountSource('/app/host-source');
+  const checkout = dataMount ? path.dirname(dataMount.Source) : await selfMountSource('/app/host-source');
+  if (!checkout || checkout === '/' || checkout === '.') return null;
+  return checkout;
 }
 
 function maintenanceComposeText({ checkout, image, installationId: id, hostPort, uid, gid, socket }) {
@@ -5358,7 +5361,10 @@ function coreContainerInfo(container) {
   const name = String(container?.name || (container?.Names || [])[0] || '').replace(/^\//, '');
   const labels = container?.Labels || {};
   const project = labels['com.docker.compose.project'] || '';
-  const selfName = /^wickedafdok(-|$)/.test(name) && !/updater|helper/.test(name);
+  if (labels['dok.maintenance'] === 'true' || name === maintenanceContainer) {
+    return { core: true, protected: true, self: false, role: 'Dok Maintenance' };
+  }
+  const selfName = /^wickedafdok(-|$)/.test(name) && !/updater|helper|maintenance/.test(name);
   if (selfName || project === 'wickedafdok') {
     return { core: true, protected: true, self: true, role: 'Dok' };
   }
@@ -9368,7 +9374,12 @@ app.post('/api/core/nginx-proxy/run', async (req, res) => {
       } catch {}
       try {
         const wadList = await docker.listContainers({ all: true });
-        const wad2 = wadList.find(c => (c.Names || []).some(n => /wickedafdok/i.test((n || '').replace(/^\//, '')) && !/updater/i.test(n)));
+        const dokList = wadList.filter(c => {
+          const names = (c.Names || []).map(n => (n || '').replace(/^\//, ''));
+          if (c.Labels?.['dok.maintenance'] === 'true') return false;
+          return names.some(n => /wickedafdok/i.test(n) && !/updater|helper|maintenance/i.test(n));
+        });
+        const wad2 = dokList.find(c => (c.Names || []).some(n => n.replace(/^\//, '') === 'wickedafdok')) || dokList[0];
         if (wad2) {
           try { await docker.getNetwork(network).connect({ Container: wad2.Id }); } catch {}
         }
