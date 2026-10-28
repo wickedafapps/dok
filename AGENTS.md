@@ -120,6 +120,7 @@ The unified way to deploy applications. Every app is stored in `apps/<name>/` wi
 - Required fields (image when no build context is present) are auto-added and marked required until filled; missing required values and conflicts such as duplicate service/container names, duplicate published ports, invalid ports, and invalid JSON are highlighted red
 - Every builder change regenerates the compose through `/api/compose/build`; edits to ports and `VIRTUAL_HOST`/`VIRTUAL_PORT` stay in sync with the quick fields. Port/volume lists accept comma-separated values on one line; other list fields are one value per line so embedded commas (for example `tmpfs` options) are preserved
 - Builder requests are sequenced: stale responses are ignored, in-flight builds cannot overwrite manual compose edits, and quick fields target the preferred app/vhost service instead of always `services[0]`
+- When core services are running, the builder calls `GET /api/core/app-hints` and adds their environment fields to the preferred service automatically: `VIRTUAL_HOST`/`VIRTUAL_PORT` for nginx-proxy, `ENABLE_AUTH=true` for Authelia, and `LETSENCRYPT_HOST`/`LETSENCRYPT_EMAIL` for acme-companion. `VIRTUAL_HOST` and `LETSENCRYPT_HOST` default to `<app>.<primaryDomain>` when a primary domain is configured. Blank hint values are omitted from the generated compose, and existing keys are left untouched. The same model is used by Alter State and imported library apps.
 - Switching to manual compose editing hides the builder and sets a dirty/manual flag so run-created apps retain their original `docker run` semantics unless the builder was actually edited
 - When Docker Compose CLI is unavailable, `/api/compose/parse` falls back to a built-in block-YAML reader for the Compose subset
 - **"Manually edit compose file"** - Opens warning modal about potential breakage; hides the builder and allows direct textarea editing
@@ -151,7 +152,8 @@ The unified way to deploy applications. Every app is stored in `apps/<name>/` wi
 - Export/import uses the `wickedafdok.library/v1` schema (`kind: wickedafdok-app-library`). The archive contains `dok-library.json` plus `apps/<name>/...`.
 - `POST /api/library/export` accepts `{ apps: [ids], name }` and returns a `.tar.gz` attachment. Apps are stripped of installation-specific data: `container_name`, `VIRTUAL_HOST`/`VIRTUAL_PORT`/`ENABLE_AUTH`/`LETSENCRYPT_*`, published host ports, absolute bind sources (except `/var/run/docker.sock`, `/etc/localtime`, `/etc/timezone`), top-level `name`, external network names (except the shared `wicked` network), external/name fields on named volumes, generated `docker-compose.wickedafdok.yml`, `.env*` (except `.env.example`), `.git`, `node_modules`, and the app's root `data` directory. Requirements metadata is sanitized the same way.
 - `POST /api/library/import` accepts the archive (multipart `file`), validates the manifest, and imports into `apps/<name>`. Existing non-empty apps return `409` with `needsOverwrite`; overwriting preserves the existing root `data` directory and `.env*` files. Imported apps are registered with `needsConfig: true` and library metadata; the Apps UI shows **Configure & Deploy**, which opens the visual compose editor so the user can supply local domains, ports, paths, and secrets.
-- UI: `#libraryExportBtn`, `#libraryImportFile`, `#libraryExportModal`, `#libraryExportList`, `#libraryExportDo`.
+- `POST /api/library/import-repo` clones a git repository (`repo`, optional `branch`, `path`, `name`, `description`, `overwrite`) and reuses the same importer. A repository with `dok-library.json` imports its apps; one with only a compose file or Dockerfile becomes a single app. Conflicts return `409 needsOverwrite`. Shared helpers: `libraryManifestFromDirectory()`, `importLibraryTree()`, `synthesizeLibraryFromRepository()`.
+- UI: `#libraryExportBtn`, `#libraryImportFile`, `#libraryImportRepoBtn`, `#libraryRepoModal`, `#libraryRepoUrl`, `#libraryRepoBranch`, `#libraryRepoPath`, `#libraryRepoName`, `#libraryRepoDo`, `#libraryExportModal`, `#libraryExportList`, `#libraryExportDo`.
 
 ### Projects / Sources
 - Browse and edit files under `sources/` directory
@@ -215,6 +217,7 @@ The **Core Services** subtab manages the bundled services. Each created service 
 - Default network: `wicked`
 - If domain configured for WickedAFDok in nginx settings, can trigger self-recreation to attach UI container to nginx network with `VIRTUAL_HOST`/`VIRTUAL_PORT` env vars
 - Uses `jwilder/nginx-proxy` style setup
+- Optional `nginxproxy/acme-companion` certificate service (`services.nginxProxy.acme = { enabled, email, staging }`) requests and renews Let's Encrypt certificates; containers opt in with `LETSENCRYPT_HOST`/`LETSENCRYPT_EMAIL`. Without it, certificates are placed manually in `core/nginx-proxy/certs`
 - Managed compose stored in `core/nginx-proxy/docker-compose.yml`
 - `GET /api/core/nginx-proxy` reports `exists`/`running` (live Docker state), `installed` (a live or stopped nginx-proxy container), `composeExists` (compose file on disk), and `lookupFailed` (Docker could not be queried). Reading status never creates the compose file, so a fresh install stays "not created" until the user launches nginx-proxy. A leftover compose file alone is not "installed": after the container is removed the card returns to the create view with a hint that the saved compose will be reused. `installed` falls back to `composeExists` only when `lookupFailed` is true, so a transient Docker/API failure cannot flip a running nginx-proxy back to "not installed"; the UI keeps the last known state on failed lookups
 - Compose reads are capped at 2 MB. A managed core-service compose that grows past the cap is renamed to `<name>.corrupt-<timestamp>` and treated as absent, so status/sync/launch recover and regenerate it from saved settings instead of failing with `Invalid string length`. `readManagedCompose()` applies this to nginx-proxy, cloudflared, Authentik, Authelia, Technitium, and Mailpit
@@ -244,12 +247,12 @@ The **Core Services** subtab manages the bundled services. Each created service 
 - The Authelia card's **Manage users** button opens `#autheliaUsersModal` (admin account, add/edit/delete local users). The **Open** button opens the portal for provider/application administration
 - The auth container picker lists every running container (not just apps), disables Dok itself with a pointer to Dok protection, and disables protected core services with a note that they are managed separately
 
-**Technitium DNS (managed):**
-- Optional DNS and ad-blocking core service with a web console
-- Web port defaults to `5380`, DNS defaults to `53` (UDP/TCP)
-- Admin password is generated when blank
-- Optional GUI domain stored as `services.technitium.domain`; the managed compose adds `VIRTUAL_HOST`/`VIRTUAL_PORT=5380`. The manage view exposes the same **Apply domain** action as Authentik.
-- Managed compose stored in `core/dns/docker-compose.yml`
+**DNS (Technitium or AdGuard Home, managed):**
+- One DNS card selects the provider via `services.dns.provider` (`technitium` default, or `adguard`)
+- Technitium: web port `5380`, DNS `53` (UDP/TCP), generated admin password, optional GUI domain (`services.technitium.domain`), compose in `core/dns/docker-compose.yml`
+- AdGuard Home: web/setup port `3000`, DNS `53` (UDP/TCP), optional GUI domain (`services.adguard.domain`), compose in the same `core/dns/docker-compose.yml` managed as project `adguard`, state in `core/dns/work` and `core/dns/conf`. Finish its setup wizard and keep the admin UI on `3000`.
+- **Apply domain** works for either provider and updates `VIRTUAL_HOST`/`VIRTUAL_PORT`
+- `GET/POST /api/core/dns` and `POST /api/core/dns/run` accept/return `provider`; `POST /api/core/dns/domain` honors it
 
 **Email / Mailpit (managed):**
 - One card covers outgoing SMTP (`services.mail`) and the optional Mailpit capture sink (`services.mailpit`)
@@ -259,7 +262,9 @@ The **Core Services** subtab manages the bundled services. Each created service 
 - `services.mailpit`: `smtpPort` (default `1025`), `webPort` (default `8025`), `maxMessages` (default `500`), optional `domain`. The managed compose publishes both ports, mounts `core/mailpit/data`, and runs on `wicked`; a domain adds `VIRTUAL_HOST`/`VIRTUAL_PORT=8025`
 - Mailpit is a capture sink only. It stores messages for inspection in its web UI and never delivers or receives internet mail; it is not a mailbox server
 - **Use Mailpit** launches the sink and points `services.mail` at `mailpit:1025` with no TLS in one step
+- **Stalwart** is launched from the same Email card and configured in its own web admin
 - Managed compose stored in `core/mailpit/docker-compose.yml`; settings are applied to Authelia immediately (config written, restart only if the content changed)
+- `services.stalwart` is an optional full mail server (`stalwartlabs/stalwart`, compose in `core/stalwart/docker-compose.yml`): admin user/password (encrypted), web port `8088`, SMTP `25`, submission `587`, IMAPS `993`, optional GUI domain. Routes: `GET /api/core/stalwart`, `POST /api/core/stalwart/compose|run|domain`. It is independent of the SMTP notifier settings; point `services.mail.host` at `stalwart` after configuring it.
 
 **Host Helper (optional):**
 - Privileged companion container running `server/host-agent.js`
@@ -342,7 +347,8 @@ The **Core Services** subtab manages the bundled services. Each created service 
 - `GET /api/core/authelia` / `POST /api/core/authelia/compose` / `POST /api/core/authelia/run` / `POST /api/core/authelia/domain` / `POST /api/core/authelia/sync` - Authelia status, compose, launch, portal domain, ENABLE_AUTH vhost sync
 - `GET /api/core/authelia/users` / `POST /api/core/authelia/users` / `DELETE /api/core/authelia/users/:username` / `POST /api/core/authelia/admin` - Manage local Authelia users and the admin account
 - `POST /api/core/authelia/dok-protection` - Toggle Authelia protection for the Dok UI
-- `GET /api/core/dns` / `POST /api/core/dns/compose` / `POST /api/core/dns/run` / `POST /api/core/dns/domain` - Technitium status, compose, launch, GUI domain
+- `GET /api/core/dns` / `POST /api/core/dns/compose` / `POST /api/core/dns/run` / `POST /api/core/dns/domain` - DNS status, compose, launch, GUI domain for Technitium or AdGuard Home (`provider`)
+- `GET /api/core/stalwart` / `POST /api/core/stalwart/compose` / `POST /api/core/stalwart/run` / `POST /api/core/stalwart/domain` - Stalwart mail server status, compose, launch, GUI domain
 - `GET /api/core/mail` - SMTP settings (redacted), Mailpit status/compose, and the resolved Authelia notifier address
 - `POST /api/core/mail/smtp` - Save SMTP delivery settings and apply them to Authelia
 - `POST /api/core/mail/use-mailpit` - Launch Mailpit and point notifications at `mailpit:1025`
@@ -350,6 +356,7 @@ The **Core Services** subtab manages the bundled services. Each created service 
 - `GET /api/core/host-helper` / `POST /api/core/host-helper/compose` / `POST /api/core/host-helper/run` - Host helper status, compose, launch
 - `POST /api/core/all/:action(start|stop|restart)` - Apply an action to every created core service
 - `POST /api/core/:service/:action(start|stop|restart)` - Apply an action to one core service
+- `GET /api/core/app-hints` - Running core-service flags and compose environment field hints (`VIRTUAL_HOST`, `VIRTUAL_PORT`, `ENABLE_AUTH`, `LETSENCRYPT_HOST`, `LETSENCRYPT_EMAIL`) used by the app and library compose builders
 - `GET /api/core/opencode` - OpenCode install/version, running sessions, modes, and generated configs
 - `POST /api/core/opencode/settings` - Save optional model/provider/API key
 - `POST /api/core/opencode/run` - Start an OpenCode Admin or User session
@@ -389,6 +396,7 @@ The **Core Services** subtab manages the bundled services. Each created service 
 ### App Library
 - `POST /api/library/export` - Export selected registry apps as a `wickedafdok.library/v1` `.tar.gz`
 - `POST /api/library/import` - Import a library archive; returns `409 needsOverwrite` when the target app exists
+- `POST /api/library/import-repo` - Clone a git repository and import its library or single app
 
 ### Designer
 - `GET /api/designer` / `POST /api/designer` - Read or save name, tagline, CSS, and logo state
@@ -626,24 +634,21 @@ The **Core Services** subtab manages the bundled services. Each created service 
 
 ##------------------------------------------Your current task--------------------------------------
 
-These changes have been started but not completed
 Apps:
- When clicking alter state to configure an existing app for redeploy under different settings. The compose editor does not load for editing the fields. Just the raw compose file.
+ Import library should also have an option to import from repositories like github
 
- App creation with OC Assist is confusing and the opencode chat never opens. OC Assist is for app creation and should always be in usermode with only the permissions needed to create, edit and launch apps and add them to the apps library. Once the user hits create app with OC Assist the chat interface should be open directly with the infornmation from the creator fields already passed without the user having to do anything else unless opencode needs more information or actions from the user.
 
- When apps are amended by the system with quick deploy or any other means. There should be a notification to the user listing other instances of the app and what is being amended to avoid conflicts for the user to approve.
-
-Apps:
- Library Export/Import:
-  Define a Structure and rules that all apps added to the library adhere to.
-  Create an export feature for the app library. The user can select which apps to include in the exported library. The library can then be imported into any installation of Dok.
-  The apps should be stripped of any information or settings specific to the current Dok installation when exported.
-  When apps from imported libraries are launched they open the compose editor for the user to provide the information needed just like the alter state button used when manually deploying another container of an existing app.
+App Creator:
+ If a Core Service is installed fields for it's options such as VIRTUAL_HOST etc.. should automatically be added to the compose file and editor. This also applies to the Apps lirary compose editor.
 
 Dok:
- Add labels to all fields and add a "?" that when hovered over gives a brief explanation of the fields function
- Create a detailed instruction manual for each individual section in Dok and add a "?" in the top corner of each section that when clicked opens detailed instructions for that section.
- Compile all the instructions into a detailed user manual. Add a button in settings to open the manual.
+ Field titles should always be above the field
+
+Core Services:
+ Reverse Proxy:
+  Add nginxproxy/acme-companion as an option for certificates
+ Email:
+  Add Stalwart Mail Server as an email option
+ DNS: Add Adguard as a DNS option
 
 Push to github

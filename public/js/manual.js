@@ -201,8 +201,9 @@
         <p>Installation-specific data is stripped automatically: container names, virtual hosts, published host ports, authentication flags, the compose project name, absolute bind-mount sources (except safe system paths), external network names other than <code>wicked</code>, generated override files, environment files, git data, and node modules. App data is not included.</p>
         <h4>Import</h4>
         <ol>
-          <li>Open <strong>Apps</strong> and choose <strong>Import library</strong>.</li>
-          <li>Select a Dok library archive.</li>
+          <li>Open <strong>Apps</strong> and choose <strong>Import library</strong> for a downloaded archive, or <strong>Import from repository</strong> to clone a git repository directly.</li>
+          <li>For a repository, enter the git URL and optionally a branch and a subfolder containing <code>dok-library.json</code>.</li>
+          <li>Repositories without a library manifest but with a compose file or Dockerfile are imported as a single app.</li>
           <li>Confirm overwrite if an app with the same name already exists.</li>
         </ol>
         <p>Imported apps are marked <strong>needs setup</strong>. They do not launch automatically. Use <strong>Configure &amp; Deploy</strong> to open the compose builder and supply the information that was stripped, such as hostnames, ports, and bind paths. Saving clears the setup flag.</p>
@@ -265,8 +266,8 @@
           <li><strong>cloudflared</strong> publishes services through a Cloudflare Tunnel.</li>
           <li><strong>Authentik</strong> provides single sign-on and user management.</li>
           <li><strong>Authelia</strong> provides forward authentication for apps that opt in.</li>
-          <li><strong>Mail / Mailpit</strong> configures outgoing email and an optional capture sink.</li>
-          <li><strong>Technitium DNS</strong> provides DNS and ad blocking.</li>
+          <li><strong>Email</strong> configures outgoing SMTP, the Mailpit capture sink, and the Stalwart mail server.</li>
+          <li><strong>DNS</strong> provides Technitium DNS or AdGuard Home with ad blocking.</li>
           <li><strong>OpenCode</strong> configures the on-demand AI assistant.</li>
           <li><strong>Host Helper</strong> is an optional privileged helper for creating host directories.</li>
         </ul>
@@ -285,6 +286,7 @@
         </ol>
         <p>When a Dok domain is configured, Dok may recreate its own container to attach it to the nginx network with the right host variables. The UI reconnects after recreation.</p>
         <p><strong>Edit compose</strong> exposes the managed file for advanced changes. <strong>Apply domain</strong> updates the virtual host without rebuilding the service.</p>
+        <p><strong>Certificates</strong> can be requested automatically by enabling <code>nginxproxy/acme-companion</code>. Enter a certificate email and optionally use the staging service while testing. Containers that need certificates set <code>LETSENCRYPT_HOST</code> (usually the same as <code>VIRTUAL_HOST</code>) and, when required, <code>LETSENCRYPT_EMAIL</code>. The companion stores certificates under <code>core/nginx-proxy/certs</code> and renews them. If you leave it disabled, place certificates there manually with <code>&lt;host&gt;.crt</code> and <code>&lt;host&gt;.key</code> names.</p>
       `
     },
     'core-cloudflared': {
@@ -336,18 +338,20 @@
           <li><strong>Use Mailpit</strong> launches the capture sink and points notifications at <code>mailpit:1025</code> without TLS.</li>
         </ul>
         <p>Mailpit is a test sink. It stores messages for inspection in its web UI and never delivers mail to the internet. It is not a mailbox server.</p>
+        <p><strong>Stalwart</strong> is a full mail server with SMTP, IMAP, JMAP, and a web admin. Launch it from the Email card, open the web admin to finish setup, then point the SMTP fields above at <code>stalwart:587</code> (or the published submission port). Publish 25, 587, 465, and 993 on the host and configure DNS MX/SPF/DKIM records before accepting internet mail.</p>
       `
     },
     'core-dns': {
-      title: 'Technitium DNS',
+      title: 'DNS (Technitium or AdGuard Home)',
       html: `
-        <p>Technitium provides DNS and ad blocking. Set the web console port (default 5380), DNS port (default 53), and an admin password. A blank password is generated.</p>
+        <p>Choose the DNS provider in the card. <strong>Technitium DNS</strong> provides zones, records, blocklists, and a full web console. <strong>AdGuard Home</strong> provides filtering DNS with a setup wizard and query dashboard.</p>
         <ul>
+          <li>Technitium: set the web console port (default 5380), DNS port (default 53), and an admin password. A blank password is generated.</li>
+          <li>AdGuard Home: launch it, open the setup wizard, and choose port <code>3000</code> for the admin UI if prompted so the published port keeps working.</li>
           <li>Set an optional GUI domain to expose the console through nginx-proxy.</li>
           <li>Point clients at the host&rsquo;s port 53 to use Dok&rsquo;s DNS service.</li>
-          <li><strong>Open</strong> launches the console in a new tab.</li>
         </ul>
-        <p>If port 53 is already used by another resolver, choose a different host port or stop the conflicting service first.</p>
+        <p>If port 53 is already used by another resolver, choose a different host port or stop the conflicting service first. Switching provider changes which compose project Dok manages for the DNS card.</p>
       `
     },
     'core-opencode': {
@@ -558,6 +562,10 @@
     assistPrompt: 'App description',
     assistData: 'Reference data',
     libraryImportFile: 'Library archive',
+    libraryRepoUrl: 'Repository URL',
+    libraryRepoBranch: 'Branch or tag',
+    libraryRepoPath: 'Library folder',
+    libraryRepoName: 'App name',
     importBackupFile: 'Backup archive'
   };
 
@@ -586,6 +594,25 @@
     assistFiles: 'Optional files to give OC Assist as supporting material.',
     libraryExportName: 'Optional filename prefix for the exported library archive.',
     libraryImportFile: 'A Dok library .tar.gz archive exported from another installation.',
+    libraryRepoUrl: 'Git URL for a repository that contains a Dok library or a single compose/Dockerfile app. HTTPS, SSH, and self-hosted git servers are supported.',
+    libraryRepoBranch: 'Optional branch, tag, or commit to clone. Leave blank for the remote default.',
+    libraryRepoPath: 'Subfolder inside the repository that contains dok-library.json and its apps/ folder.',
+    libraryRepoName: 'App name to use when the repository has no dok-library.json and is imported as a single app.',
+    nginxAcmeEnabled: 'Create and renew Let\'s Encrypt certificates automatically with nginxproxy/acme-companion.',
+    nginxAcmeEmail: 'Contact email used for certificate registration and expiry notices.',
+    nginxAcmeStaging: 'Use the Let\'s Encrypt staging service while testing to avoid rate limits. Staging certificates are not trusted by browsers.',
+    dnsProvider: 'Choose Technitium DNS or AdGuard Home as the local DNS and ad-blocking service.',
+    dnsAdminPassword: 'Technitium admin password. A blank value generates one.',
+    dnsWebPort: 'Host port for the DNS web console. Technitium defaults to 5380; AdGuard Home setup defaults to 3000.',
+    dnsDnsPort: 'Host port for DNS queries. Port 53 is standard but may conflict with a resolver on the host.',
+    dnsDomain: 'Optional hostname for the DNS console through nginx-proxy.',
+    stalwartDomain: 'Optional hostname for the Stalwart web admin through nginx-proxy.',
+    stalwartAdminUser: 'Admin username used for the Stalwart setup and recovery account.',
+    stalwartAdminPassword: 'Admin password. A blank value generates one and stores it encrypted.',
+    stalwartWebPort: 'Host port for the Stalwart web admin.',
+    stalwartSmtpPort: 'Host port for inbound SMTP delivery. Usually 25.',
+    stalwartSubmissionPort: 'Host port for authenticated mail submission. Usually 587.',
+    stalwartImapsPort: 'Host port for IMAPS. Usually 993.',
     importBackupFile: 'A Dok backup archive to upload and restore.',
     importBackupName: 'Optional name for the imported backup.',
     backupName: 'Optional name for the new backup archive.',

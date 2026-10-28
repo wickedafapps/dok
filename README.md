@@ -34,7 +34,10 @@ Open `http://localhost:8080`. The UI has no built-in login — put it behind a r
 - Use **Quick Deploy** for one-click app redeploys (duplicate container names are renamed safely) or **Alter State** to edit an app's compose file and save it as the new base configuration.
 - Customize the installation from **Settings → Dok Settings → Designer**: logo, name, tagline, CSS override, and direct editing of nginx-proxy error pages and configuration files.
 - Open a browser terminal from the dashboard, or launch OpenCode in Admin or User mode without any setup. OpenCode starts on demand and stops when you close the terminal.
-- Give the Authentik and Technitium DNS web consoles their own domain; WickedAFDok writes the `VIRTUAL_HOST`/`VIRTUAL_PORT` reverse-proxy entries and can apply the change to an existing service.
+- Give the Authentik, Technitium, or AdGuard Home web consoles their own domain; WickedAFDok writes the `VIRTUAL_HOST`/`VIRTUAL_PORT` reverse-proxy entries and can apply the change to an existing service.
+- Request and renew Let's Encrypt certificates automatically with the optional `nginxproxy/acme-companion` service, or place certificates manually.
+- Send outgoing mail through any SMTP provider, capture it locally with Mailpit, or run a full Stalwart mail server from the Email card.
+- Import app libraries from a local archive or directly from a git repository, including single compose/Dockerfile projects.
 - Add Authelia forward auth to any app: launch the auth service, pick containers from the window that opens, and WickedAFDok recreates them with `ENABLE_AUTH=true` or patches their compose file. Authelia runs alongside Authentik, not instead of it.
 - Create full, single-app, or custom backups. Custom backups can mix data, apps, core services, sources, and logs, and optionally include only selected apps or core services.
 - Store encrypted credentials for Docker Hub, GHCR, GitLab, Quay, and other registries in **Settings → Dok Settings**, and use them automatically for pulls and compose launches.

@@ -184,13 +184,16 @@ function readSettings() {
     if (!fs.existsSync(settingsPath)) {
       const defaults = {
         services: {
-          nginxProxy: { enabled: false, network: 'wicked', defaultVhostPort: 80, domain: '' },
+          nginxProxy: { enabled: false, network: 'wicked', defaultVhostPort: 80, domain: '', acme: { enabled: false, email: '', staging: false } },
           cloudflared: { enabled: false, token: '' },
           authentik: { enabled: false, adminEmail: '', adminPassword: '', secretKey: '', postgresPassword: '', port: 9000, httpsPort: 9443, domain: '' },
           authelia: { enabled: false, domain: '', port: 9091, adminUser: 'admin', adminEmail: '', adminPassword: '', adminPasswordHash: '', sessionSecret: '', encryptionKey: '', jwtSecret: '', theme: 'auto' },
+          dns: { provider: 'technitium' },
           technitium: { enabled: false, adminPassword: '', webPort: 5380, dnsPort: 53, domain: '' },
+          adguard: { enabled: false, webPort: 3000, dnsPort: 53, domain: '' },
           mail: { host: '', port: 587, tls: 'starttls', username: '', password: '', sender: '', identifier: '' },
           mailpit: { enabled: false, smtpPort: 1025, webPort: 8025, domain: '', maxMessages: 500 },
+          stalwart: { enabled: false, domain: '', adminUser: 'admin', adminPassword: '', webPort: 8088, smtpPort: 25, submissionPort: 587, imapsPort: 993 },
           hostHelper: { enabled: false, image: '' },
           opencode: { model: '', provider: '', apiKey: '' }
         },
@@ -204,7 +207,8 @@ function readSettings() {
     }
     const cur = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
     cur.services = cur.services || {};
-    cur.services.nginxProxy = { enabled: false, network: 'wicked', defaultVhostPort: 80, domain: '', ...(cur.services.nginxProxy || {}) };
+    cur.services.nginxProxy = { enabled: false, network: 'wicked', defaultVhostPort: 80, domain: '', acme: nginxProxyAcme(cur.services.nginxProxy?.acme || {}), ...(cur.services.nginxProxy || {}) };
+    cur.services.nginxProxy.acme = nginxProxyAcme(cur.services.nginxProxy.acme || {});
     // Migrate the legacy default network name.
     if (!cur.services.nginxProxy.network || cur.services.nginxProxy.network === 'proxy') {
       cur.services.nginxProxy.network = 'wicked';
@@ -216,12 +220,18 @@ function readSettings() {
       port: 9000, httpsPort: 9443, domain: '', ...(cur.services.authentik || {})
     };
     cur.services.authelia = autheliaDefaults(cur.services.authelia || {});
+    cur.services.dns = { provider: 'technitium', ...(cur.services.dns || {}) };
     cur.services.technitium = {
       enabled: false, adminPassword: '', webPort: 5380, dnsPort: 53, domain: '',
       ...(cur.services.technitium || {})
     };
+    cur.services.adguard = {
+      enabled: false, webPort: 3000, dnsPort: 53, domain: '',
+      ...(cur.services.adguard || {})
+    };
     cur.services.mail = mailDefaults(cur.services.mail || {});
     cur.services.mailpit = mailpitDefaults(cur.services.mailpit || {});
+    cur.services.stalwart = stalwartDefaults(cur.services.stalwart || {});
     cur.services.hostHelper = { enabled: false, image: '', ...(cur.services.hostHelper || {}) };
     cur.services.opencode = { model: '', provider: '', apiKey: '', ...(cur.services.opencode || {}) };
     cur.defaults = defaultsDefaults(cur.defaults || {});
@@ -236,13 +246,16 @@ function readSettings() {
   } catch {
     return {
       services: {
-        nginxProxy: { enabled: false, network: 'wicked', defaultVhostPort: 80, domain: '' },
+        nginxProxy: { enabled: false, network: 'wicked', defaultVhostPort: 80, domain: '', acme: { enabled: false, email: '', staging: false } },
         cloudflared: { enabled: false, token: '' },
         authentik: { enabled: false, adminEmail: '', adminPassword: '', secretKey: '', postgresPassword: '', port: 9000, httpsPort: 9443, domain: '' },
         authelia: { enabled: false, domain: '', port: 9091, adminUser: 'admin', adminEmail: '', adminPassword: '', adminPasswordHash: '', sessionSecret: '', encryptionKey: '', jwtSecret: '', theme: 'auto' },
+        dns: { provider: 'technitium' },
         technitium: { enabled: false, adminPassword: '', webPort: 5380, dnsPort: 53, domain: '' },
+        adguard: { enabled: false, webPort: 3000, dnsPort: 53, domain: '' },
         mail: { host: '', port: 587, tls: 'starttls', username: '', password: '', sender: '', identifier: '' },
         mailpit: { enabled: false, smtpPort: 1025, webPort: 8025, domain: '', maxMessages: 500 },
+        stalwart: { enabled: false, domain: '', adminUser: 'admin', adminPassword: '', webPort: 8088, smtpPort: 25, submissionPort: 587, imapsPort: 993 },
         hostHelper: { enabled: false, image: '' },
         opencode: { model: '', provider: '', apiKey: '' }
       },
@@ -269,6 +282,7 @@ const SETTINGS_SECRET_PATHS = [
   ['services', 'authelia', 'jwtSecret'],
   ['services', 'technitium', 'adminPassword'],
   ['services', 'mail', 'password'],
+  ['services', 'stalwart', 'adminPassword'],
   ['services', 'opencode', 'apiKey'],
   ['defaults', 'adminPassword']
 ];
@@ -2458,6 +2472,8 @@ function builderListItems(value, splitCommas = false) {
   return items;
 }
 
+const BUILDER_OPTIONAL_BLANK_ENV = new Set(['VIRTUAL_HOST', 'VIRTUAL_PORT', 'ENABLE_AUTH', 'LETSENCRYPT_HOST', 'LETSENCRYPT_EMAIL']);
+
 function builderMapEntries(value) {
   const map = Object.create(null);
   const errors = [];
@@ -2476,7 +2492,9 @@ function builderMapEntries(value) {
       continue;
     }
     if (Object.prototype.hasOwnProperty.call(map, key)) errors.push(`Duplicate key "${key}"`);
-    map[key] = text.slice(idx + 1).trim();
+    const entryValue = text.slice(idx + 1).trim();
+    if (!entryValue && BUILDER_OPTIONAL_BLANK_ENV.has(key)) continue;
+    map[key] = entryValue;
   }
   return { map, errors };
 }
@@ -3144,10 +3162,54 @@ function containerToCompose(info, { serviceName = 'app', network = '', networks 
   return compose;
 }
 
-function nginxProxyCompose(network, domain, hostDir = '') {
+function nginxProxyAcme(raw = {}) {
+  const settings = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  return {
+    enabled: false,
+    email: '',
+    staging: false,
+    ...settings
+  };
+}
+
+function nginxProxyCompose(network, domain, hostDir = '', acmeSettings = {}) {
   let host = normalizeDomain(domain);
   if (!host) host = normalizeDomain(configuredDefaults().dokDomain || '');
+  const acme = nginxProxyAcme(acmeSettings);
+  const acmeEnabled = acme.enabled && String(acme.email || '').trim();
   const base = String(hostDir || '').trim() ? String(hostDir).replace(/[/\\]+$/, '') + '/' : './';
+  const nginxEnv = [];
+  if (host) nginxEnv.push(`DEFAULT_HOST=${host}`);
+  if (acmeEnabled) nginxEnv.push('DHPARAM_GENERATION=false');
+  const nginxEnvBlock = nginxEnv.length
+    ? `    environment:\n${nginxEnv.map(item => `      - ${yamlScalar(item)}`).join('\n')}\n`
+    : '';
+  const nginxLabelBlock = acmeEnabled
+    ? '    labels:\n      - com.github.jrcs.letsencrypt_nginx_proxy_companion.nginx_proxy=true\n'
+    : '';
+  const acmeEnv = [
+    `DEFAULT_EMAIL=${String(acme.email || '').trim()}`,
+    'NGINX_PROXY_CONTAINER=nginx-proxy'
+  ];
+  if (acme.staging) acmeEnv.push('ACME_CA_URI=https://acme-staging-v02.api.letsencrypt.org/directory');
+  const acmeBlock = acmeEnabled ? `
+  acme-companion:
+    image: nginxproxy/acme-companion
+    container_name: acme-companion
+    restart: unless-stopped
+    depends_on:
+      - nginx-proxy
+    environment:
+${acmeEnv.map(item => `      - ${yamlScalar(item)}`).join('\n')}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ${yamlScalar(`${base}vhost.d:/etc/nginx/vhost.d`)}
+      - ${yamlScalar(`${base}certs:/etc/nginx/certs:rw`)}
+      - ${yamlScalar(`${base}html:/usr/share/nginx/html`)}
+      - ${yamlScalar(`${base}acme:/etc/acme.sh`)}
+    networks:
+      - proxy_net
+` : '';
   return `# managed-by: wickedafdok
 services:
   nginx-proxy:
@@ -3161,12 +3223,10 @@ services:
       - ${yamlScalar(`${base}vhost.d:/etc/nginx/vhost.d`)}
       - ${yamlScalar(`${base}certs:/etc/nginx/certs:ro`)}
       - ${yamlScalar(`${base}html:/usr/share/nginx/html:ro`)}
-${host ? `    environment:
-      - ${yamlScalar(`DEFAULT_HOST=${host}`)}
-` : ''}    restart: unless-stopped
+${nginxEnvBlock}${nginxLabelBlock}    restart: unless-stopped
     networks:
       - proxy_net
-
+${acmeBlock}
 networks:
   proxy_net:
     external: true
@@ -4358,12 +4418,23 @@ async function ensureNginxProxyCompose({ recreate = false } = {}) {
   let next = setMountSource(compose, '/etc/nginx/vhost.d', path.join(nginxHostDir, 'vhost.d'));
   next = setMountSource(next, '/etc/nginx/certs', path.join(nginxHostDir, 'certs'));
   next = setMountSource(next, '/usr/share/nginx/html', path.join(nginxHostDir, 'html'));
-  if (!next.includes('/etc/nginx/vhost.d') || !next.includes('/etc/nginx/certs') ||
+  const configured = readSettings().services?.nginxProxy || {};
+  const acme = nginxProxyAcme(configured.acme || {});
+  const wantsAcme = !!(acme.enabled && String(acme.email || '').trim());
+  const hasAcme = /(^|\n)\s*acme-companion\s*:/.test(next);
+  const acmeStale = wantsAcme !== hasAcme ||
+    (wantsAcme && (!next.includes(`DEFAULT_EMAIL=${yamlScalar(String(acme.email || '').trim())}`) ||
+      (acme.staging && !next.includes('acme-staging-v02.api.letsencrypt.org')) ||
+      (!acme.staging && next.includes('acme-staging-v02.api.letsencrypt.org'))));
+  if (acmeStale || !next.includes('/etc/nginx/vhost.d') || !next.includes('/etc/nginx/certs') ||
       !next.includes('/usr/share/nginx/html')) {
-    // Older managed composes have no vhost/certs/error-page volumes; regenerate
-    // the whole file from the saved nginx-proxy settings.
-    const configured = readSettings().services?.nginxProxy || {};
-    next = nginxProxyCompose(configured.network || 'wicked', configured.domain || '', nginxHostDir);
+    // Older managed composes have no vhost/certs/error-page volumes or the
+    // certificate companion setting changed; regenerate the whole file from
+    // the saved nginx-proxy settings.
+    if (wantsAcme) {
+      try { fs.mkdirSync(path.join(dir, 'acme'), { recursive: true }); } catch {}
+    }
+    next = nginxProxyCompose(configured.network || 'wicked', configured.domain || '', nginxHostDir, acme);
   }
   const changed = next !== compose;
   if (changed) writePrivateFile(composePath, next);
@@ -4525,6 +4596,106 @@ ${envLines}
       - ${yamlScalar(`${dnsPort}:53/tcp`)}
     volumes:
       - ${yamlScalar(`${base}config:/etc/dns`)}
+    networks:
+      - wicked
+
+networks:
+  wicked:
+    external: true
+    name: wicked
+`;
+}
+
+function adguardDefaults(raw = {}) {
+  const settings = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  return {
+    enabled: false,
+    webPort: 3000,
+    dnsPort: 53,
+    domain: '',
+    ...settings
+  };
+}
+
+function adguardCompose(settings = {}, hostDir = '') {
+  const s = adguardDefaults(settings);
+  const webPort = Number(s.webPort) || 3000;
+  const dnsPort = Number(s.dnsPort) || 53;
+  const domain = normalizeDomain(s.domain);
+  const base = String(hostDir || '').trim() ? String(hostDir).replace(/[/\\]+$/, '') + '/' : './';
+  const env = domain ? [`VIRTUAL_HOST=${domain}`, 'VIRTUAL_PORT=3000'] : [];
+  const envBlock = env.length ? `    environment:\n${env.map(item => `      - ${yamlScalar(item)}`).join('\n')}\n` : '';
+  return `# managed-by: wickedafdok
+services:
+  adguard:
+    image: adguard/adguardhome:latest
+    container_name: adguard
+    restart: unless-stopped
+${envBlock}    ports:
+      - ${yamlScalar(`${webPort}:3000`)}
+      - ${yamlScalar(`${dnsPort}:53/udp`)}
+      - ${yamlScalar(`${dnsPort}:53/tcp`)}
+    volumes:
+      - ${yamlScalar(`${base}work:/opt/adguardhome/work`)}
+      - ${yamlScalar(`${base}conf:/opt/adguardhome/conf`)}
+    networks:
+      - wicked
+
+networks:
+  wicked:
+    external: true
+    name: wicked
+`;
+}
+
+function stalwartDefaults(raw = {}) {
+  const settings = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  return {
+    enabled: false,
+    domain: '',
+    adminUser: 'admin',
+    adminPassword: '',
+    webPort: 8088,
+    smtpPort: 25,
+    submissionPort: 587,
+    imapsPort: 993,
+    ...settings
+  };
+}
+
+function stalwartCompose(settings = {}, hostDir = '') {
+  const s = stalwartDefaults(settings);
+  const adminPassword = String(s.adminPassword || '').trim() || randomSecret(16);
+  const webPort = Number(s.webPort) || 8088;
+  const smtpPort = Number(s.smtpPort) || 25;
+  const submissionPort = Number(s.submissionPort) || 587;
+  const imapsPort = Number(s.imapsPort) || 993;
+  const hostname = normalizeDomain(s.domain);
+  const base = String(hostDir || '').trim() ? String(hostDir).replace(/[/\\]+$/, '') + '/' : './';
+  const env = [
+    `STALWART_RECOVERY_ADMIN=${String(s.adminUser || 'admin').trim()}:${adminPassword}`
+  ];
+  if (hostname) env.push(`STALWART_HOSTNAME=${hostname}`);
+  if (hostname) {
+    env.push(`VIRTUAL_HOST=${hostname}`);
+    env.push('VIRTUAL_PORT=8080');
+  }
+  return `# managed-by: wickedafdok
+services:
+  stalwart:
+    image: stalwartlabs/stalwart:latest
+    container_name: stalwart
+    restart: unless-stopped
+    environment:
+${env.map(item => `      - ${yamlScalar(item)}`).join('\n')}
+    ports:
+      - ${yamlScalar(`${smtpPort}:25`)}
+      - ${yamlScalar(`${submissionPort}:587`)}
+      - "465:465"
+      - ${yamlScalar(`${imapsPort}:993`)}
+      - ${yamlScalar(`${webPort}:8080`)}
+    volumes:
+      - ${yamlScalar(`${base}data:/opt/stalwart`)}
     networks:
       - wicked
 
@@ -4730,7 +4901,9 @@ const CORE_COMPOSE_PROJECTS = new Set([
   'authentik',
   'authelia',
   'technitium',
+  'adguard',
   'mailpit',
+  'stalwart',
   'wickedafdok-host-helper'
 ]);
 
@@ -4739,7 +4912,9 @@ const CORE_CONTAINER_NAMES = [
   'cloudflared',
   'authelia',
   'technitium-dns',
+  'adguard',
   'mailpit',
+  'stalwart',
   'wickedafdok-host-helper',
   'wickedafdok-updater',
   'authentik-server',
@@ -4800,13 +4975,15 @@ async function coreServiceStatus(project, { nameHint = '', primaryHint = '' } = 
 }
 
 async function coreServiceAction(service, action) {
+  const dnsProvider = dnsProviderName(readSettings());
   const map = {
     'nginx-proxy': { dir: 'nginx-proxy', project: 'nginx-proxy' },
     cloudflared: { dir: 'cloudflared', project: 'cloudflared' },
     auth: { dir: 'auth', project: 'authentik' },
     authelia: { dir: 'authelia', project: 'authelia' },
-    dns: { dir: 'dns', project: 'technitium' },
+    dns: { dir: 'dns', project: dnsProvider === 'adguard' ? 'adguard' : 'technitium' },
     mailpit: { dir: 'mailpit', project: 'mailpit' },
+    stalwart: { dir: 'stalwart', project: 'stalwart' },
     'host-helper': { dir: 'host-helper', project: 'wickedafdok-host-helper' }
   };
   const target = map[service];
@@ -5016,8 +5193,9 @@ function backupCoreServices() {
     { name: 'nginx-proxy', label: 'nginx-proxy' },
     { name: 'cloudflared', label: 'cloudflared' },
     { name: 'auth', label: 'Authentik' },
-    { name: 'dns', label: 'Technitium DNS' },
+    { name: 'dns', label: 'DNS (Technitium / AdGuard Home)' },
     { name: 'mailpit', label: 'Mailpit' },
+    { name: 'stalwart', label: 'Stalwart Mail Server' },
     { name: 'host-helper', label: 'Host Helper' }
   ];
 }
@@ -7263,6 +7441,198 @@ app.post('/api/library/export', async (req, res) => {
   }
 });
 
+function libraryManifestFromDirectory(rootDir, subdir = '') {
+  const base = subdir ? path.resolve(rootDir, String(subdir)) : rootDir;
+  if (base !== rootDir && !base.startsWith(rootDir + path.sep)) {
+    throw httpError(400, 'Invalid library path in repository');
+  }
+  if (!fs.existsSync(base) || !fs.statSync(base).isDirectory()) {
+    throw httpError(400, `The repository has no directory at ${subdir || '/'}`);
+  }
+  const manifestPath = [path.join(base, 'dok-library.json'), path.join(base, 'library.json')]
+    .find(candidate => fs.existsSync(candidate));
+  if (!manifestPath) return null;
+  let manifest;
+  try { manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')); } catch {
+    throw httpError(400, 'The library manifest is not valid JSON');
+  }
+  if (manifest?.schema !== LIBRARY_SCHEMA || manifest?.kind !== 'wickedafdok-app-library' || !Array.isArray(manifest.apps)) {
+    throw httpError(400, `Unsupported library format. Expected ${LIBRARY_SCHEMA}.`);
+  }
+  return { manifest, appsRoot: path.join(base, 'apps') };
+}
+
+function copyDirectoryTree(source, dest, { skipTop = [] } = {}) {
+  const skip = new Set(skipTop);
+  fs.mkdirSync(dest, { recursive: true });
+  const walk = (from, to, depth) => {
+    for (const entry of fs.readdirSync(from, { withFileTypes: true })) {
+      if (depth === 0 && skip.has(entry.name)) continue;
+      if (entry.isSymbolicLink()) continue;
+      const src = path.join(from, entry.name);
+      const out = path.join(to, entry.name);
+      if (entry.isDirectory()) {
+        if (LIBRARY_SKIP_DIRS.has(entry.name)) continue;
+        fs.mkdirSync(out, { recursive: true });
+        walk(src, out, depth + 1);
+      } else if (entry.isFile()) {
+        fs.copyFileSync(src, out);
+      }
+    }
+  };
+  walk(source, dest, 0);
+}
+
+// Builds a library tree from a repository that has a compose file or
+// Dockerfile but no dok-library.json. The repository becomes a single app.
+function synthesizeLibraryFromRepository(repoDir, { name = '', description = '' } = {}) {
+  const repoBase = path.basename(String(repoDir).replace(/[/\\]+$/, ''));
+  const appName = projectName(name || repoBase, `repo-${Date.now()}`);
+  const composeFile = findComposeFile(repoDir);
+  const hasDockerfile = fs.existsSync(path.join(repoDir, 'Dockerfile'));
+  if (!composeFile && !hasDockerfile) {
+    throw httpError(400, 'The repository has no dok-library.json, compose file, or Dockerfile to import');
+  }
+  const root = fs.mkdtempSync(path.join(tmpDir, 'library-repo-'));
+  const appDir = path.join(root, 'apps', appName);
+  copyDirectoryTree(repoDir, appDir, { skipTop: ['.git', 'node_modules', 'data'] });
+  const composeRel = 'docker-compose.yml';
+  if (composeFile) {
+    const rel = path.relative(repoDir, composeFile).replace(/\\/g, '/');
+    if (rel !== composeRel) fs.copyFileSync(composeFile, path.join(appDir, composeRel));
+  } else {
+    fs.writeFileSync(path.join(appDir, composeRel),
+      `# managed-by: wickedafdok\nservices:\n  ${yamlScalar(appName)}:\n    build: .\n    container_name: ${yamlScalar(appName)}\n    restart: unless-stopped\n`);
+  }
+  const manifest = {
+    schema: LIBRARY_SCHEMA,
+    kind: 'wickedafdok-app-library',
+    version: 1,
+    name: String(name || repoBase || 'Repository app').slice(0, 120),
+    created: new Date().toISOString(),
+    apps: [{
+      name: appName,
+      description: String(description || '').slice(0, 500),
+      composeFile: composeRel,
+      files: libraryFiles(appDir),
+      requirements: {}
+    }]
+  };
+  return { root, manifest, appsRoot: path.join(root, 'apps') };
+}
+
+async function importLibraryTree({ manifest, appsRoot, overwrite = false }) {
+  const entries = [];
+  for (const app of manifest.apps) {
+    const name = String(app?.name || '').trim();
+    if (!/^[a-z0-9][a-z0-9._-]{0,59}$/.test(name)) {
+      throw httpError(400, `Invalid app name in library: ${name || '(empty)'}`);
+    }
+    if (entries.some(entry => entry.name === name)) throw httpError(400, `Duplicate app in library: ${name}`);
+    const sourceDir = path.join(appsRoot, name);
+    const rel = path.relative(appsRoot, sourceDir);
+    if (rel.startsWith('..') || path.isAbsolute(rel) || isSymlink(sourceDir) || !fs.existsSync(sourceDir)) {
+      throw httpError(400, `The library is missing the files for ${name}`);
+    }
+    const composeRel = String(app.composeFile || 'docker-compose.yml').replace(/\\/g, '/');
+    const composePath = path.resolve(sourceDir, composeRel);
+    if (composePath !== sourceDir && !composePath.startsWith(sourceDir + path.sep)) {
+      throw httpError(400, `Invalid compose path for ${name}`);
+    }
+    if (!fs.existsSync(composePath) || !fs.statSync(composePath).isFile()) {
+      throw httpError(400, `${name} is missing ${composeRel}`);
+    }
+    const sanitized = sanitizeComposeForLibrary(fs.readFileSync(composePath, 'utf-8'));
+    if (!sanitized.compose.trim()) throw httpError(400, `${name} has an empty compose file`);
+    const target = path.join(appsDir, name);
+    let occupied = false;
+    try { occupied = fs.existsSync(target) && fs.readdirSync(target).length > 0; } catch { occupied = true; }
+    entries.push({
+      name,
+      sourceDir,
+      composeRel,
+      compose: sanitized.compose,
+      target,
+      occupied,
+      description: String(app.description || '').slice(0, 500),
+      requirements: app.requirements && typeof app.requirements === 'object' ? app.requirements : sanitized.requirements
+    });
+  }
+  const conflicts = entries.filter(entry => entry.occupied).map(entry => entry.name);
+  if (conflicts.length && !overwrite) {
+    const err = httpError(409, `These apps already exist: ${conflicts.join(', ')}. Confirm to overwrite them.`);
+    err.needsOverwrite = true;
+    err.apps = conflicts;
+    throw err;
+  }
+  const imported = [];
+  for (const entry of entries) {
+    if (isSymlink(entry.target)) throw httpError(400, `Invalid app directory for ${entry.name}`);
+    if (entry.occupied) {
+      for (const child of fs.readdirSync(entry.target)) {
+        if (child === 'data' || /^\.env($|\.)/.test(child)) continue;
+        fs.rmSync(path.join(entry.target, child), { recursive: true, force: true });
+      }
+    }
+    fs.mkdirSync(entry.target, { recursive: true });
+    for (const rel of libraryFiles(entry.sourceDir)) {
+      const from = path.join(entry.sourceDir, rel);
+      const to = path.resolve(entry.target, rel);
+      if (to !== entry.target && !to.startsWith(entry.target + path.sep)) continue;
+      copyLibraryFile(from, to);
+    }
+    const composeDest = path.resolve(entry.target, entry.composeRel);
+    if (composeDest !== entry.target && !composeDest.startsWith(entry.target + path.sep)) {
+      throw httpError(400, `Invalid compose path for ${entry.name}`);
+    }
+    fs.mkdirSync(path.dirname(composeDest), { recursive: true });
+    writePrivateFile(composeDest, entry.compose);
+    addRegistryEntry({
+      type: 'compose',
+      name: entry.name,
+      path: entry.target,
+      appDir: entry.target,
+      sourcePath: '',
+      composeFile: entry.composeRel,
+      command: '',
+      dataPath: '',
+      needsConfig: true,
+      description: entry.description,
+      library: {
+        schema: manifest.schema,
+        name: String(manifest.name || ''),
+        importedAt: new Date().toISOString(),
+        requirements: entry.requirements
+      },
+      launch: {
+        mode: 'compose',
+        name: entry.name,
+        command: '',
+        ports: [],
+        vhost: '',
+        vhostPort: '',
+        appDir: entry.target,
+        network: '',
+        type: 'compose'
+      }
+    });
+    imported.push(entry.name);
+  }
+  return {
+    ok: true,
+    imported,
+    library: {
+      schema: manifest.schema,
+      name: String(manifest.name || ''),
+      created: manifest.created || '',
+      apps: entries.map(entry => entry.name)
+    },
+    message: imported.length === 1
+      ? `Imported ${imported[0]}. Open it in Apps and configure it before launching.`
+      : `Imported ${imported.length} apps. Open each one in Apps and configure it before launching.`
+  };
+}
+
 app.post('/api/library/import', upload.single('file'), async (req, res) => {
   const uploadPath = req.file?.path || '';
   const temp = fs.mkdtempSync(path.join(tmpDir, 'library-import-'));
@@ -7271,126 +7641,13 @@ app.post('/api/library/import', upload.single('file'), async (req, res) => {
     const list = await run('tar', ['-tzf', uploadPath]);
     validateArchiveEntries(String(list.stdout || '').split('\n').filter(Boolean));
     await run('tar', ['-xzf', uploadPath, '-C', temp]);
-    const manifestPath = [path.join(temp, 'dok-library.json'), path.join(temp, 'library.json')]
-      .find(candidate => fs.existsSync(candidate));
-    if (!manifestPath) throw httpError(400, 'The archive does not contain dok-library.json');
-    let manifest;
-    try { manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')); } catch {
-      throw httpError(400, 'The library manifest is not valid JSON');
-    }
-    if (manifest?.schema !== LIBRARY_SCHEMA || manifest?.kind !== 'wickedafdok-app-library' || !Array.isArray(manifest.apps)) {
-      throw httpError(400, `Unsupported library format. Expected ${LIBRARY_SCHEMA}.`);
-    }
-    const appsRoot = path.join(temp, 'apps');
-    const entries = [];
-    for (const app of manifest.apps) {
-      const name = String(app?.name || '').trim();
-      if (!/^[a-z0-9][a-z0-9._-]{0,59}$/.test(name)) {
-        throw httpError(400, `Invalid app name in library: ${name || '(empty)'}`);
-      }
-      if (entries.some(entry => entry.name === name)) throw httpError(400, `Duplicate app in library: ${name}`);
-      const sourceDir = path.join(appsRoot, name);
-      const rel = path.relative(appsRoot, sourceDir);
-      if (rel.startsWith('..') || path.isAbsolute(rel) || isSymlink(sourceDir) || !fs.existsSync(sourceDir)) {
-        throw httpError(400, `The library is missing the files for ${name}`);
-      }
-      const composeRel = String(app.composeFile || 'docker-compose.yml').replace(/\\/g, '/');
-      const composePath = path.resolve(sourceDir, composeRel);
-      if (composePath !== sourceDir && !composePath.startsWith(sourceDir + path.sep)) {
-        throw httpError(400, `Invalid compose path for ${name}`);
-      }
-      if (!fs.existsSync(composePath) || !fs.statSync(composePath).isFile()) {
-        throw httpError(400, `${name} is missing ${composeRel}`);
-      }
-      const sanitized = sanitizeComposeForLibrary(fs.readFileSync(composePath, 'utf-8'));
-      if (!sanitized.compose.trim()) throw httpError(400, `${name} has an empty compose file`);
-      const target = path.join(appsDir, name);
-      let occupied = false;
-      try { occupied = fs.existsSync(target) && fs.readdirSync(target).length > 0; } catch { occupied = true; }
-      entries.push({
-        name,
-        sourceDir,
-        composeRel,
-        compose: sanitized.compose,
-        target,
-        occupied,
-        description: String(app.description || '').slice(0, 500),
-        requirements: app.requirements && typeof app.requirements === 'object' ? app.requirements : sanitized.requirements
-      });
-    }
-    const conflicts = entries.filter(entry => entry.occupied).map(entry => entry.name);
-    if (conflicts.length && req.body?.overwrite !== 'true') {
-      const err = httpError(409, `These apps already exist: ${conflicts.join(', ')}. Confirm to overwrite them.`);
-      err.needsOverwrite = true;
-      err.apps = conflicts;
-      throw err;
-    }
-    const imported = [];
-    for (const entry of entries) {
-      if (isSymlink(entry.target)) throw httpError(400, `Invalid app directory for ${entry.name}`);
-      if (entry.occupied) {
-        for (const child of fs.readdirSync(entry.target)) {
-          if (child === 'data' || /^\.env($|\.)/.test(child)) continue;
-          fs.rmSync(path.join(entry.target, child), { recursive: true, force: true });
-        }
-      }
-      fs.mkdirSync(entry.target, { recursive: true });
-      for (const rel of libraryFiles(entry.sourceDir)) {
-        const from = path.join(entry.sourceDir, rel);
-        const to = path.resolve(entry.target, rel);
-        if (to !== entry.target && !to.startsWith(entry.target + path.sep)) continue;
-        copyLibraryFile(from, to);
-      }
-      const composeDest = path.resolve(entry.target, entry.composeRel);
-      if (composeDest !== entry.target && !composeDest.startsWith(entry.target + path.sep)) {
-        throw httpError(400, `Invalid compose path for ${entry.name}`);
-      }
-      fs.mkdirSync(path.dirname(composeDest), { recursive: true });
-      writePrivateFile(composeDest, entry.compose);
-      addRegistryEntry({
-        type: 'compose',
-        name: entry.name,
-        path: entry.target,
-        appDir: entry.target,
-        sourcePath: '',
-        composeFile: entry.composeRel,
-        command: '',
-        dataPath: '',
-        needsConfig: true,
-        description: entry.description,
-        library: {
-          schema: manifest.schema,
-          name: String(manifest.name || ''),
-          importedAt: new Date().toISOString(),
-          requirements: entry.requirements
-        },
-        launch: {
-          mode: 'compose',
-          name: entry.name,
-          command: '',
-          ports: [],
-          vhost: '',
-          vhostPort: '',
-          appDir: entry.target,
-          network: '',
-          type: 'compose'
-        }
-      });
-      imported.push(entry.name);
-    }
-    res.json({
-      ok: true,
-      imported,
-      library: {
-        schema: manifest.schema,
-        name: String(manifest.name || ''),
-        created: manifest.created || '',
-        apps: entries.map(entry => entry.name)
-      },
-      message: imported.length === 1
-        ? `Imported ${imported[0]}. Open it in Apps and configure it before launching.`
-        : `Imported ${imported.length} apps. Open each one in Apps and configure it before launching.`
+    const loaded = libraryManifestFromDirectory(temp);
+    if (!loaded) throw httpError(400, 'The archive does not contain dok-library.json');
+    const result = await importLibraryTree({
+      ...loaded,
+      overwrite: req.body?.overwrite === 'true'
     });
+    res.json(result);
   } catch (e) {
     res.status(e.status || 500).json({
       error: e.message,
@@ -7401,6 +7658,54 @@ app.post('/api/library/import', upload.single('file'), async (req, res) => {
   } finally {
     try { fs.rmSync(temp, { recursive: true, force: true }); } catch {}
     if (uploadPath) { try { fs.rmSync(uploadPath, { force: true }); } catch {} }
+  }
+});
+
+// Import a Dok app library (or a single compose/Dockerfile app) straight from
+// a git repository such as GitHub. The repository is cloned into a temporary
+// directory, so nothing is left behind in sources/.
+app.post('/api/library/import-repo', async (req, res) => {
+  const body = req.body || {};
+  const repo = String(body.repo || '').trim();
+  const branch = String(body.branch || '').trim();
+  const subdir = String(body.path || '').trim().replace(/^[/\\]+|[/\\]+$/g, '');
+  const overwrite = body.overwrite === true || body.overwrite === 'true';
+  const temp = fs.mkdtempSync(path.join(tmpDir, 'library-repo-clone-'));
+  try {
+    if (!repo) throw httpError(400, 'Repository URL is required');
+    if (!/^(https?:\/\/|git:\/\/|ssh:\/\/|git@)[^\s]+$/.test(repo)) {
+      throw httpError(400, 'Repo must be an http(s), git, ssh, or git@ URL');
+    }
+    if (branch && !/^[A-Za-z0-9_][A-Za-z0-9._/-]*$/.test(branch)) {
+      throw httpError(400, 'Invalid branch name');
+    }
+    if (subdir && (subdir.split('/').some(part => part === '..' || part === '') || path.isAbsolute(subdir))) {
+      throw httpError(400, 'Invalid library path in repository');
+    }
+    const repoDir = path.join(temp, 'repo');
+    const args = ['clone', '--depth', '1'];
+    if (branch) args.push('--branch', branch);
+    args.push(repo, repoDir);
+    await run('git', args, { env: gitEnvironment(repo) });
+    let loaded = libraryManifestFromDirectory(repoDir, subdir);
+    if (!loaded) {
+      loaded = synthesizeLibraryFromRepository(repoDir, {
+        name: body.name || '',
+        description: body.description || ''
+      });
+    }
+    const result = await importLibraryTree({ ...loaded, overwrite });
+    if (loaded.root) { try { fs.rmSync(loaded.root, { recursive: true, force: true }); } catch {} }
+    res.json({ ...result, source: 'repository', repo });
+  } catch (e) {
+    res.status(e.status || 500).json({
+      error: e.message,
+      needsOverwrite: !!e.needsOverwrite,
+      apps: e.apps || [],
+      libraryName: e.libraryName || ''
+    });
+  } finally {
+    try { fs.rmSync(temp, { recursive: true, force: true }); } catch {}
   }
 });
 
@@ -7638,11 +7943,14 @@ app.post('/api/settings', (req, res) => {
     const next = { ...current, ...body };
     if (body.services) {
       next.services = { ...current.services, ...body.services };
-      if (body.services.nginxProxy) next.services.nginxProxy = { ...current.services.nginxProxy, ...body.services.nginxProxy };
+      if (body.services.nginxProxy) next.services.nginxProxy = { ...current.services.nginxProxy, ...body.services.nginxProxy, acme: { ...(current.services.nginxProxy?.acme || {}), ...(body.services.nginxProxy.acme || {}) } };
       if (body.services.cloudflared) next.services.cloudflared = { ...current.services.cloudflared, ...body.services.cloudflared };
       if (body.services.authelia) next.services.authelia = { ...current.services.authelia, ...body.services.authelia };
       if (body.services.mail) next.services.mail = { ...current.services.mail, ...body.services.mail };
       if (body.services.mailpit) next.services.mailpit = { ...current.services.mailpit, ...body.services.mailpit };
+      if (body.services.dns) next.services.dns = { ...current.services.dns, ...body.services.dns };
+      if (body.services.adguard) next.services.adguard = { ...current.services.adguard, ...body.services.adguard };
+      if (body.services.stalwart) next.services.stalwart = { ...current.services.stalwart, ...body.services.stalwart };
     }
     if (!next.services) next.services = {};
     if (!next.services.nginxProxy) next.services.nginxProxy = {};
@@ -8359,7 +8667,8 @@ app.get('/api/core/nginx-proxy', async (req, res) => {
       dir: nginxDir,
       composePath,
       compose: composeExists ? readComposeText(composePath) : '',
-      settings: settings.services?.nginxProxy || {}
+      settings: settings.services?.nginxProxy || {},
+      acme: nginxProxyAcme(settings.services?.nginxProxy?.acme || {})
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -8380,6 +8689,38 @@ app.post('/api/core/nginx-proxy/compose', async (req, res) => {
   }
 });
 
+app.post('/api/core/nginx-proxy/acme', async (req, res) => {
+  try {
+    const settings = readSettings();
+    const current = nginxProxyAcme(settings.services?.nginxProxy?.acme || {});
+    const body = req.body || {};
+    const next = nginxProxyAcme({
+      ...current,
+      enabled: body.enabled !== undefined ? body.enabled === true : current.enabled,
+      email: body.email !== undefined ? String(body.email || '').trim() : current.email,
+      staging: body.staging !== undefined ? body.staging === true : current.staging
+    });
+    next.enabled = !!next.enabled && !!next.email;
+    if (next.enabled && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(next.email)) {
+      return res.status(400).json({ error: 'A valid certificate email is required' });
+    }
+    settings.services = settings.services || {};
+    settings.services.nginxProxy = { ...(settings.services.nginxProxy || {}), acme: next };
+    writeSettings(settings);
+    const ensured = await ensureNginxProxyCompose({ recreate: true });
+    res.json({
+      ok: true,
+      acme: next,
+      message: next.enabled
+        ? `acme-companion is enabled${next.staging ? ' (staging certificates)' : ''}. ${ensured.recreated ? 'nginx-proxy was recreated.' : 'It will be used the next time nginx-proxy starts.'}`
+        : 'acme-companion is disabled. Place certificates in core/nginx-proxy/certs or use another certificate method.'
+    });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+
 app.post('/api/core/nginx-proxy/run', async (req, res) => {
   try {
     const body = req.body || {};
@@ -8392,6 +8733,15 @@ app.post('/api/core/nginx-proxy/run', async (req, res) => {
     if (domain && !/^[A-Za-z0-9*][A-Za-z0-9*._-]*$/.test(domain)) {
       return res.status(400).json({ error: 'Invalid domain name' });
     }
+    const configuredAcme = nginxProxyAcme(configured.acme || {});
+    const acme = nginxProxyAcme(body.acme && typeof body.acme === 'object'
+      ? { ...configuredAcme, ...body.acme }
+      : configuredAcme);
+    acme.email = String(acme.email || '').trim();
+    acme.enabled = !!acme.enabled && !!acme.email;
+    if (acme.enabled && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(acme.email)) {
+      return res.status(400).json({ error: 'A valid certificate email is required for acme-companion' });
+    }
     const port = process.env.PORT || 8080;
     await ensureNetwork(network);
 
@@ -8399,6 +8749,7 @@ app.post('/api/core/nginx-proxy/run', async (req, res) => {
     if (!fs.existsSync(nginxDir)) fs.mkdirSync(nginxDir, { recursive: true });
     fs.mkdirSync(path.join(nginxDir, 'vhost.d'), { recursive: true });
     fs.mkdirSync(path.join(nginxDir, 'certs'), { recursive: true });
+    if (acme.enabled) fs.mkdirSync(path.join(nginxDir, 'acme'), { recursive: true });
     ensureNginxErrorPages();
     const composePath = path.join(nginxDir, 'docker-compose.yml');
     recoverOversizedManagedCompose(composePath);
@@ -8408,6 +8759,11 @@ app.post('/api/core/nginx-proxy/run', async (req, res) => {
     const quotedNetworkLine = `name: ${yamlScalar(network)}`;
     const hostLine = `DEFAULT_HOST=${domain}`;
     const quotedHostLine = `DEFAULT_HOST=${yamlScalar(domain)}`;
+    const hasAcme = /(^|\n)\s*acme-companion\s*:/.test(existingCompose);
+    const acmeStale = managedCompose && (acme.enabled !== hasAcme ||
+      (acme.enabled && (!existingCompose.includes(`DEFAULT_EMAIL=${yamlScalar(acme.email)}`) ||
+        (acme.staging && !existingCompose.includes('acme-staging-v02.api.letsencrypt.org')) ||
+        (!acme.staging && existingCompose.includes('acme-staging-v02.api.letsencrypt.org')))));
     const staleCompose = managedCompose && (
       (!existingCompose.includes(networkLine) && !existingCompose.includes(quotedNetworkLine)) ||
       (domain
@@ -8415,7 +8771,8 @@ app.post('/api/core/nginx-proxy/run', async (req, res) => {
         : existingCompose.includes('DEFAULT_HOST=')) ||
       !existingCompose.includes('/etc/nginx/vhost.d') ||
       !existingCompose.includes('/etc/nginx/certs') ||
-      !existingCompose.includes('/usr/share/nginx/html')
+      !existingCompose.includes('/usr/share/nginx/html') ||
+      acmeStale
     );
     // Docker resolves bind sources on the daemon's side, so a compose file in
     // the app container must name host paths. A relative ./vhost.d would point
@@ -8430,7 +8787,7 @@ app.post('/api/core/nginx-proxy/run', async (req, res) => {
       nextCompose = setMountSource(nextCompose, '/usr/share/nginx/html', path.join(nginxHostDir, 'html'));
     }
     if (!nextCompose || staleCompose) {
-      nextCompose = nginxProxyCompose(network, domain, nginxHostDir);
+      nextCompose = nginxProxyCompose(network, domain, nginxHostDir, acme);
     }
     if (nextCompose !== existingCompose) writePrivateFile(composePath, nextCompose);
 
@@ -8454,7 +8811,8 @@ app.post('/api/core/nginx-proxy/run', async (req, res) => {
       ...(nextSettings.services.nginxProxy || {}),
       enabled: true,
       network,
-      domain
+      domain,
+      acme
     };
     writeSettings(nextSettings);
 
@@ -9302,25 +9660,51 @@ app.post('/api/core/auth/apply', async (req, res) => {
   }
 });
 
-// Core services - Technitium DNS
+// Core services - DNS (Technitium or AdGuard Home)
+function dnsProviderName(settings = {}) {
+  return settings.services?.dns?.provider === 'adguard' ? 'adguard' : 'technitium';
+}
+
+function dnsServiceMeta(provider) {
+  if (provider === 'adguard') {
+    return { provider, project: 'adguard', service: 'adguard', nameHint: 'adguard', label: 'AdGuard Home', webPort: 3000 };
+  }
+  return { provider, project: 'technitium', service: 'technitium-dns', nameHint: 'technitium-dns', label: 'Technitium DNS', webPort: 5380 };
+}
+
 app.get('/api/core/dns', async (req, res) => {
   try {
     const settings = readSettings();
+    const provider = dnsProviderName(settings);
+    const meta = dnsServiceMeta(provider);
     const dir = path.join(coreDir, 'dns');
     const composePath = path.join(dir, 'docker-compose.yml');
-    const dnsSettings = { ...(settings.services?.technitium || {}) };
-    if (!dnsSettings.adminPassword) dnsSettings.adminPassword = randomSecret(12);
+    const providerSettings = provider === 'adguard'
+      ? adguardDefaults(settings.services?.adguard || {})
+      : { ...(settings.services?.technitium || {}) };
+    if (provider !== 'adguard' && !providerSettings.adminPassword) providerSettings.adminPassword = randomSecret(12);
     const existing = readManagedCompose(composePath);
     const coreHostDir = await selfMountSource('/app/core');
-    const compose = existing.trim() ? existing : technitiumCompose(dnsSettings, coreHostDir ? path.join(coreHostDir, 'dns') : '');
-    const status = await coreServiceStatus('technitium', { nameHint: 'technitium-dns', primaryHint: 'technitium-dns' });
+    const hostDir = coreHostDir ? path.join(coreHostDir, 'dns') : '';
+    const existingProvider = /(^|\n)\s*adguard\s*:/.test(existing) ? 'adguard' : 'technitium';
+    const compose = existing.trim() && existingProvider === provider
+      ? existing
+      : (provider === 'adguard' ? adguardCompose(providerSettings, hostDir) : technitiumCompose(providerSettings, hostDir));
+    const status = await coreServiceStatus(meta.project, { nameHint: meta.nameHint, primaryHint: meta.nameHint });
     res.json({
       ...status,
+      provider,
       dir,
       composePath,
       compose,
-      settings: redactServiceSecrets('technitium', settings.services?.technitium || {}),
-      url: coreServiceUrl(settings.services?.technitium?.domain, settings.services?.technitium?.webPort || 5380)
+      settings: provider === 'adguard'
+        ? adguardDefaults(settings.services?.adguard || {})
+        : redactServiceSecrets('technitium', settings.services?.technitium || {}),
+      providers: {
+        technitium: redactServiceSecrets('technitium', settings.services?.technitium || {}),
+        adguard: adguardDefaults(settings.services?.adguard || {})
+      },
+      url: coreServiceUrl(providerSettings.domain, providerSettings.webPort || meta.webPort)
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -9343,10 +9727,18 @@ app.post('/api/core/dns/run', async (req, res) => {
   try {
     const body = req.body || {};
     const settings = readSettings();
+    const provider = body.provider === 'adguard' || body.provider === 'technitium'
+      ? body.provider
+      : dnsProviderName(settings);
+    const meta = dnsServiceMeta(provider);
     const installDefaults = configuredDefaults();
-    const dns = { ...(settings.services?.technitium || {}) };
-    if (body.adminPassword) dns.adminPassword = String(body.adminPassword);
-    else if (!dns.adminPassword && installDefaults.adminPassword) dns.adminPassword = installDefaults.adminPassword;
+    const dns = provider === 'adguard'
+      ? adguardDefaults(settings.services?.adguard || {})
+      : { ...(settings.services?.technitium || {}) };
+    if (provider !== 'adguard') {
+      if (body.adminPassword) dns.adminPassword = String(body.adminPassword);
+      else if (!dns.adminPassword && installDefaults.adminPassword) dns.adminPassword = installDefaults.adminPassword;
+    }
     if (body.domain === undefined && !dns.domain && installDefaults.primaryDomain) {
       dns.domain = normalizeDomain('dns.' + installDefaults.primaryDomain);
     }
@@ -9365,19 +9757,35 @@ app.post('/api/core/dns/run', async (req, res) => {
       if (domain && !/^[A-Za-z0-9*][A-Za-z0-9*._-]*$/.test(domain)) return res.status(400).json({ error: 'Invalid domain name' });
       dns.domain = domain;
     }
-    if (!dns.adminPassword) dns.adminPassword = randomSecret(12);
+    if (provider !== 'adguard' && !dns.adminPassword) dns.adminPassword = randomSecret(12);
     dns.enabled = true;
     await ensureNetwork('wicked');
     const composePath = coreServiceFile('dns');
+    const previousProvider = dnsProviderName(settings);
+    if (previousProvider !== provider && fs.existsSync(composePath)) {
+      const previousMeta = dnsServiceMeta(previousProvider);
+      await run('docker', ['compose', '-f', composePath, '-p', previousMeta.project, 'down', '--remove-orphans'], { cwd: coreServiceDir('dns') }).catch(() => {});
+    }
     const coreHostDir = await selfMountSource('/app/core');
     const dnsHostDir = coreHostDir ? path.join(coreHostDir, 'dns') : '';
-    prepareHostBindDirs(dnsHostDir, [['config', 0o775]]);
-    writePrivateFile(composePath, technitiumCompose(dns, dnsHostDir));
-    const { stdout, stderr } = await run('docker', ['compose', '-f', composePath, '-p', 'technitium', 'up', '-d', '--remove-orphans'], { cwd: coreServiceDir('dns') });
+    if (provider === 'adguard') {
+      prepareHostBindDirs(dnsHostDir, [['work', 0o775], ['conf', 0o775]]);
+      writePrivateFile(composePath, adguardCompose(dns, dnsHostDir));
+    } else {
+      prepareHostBindDirs(dnsHostDir, [['config', 0o775]]);
+      writePrivateFile(composePath, technitiumCompose(dns, dnsHostDir));
+    }
+    const { stdout, stderr } = await run('docker', ['compose', '-f', composePath, '-p', meta.project, 'up', '-d', '--remove-orphans'], { cwd: coreServiceDir('dns') });
     settings.services = settings.services || {};
-    settings.services.technitium = dns;
+    settings.services.dns = { provider };
+    if (provider === 'adguard') settings.services.adguard = dns;
+    else settings.services.technitium = dns;
     writeSettings(settings);
-    res.json({ ok: true, stdout, stderr, message: `Technitium DNS is starting. Open ${coreServiceUrl(dns.domain, dns.webPort)} to finish setup.`, url: coreServiceUrl(dns.domain, dns.webPort) });
+    const url = coreServiceUrl(dns.domain, dns.webPort || meta.webPort);
+    const message = provider === 'adguard'
+      ? `AdGuard Home is starting. Open ${url} and finish the setup wizard (choose port 3000 if asked).`
+      : `Technitium DNS is starting. Open ${url} to finish setup.`;
+    res.json({ ok: true, provider, stdout, stderr, message, url });
   } catch (e) {
     res.status(500).json({ error: e.message, stdout: e.stdout, stderr: e.stderr });
   }
@@ -9386,31 +9794,39 @@ app.post('/api/core/dns/run', async (req, res) => {
 app.post('/api/core/dns/domain', async (req, res) => {
   try {
     const settings = readSettings();
-    const dns = { ...(settings.services?.technitium || {}) };
+    const provider = req.body?.provider === 'adguard' || req.body?.provider === 'technitium'
+      ? req.body.provider
+      : dnsProviderName(settings);
+    const meta = dnsServiceMeta(provider);
+    const dns = provider === 'adguard'
+      ? adguardDefaults(settings.services?.adguard || {})
+      : { ...(settings.services?.technitium || {}) };
     const domain = normalizeDomain(req.body?.domain);
     if (domain && !/^[A-Za-z0-9*][A-Za-z0-9*._-]*$/.test(domain)) {
       return res.status(400).json({ error: 'Invalid domain name' });
     }
     dns.domain = domain;
     settings.services = settings.services || {};
-    settings.services.technitium = dns;
+    settings.services.dns = { provider };
+    if (provider === 'adguard') settings.services.adguard = dns;
+    else settings.services.technitium = dns;
     writeSettings(settings);
     const dir = coreServiceDir('dns');
     const composePath = path.join(dir, 'docker-compose.yml');
-    const status = await coreServiceStatus('technitium', { nameHint: 'technitium-dns', primaryHint: 'technitium-dns' });
+    const status = await coreServiceStatus(meta.project, { nameHint: meta.nameHint, primaryHint: meta.nameHint });
     let stdout = '';
     let stderr = '';
     const compose = readManagedCompose(composePath);
     if (compose.trim()) {
-      writePrivateFile(composePath, setComposeServiceEnv(compose, 'technitium-dns', {
+      writePrivateFile(composePath, setComposeServiceEnv(compose, meta.service, {
         VIRTUAL_HOST: domain,
-        VIRTUAL_PORT: domain ? '5380' : ''
+        VIRTUAL_PORT: domain ? String(meta.webPort) : ''
       }));
       if (status.running) {
-        ({ stdout, stderr } = await run('docker', ['compose', '-f', composePath, '-p', 'technitium', 'up', '-d', '--remove-orphans'], { cwd: dir }));
+        ({ stdout, stderr } = await run('docker', ['compose', '-f', composePath, '-p', meta.project, 'up', '-d', '--remove-orphans'], { cwd: dir }));
       }
     }
-    res.json({ ok: true, domain, restarted: status.running, url: coreServiceUrl(domain, dns.webPort || 5380), stdout, stderr });
+    res.json({ ok: true, provider, domain, restarted: status.running, url: coreServiceUrl(domain, dns.webPort || meta.webPort), stdout, stderr });
   } catch (e) {
     res.status(500).json({ error: e.message, stdout: e.stdout, stderr: e.stderr });
   }
@@ -9612,6 +10028,126 @@ app.post('/api/core/mailpit/domain', async (req, res) => {
       }
     }
     res.json({ ok: true, domain, restarted: status.running, url: coreServiceUrl(domain, mailpit.webPort || 8025), stdout, stderr });
+  } catch (e) {
+    res.status(500).json({ error: e.message, stdout: e.stdout, stderr: e.stderr });
+  }
+});
+
+// ---------- Email: Stalwart mail server ----------
+app.get('/api/core/stalwart', async (req, res) => {
+  try {
+    const settings = readSettings();
+    const dir = path.join(coreDir, 'stalwart');
+    const composePath = path.join(dir, 'docker-compose.yml');
+    const stalwart = stalwartDefaults(settings.services?.stalwart || {});
+    const existing = readManagedCompose(composePath);
+    const coreHostDir = await selfMountSource('/app/core');
+    const compose = existing.trim()
+      ? existing
+      : stalwartCompose(stalwart, coreHostDir ? path.join(coreHostDir, 'stalwart') : '');
+    const status = await coreServiceStatus('stalwart', { nameHint: 'stalwart', primaryHint: 'stalwart' });
+    res.json({
+      ...status,
+      dir,
+      composePath,
+      compose,
+      settings: redactServiceSecrets('stalwart', settings.services?.stalwart || {}),
+      url: coreServiceUrl(stalwart.domain, stalwart.webPort || 8088)
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/core/stalwart/compose', async (req, res) => {
+  try {
+    const { compose } = req.body || {};
+    if (!compose) return res.status(400).json({ error: 'compose required' });
+    const composePath = coreServiceFile('stalwart');
+    writePrivateFile(composePath, String(compose));
+    res.json({ ok: true, path: composePath });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/core/stalwart/run', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const settings = readSettings();
+    const stalwart = stalwartDefaults(settings.services?.stalwart || {});
+    const installDefaults = configuredDefaults();
+    if (body.domain !== undefined) {
+      const domain = normalizeDomain(body.domain);
+      if (domain && !/^[A-Za-z0-9*][A-Za-z0-9*._-]*$/.test(domain)) return res.status(400).json({ error: 'Invalid domain name' });
+      stalwart.domain = domain;
+    } else if (!stalwart.domain && installDefaults.primaryDomain) {
+      stalwart.domain = normalizeDomain('mail.' + installDefaults.primaryDomain);
+    }
+    if (body.adminUser) stalwart.adminUser = String(body.adminUser).trim() || 'admin';
+    if (body.adminPassword) stalwart.adminPassword = String(body.adminPassword);
+    if (!stalwart.adminPassword) stalwart.adminPassword = randomSecret(16);
+    for (const [field, label] of [['webPort', 'Web port'], ['smtpPort', 'SMTP port'], ['submissionPort', 'Submission port'], ['imapsPort', 'IMAPS port']]) {
+      if (body[field] === undefined) continue;
+      const port = Number(body[field]);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) return res.status(400).json({ error: `Invalid ${label.toLowerCase()}` });
+      stalwart[field] = port;
+    }
+    const ports = [stalwart.smtpPort, stalwart.submissionPort, stalwart.imapsPort, stalwart.webPort];
+    if (new Set(ports).size !== ports.length) return res.status(400).json({ error: 'Each published port must be unique' });
+    stalwart.enabled = true;
+    await ensureNetwork('wicked');
+    const composePath = coreServiceFile('stalwart');
+    const coreHostDir = await selfMountSource('/app/core');
+    const stalwartHostDir = coreHostDir ? path.join(coreHostDir, 'stalwart') : '';
+    prepareHostBindDirs(stalwartHostDir, [['data', 0o775]]);
+    writePrivateFile(composePath, stalwartCompose(stalwart, stalwartHostDir));
+    const { stdout, stderr } = await run('docker', ['compose', '-f', composePath, '-p', 'stalwart', 'up', '-d', '--remove-orphans'], { cwd: coreServiceDir('stalwart') });
+    settings.services = settings.services || {};
+    settings.services.stalwart = stalwart;
+    writeSettings(settings);
+    const url = coreServiceUrl(stalwart.domain, stalwart.webPort || 8088);
+    res.json({
+      ok: true,
+      stdout,
+      stderr,
+      url,
+      message: `Stalwart is starting. Open ${url} to complete the admin setup, then set the SMTP host in this Email card to point Authelia at it.`
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message, stdout: e.stdout, stderr: e.stderr });
+  }
+});
+
+app.post('/api/core/stalwart/domain', async (req, res) => {
+  try {
+    const settings = readSettings();
+    const stalwart = stalwartDefaults(settings.services?.stalwart || {});
+    const domain = normalizeDomain(req.body?.domain);
+    if (domain && !/^[A-Za-z0-9*][A-Za-z0-9*._-]*$/.test(domain)) {
+      return res.status(400).json({ error: 'Invalid domain name' });
+    }
+    stalwart.domain = domain;
+    settings.services = settings.services || {};
+    settings.services.stalwart = stalwart;
+    writeSettings(settings);
+    const dir = coreServiceDir('stalwart');
+    const composePath = path.join(dir, 'docker-compose.yml');
+    const status = await coreServiceStatus('stalwart', { nameHint: 'stalwart', primaryHint: 'stalwart' });
+    let stdout = '';
+    let stderr = '';
+    const existing = readManagedCompose(composePath);
+    if (existing.trim()) {
+      const compose = setComposeServiceEnv(existing, 'stalwart', {
+        VIRTUAL_HOST: domain,
+        VIRTUAL_PORT: domain ? '8080' : ''
+      });
+      writePrivateFile(composePath, compose);
+      if (status.running) {
+        ({ stdout, stderr } = await run('docker', ['compose', '-f', composePath, '-p', 'stalwart', 'up', '-d', '--remove-orphans'], { cwd: dir }));
+      }
+    }
+    res.json({ ok: true, domain, restarted: status.running, url: coreServiceUrl(domain, stalwart.webPort || 8088), stdout, stderr });
   } catch (e) {
     res.status(500).json({ error: e.message, stdout: e.stdout, stderr: e.stderr });
   }
@@ -10372,14 +10908,57 @@ app.post('/api/core/opencode/stop', (req, res) => {
   res.json({ ok: true, stopped });
 });
 
+// Core services - app integration hints
+// The app compose builder asks for this before rendering so routing and
+// certificate variables for installed core services are present automatically.
+app.get('/api/core/app-hints', async (req, res) => {
+  try {
+    const containers = await docker.listContainers({ all: true }).catch(() => []);
+    const nameOf = container => String((container.Names || [])[0] || '').replace(/^\//, '');
+    const isRunning = (project, names) => containers.some(container => {
+      const labels = container.Labels || {};
+      if (labels['com.docker.compose.project'] === project) return true;
+      return names.includes(nameOf(container));
+    });
+    const nginxProxy = isRunning('nginx-proxy', ['nginx-proxy']);
+    const acmeCompanion = isRunning('nginx-proxy', ['acme-companion']);
+    const authelia = isRunning('authelia', ['authelia']);
+    const authentik = isRunning('authentik', ['authentik-server']);
+    const mailpit = isRunning('mailpit', ['mailpit']);
+    const stalwart = isRunning('stalwart', ['stalwart']);
+    const fields = [];
+    if (nginxProxy) {
+      fields.push(
+        { key: 'VIRTUAL_HOST', value: '', label: 'Public hostname', help: 'Hostname nginx-proxy serves for this app.' },
+        { key: 'VIRTUAL_PORT', value: '', label: 'Container port', help: 'Container port nginx-proxy forwards to. Required when the image exposes more than one port.' }
+      );
+    }
+    if (authelia) {
+      fields.push({ key: 'ENABLE_AUTH', value: 'true', label: 'Require login', help: 'Protect this app through the Authelia forward-auth portal.' });
+    }
+    if (acmeCompanion) {
+      fields.push(
+        { key: 'LETSENCRYPT_HOST', value: '', label: 'Certificate hostname', help: 'Hostname acme-companion requests a certificate for. Usually the same as VIRTUAL_HOST.' },
+        { key: 'LETSENCRYPT_EMAIL', value: '', label: 'Certificate email', help: 'Contact email used for Let\'s Encrypt registration and expiry notices.' }
+      );
+    }
+    res.json({
+      services: { nginxProxy, acmeCompanion, authelia, authentik, mailpit, stalwart },
+      fields
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message, services: {}, fields: [] });
+  }
+});
+
 // Core services - shared actions
 app.post('/api/core/all/:action(start|stop|restart)', async (req, res) => {
   try {
     const action = req.params.action === 'start' ? 'up' : req.params.action;
-    const services = ['nginx-proxy', 'cloudflared', 'auth', 'authelia', 'dns', 'mailpit', 'host-helper'];
+    const services = ['nginx-proxy', 'cloudflared', 'auth', 'authelia', 'dns', 'mailpit', 'stalwart', 'host-helper'];
     const results = [];
     for (const service of services) {
-      const map = { 'nginx-proxy': 'nginx-proxy', cloudflared: 'cloudflared', auth: 'auth', authelia: 'authelia', dns: 'dns', mailpit: 'mailpit', 'host-helper': 'host-helper' };
+      const map = { 'nginx-proxy': 'nginx-proxy', cloudflared: 'cloudflared', auth: 'auth', authelia: 'authelia', dns: 'dns', mailpit: 'mailpit', stalwart: 'stalwart', 'host-helper': 'host-helper' };
       const dir = coreServiceDir(map[service]);
       if (!fs.existsSync(path.join(dir, 'docker-compose.yml'))) continue;
       try {
@@ -10424,8 +11003,8 @@ app.get('/api/logs/apps', (req, res) => {
   const apps = readRegistry().map(entry => ({
     id: entry.id, name: entry.name, appDir: appDirFor(entry)
   }));
-  const core = ['nginx-proxy', 'cloudflared', 'auth', 'authelia', 'dns', 'mailpit', 'host-helper'].filter(service => {
-    const map = { 'nginx-proxy': 'nginx-proxy', cloudflared: 'cloudflared', auth: 'auth', authelia: 'authelia', dns: 'dns', mailpit: 'mailpit', 'host-helper': 'host-helper' };
+  const core = ['nginx-proxy', 'cloudflared', 'auth', 'authelia', 'dns', 'mailpit', 'stalwart', 'host-helper'].filter(service => {
+    const map = { 'nginx-proxy': 'nginx-proxy', cloudflared: 'cloudflared', auth: 'auth', authelia: 'authelia', dns: 'dns', mailpit: 'mailpit', stalwart: 'stalwart', 'host-helper': 'host-helper' };
     return fs.existsSync(path.join(coreServiceDir(map[service]), 'docker-compose.yml'));
   });
   res.json({ apps, core });
@@ -10457,8 +11036,9 @@ app.get('/api/logs/core/:service', async (req, res) => {
       cloudflared: { dir: 'cloudflared', project: 'cloudflared' },
       auth: { dir: 'auth', project: 'authentik' },
       authelia: { dir: 'authelia', project: 'authelia' },
-      dns: { dir: 'dns', project: 'technitium' },
+      dns: { dir: 'dns', project: dnsProviderName(readSettings()) === 'adguard' ? 'adguard' : 'technitium' },
       mailpit: { dir: 'mailpit', project: 'mailpit' },
+      stalwart: { dir: 'stalwart', project: 'stalwart' },
       'host-helper': { dir: 'host-helper', project: 'wickedafdok-host-helper' }
     };
     const target = map[req.params.service];

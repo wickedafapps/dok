@@ -1265,12 +1265,75 @@ async function loadAppCfgBuilder(compose) {
       return;
     }
     appCfgBuilderModel = normalizeClientBuilderModel(result.model);
+    await applyCoreServiceHints(appCfgBuilderModel);
+    if (seq !== appCfgBuilderLoadSeq || appCfgBuilderManual) return;
     renderAppCfgBuilder();
     scheduleAppCfgBuilderBuild(true, false);
   } catch (e) {
     if (seq !== appCfgBuilderLoadSeq || appCfgBuilderManual) return;
     if (root) root.innerHTML = `<p class="muted">${escapeHtml(e.message)}</p>`;
     setAppCfgBuilderStatus('Builder unavailable', true);
+  }
+}
+
+
+let coreAppHintsCache = { at: 0, data: null, promise: null };
+async function getCoreAppHints() {
+  if (coreAppHintsCache.data && Date.now() - coreAppHintsCache.at < 30000) return coreAppHintsCache.data;
+  if (!coreAppHintsCache.promise) {
+    coreAppHintsCache.promise = api('/api/core/app-hints')
+      .then(data => {
+        coreAppHintsCache = { at: Date.now(), data, promise: null };
+        return data;
+      })
+      .catch(() => {
+        coreAppHintsCache = { at: 0, data: { services: {}, fields: [] }, promise: null };
+        return coreAppHintsCache.data;
+      });
+  }
+  return coreAppHintsCache.promise;
+}
+
+function applyCoreServiceHintsToModel(model, hints) {
+  const fields = Array.isArray(hints?.fields) ? hints.fields : [];
+  if (!model || !fields.length) return false;
+  const services = model.services || [];
+  if (!services.length) return false;
+  const preferred = String(pendingAppConfig?.vhostService || pendingAppConfig?.appName || '').trim();
+  const service = services.find(item => item.name === preferred) || services[0];
+  if (!service) return false;
+  let envField = (service.fields || []).find(field => field.key === 'environment');
+  if (!envField) {
+    envField = { key: 'environment', type: 'environment', value: '' };
+    service.fields = service.fields || [];
+    service.fields.push(envField);
+  }
+  const existing = new Set(Object.keys(appCfgBuilderEnvMap(envField)));
+  const lines = appCfgRawLines(envField.value).map(line => line.trim()).filter(Boolean);
+  let changed = false;
+  for (const hint of fields) {
+    const key = String(hint?.key || '').trim();
+    if (!key || existing.has(key)) continue;
+    let value = hint.value === undefined || hint.value === null ? '' : String(hint.value);
+    if (!value && (key === 'VIRTUAL_HOST' || key === 'LETSENCRYPT_HOST')) {
+      const appName = String(pendingAppConfig?.appName || '').trim();
+      const primary = String(installDefaults?.primaryDomain || '').trim();
+      if (appName && primary) value = `${appName}.${primary}`;
+    }
+    lines.push(`${key}=${value}`);
+    existing.add(key);
+    changed = true;
+  }
+  if (changed) envField.value = lines.join('\n');
+  return changed;
+}
+
+async function applyCoreServiceHints(model) {
+  try {
+    const hints = await getCoreAppHints();
+    return applyCoreServiceHintsToModel(model, hints);
+  } catch {
+    return false;
   }
 }
 
@@ -2726,6 +2789,75 @@ if (qs('#libraryImportFile')) {
   });
 }
 
+
+async function importLibraryRepo(payload, overwrite = false) {
+  const res = await fetch('/api/library/import-repo', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...payload, overwrite })
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(data.error || res.statusText || 'Import failed');
+    err.status = res.status;
+    err.data = data;
+    throw err;
+  }
+  return data;
+}
+
+if (qs('#libraryImportRepoBtn')) {
+  qs('#libraryImportRepoBtn').addEventListener('click', () => {
+    const msg = qs('#libraryRepoMsg');
+    if (msg) msg.textContent = '';
+    qs('#libraryRepoModal')?.classList.remove('hidden');
+  });
+}
+
+if (qs('#libraryRepoDo')) {
+  qs('#libraryRepoDo').addEventListener('click', async () => {
+    const btn = qs('#libraryRepoDo');
+    const msg = qs('#libraryRepoMsg');
+    const payload = {
+      repo: qs('#libraryRepoUrl')?.value.trim() || '',
+      branch: qs('#libraryRepoBranch')?.value.trim() || '',
+      path: qs('#libraryRepoPath')?.value.trim() || '',
+      name: qs('#libraryRepoName')?.value.trim() || ''
+    };
+    if (!payload.repo) {
+      if (msg) msg.textContent = 'Repository URL is required';
+      return;
+    }
+    const setBusy = (busy, text) => {
+      if (btn) { btn.disabled = busy; btn.textContent = busy ? 'Cloning…' : 'Clone and import'; }
+      if (msg) msg.textContent = text || '';
+    };
+    setBusy(true, 'Cloning repository and importing apps…');
+    try {
+      let result;
+      try {
+        result = await importLibraryRepo(payload, false);
+      } catch (e) {
+        if (e.status === 409 && e.data?.needsOverwrite) {
+          const names = Array.isArray(e.data.apps) ? e.data.apps.join(', ') : 'the selected apps';
+          if (!confirm(`${names} already exist. Overwrite their app files?`)) throw e;
+          result = await importLibraryRepo(payload, true);
+        } else {
+          throw e;
+        }
+      }
+      setBusy(false, result.message || 'Import complete');
+      toast(result.message || `Imported ${result.imported?.length || 0} app${result.imported?.length === 1 ? '' : 's'}`, false, 9000);
+      closeModal('libraryRepoModal');
+      await loadApps();
+      refreshAll();
+    } catch (e) {
+      setBusy(false, e.message || 'Import failed');
+      toast(e.message || 'Import failed', true, 8000);
+    }
+  });
+}
+
 // ---------------- Settings ----------------
 let coreCfData = null;
 let updateWatcher = null;
@@ -3082,6 +3214,9 @@ async function loadCoreNginx() {
     if (qs('#nginxComposeEditor')) {
       qs('#nginxComposeEditor').value = res.compose || '';
     }
+    if (qs('#nginxAcmeEnabled')) qs('#nginxAcmeEnabled').checked = !!res.acme?.enabled;
+    if (qs('#nginxAcmeEmail')) qs('#nginxAcmeEmail').value = res.acme?.email || '';
+    if (qs('#nginxAcmeStaging')) qs('#nginxAcmeStaging').checked = !!res.acme?.staging;
     state.coreNginxRunning = !!res.running;
     state.coreNginxInstalled = installed;
     const hasNginx = installed;
@@ -3171,6 +3306,35 @@ if (qs('#viewNginxStatus')) {
       out.classList.remove('hidden');
     } catch (e) {
       toast(e.message, true);
+    }
+  });
+}
+
+if (qs('#nginxAcmeSave')) {
+  qs('#nginxAcmeSave').addEventListener('click', async () => {
+    const btn = qs('#nginxAcmeSave');
+    const msg = qs('#nginxAcmeMsg');
+    const enabled = !!qs('#nginxAcmeEnabled')?.checked;
+    const email = qs('#nginxAcmeEmail')?.value.trim() || '';
+    if (enabled && !email) {
+      if (msg) msg.textContent = 'Set a certificate email to enable acme-companion';
+      return toast('Certificate email is required for acme-companion', true);
+    }
+    setLoading(btn, true, 'Saving…');
+    try {
+      const res = await api('/api/core/nginx-proxy/acme', jsonBody({
+        enabled,
+        email,
+        staging: !!qs('#nginxAcmeStaging')?.checked
+      }));
+      if (msg) msg.textContent = res.message || 'Certificate settings saved';
+      toast(res.message || 'Certificate settings saved', false, 12000);
+      await loadCoreNginx();
+    } catch (e) {
+      if (msg) msg.textContent = e.message;
+      toast(e.message, true);
+    } finally {
+      setLoading(btn, false, 'Save certificate settings');
     }
   });
 }
@@ -3682,20 +3846,73 @@ async function loadCoreMail() {
     if (qs('#mailpitDomain')) qs('#mailpitDomain').value = res.settings?.domain || '';
     if (qs('#mailpitDomainManage')) qs('#mailpitDomainManage').value = res.settings?.domain || '';
     if (qs('#mailpitComposeEditor') && res.compose) qs('#mailpitComposeEditor').value = res.compose;
+    const stalwart = await api('/api/core/stalwart').catch(() => null);
+    if (stalwart) {
+      coreMailData.stalwart = stalwart;
+      setCoreSections('stalwart', coreServiceInstalled('stalwart', stalwart));
+      if (qs('#stalwartStatus')) qs('#stalwartStatus').textContent = `Stalwart status: ${stalwart.state || (stalwart.running ? 'running' : 'stopped')}`;
+      if (qs('#stalwartDomain')) qs('#stalwartDomain').value = stalwart.settings?.domain || '';
+      if (qs('#stalwartDomainManage')) qs('#stalwartDomainManage').value = stalwart.settings?.domain || '';
+      if (qs('#stalwartAdminUser')) qs('#stalwartAdminUser').value = stalwart.settings?.adminUser || 'admin';
+      if (qs('#stalwartWebPort')) qs('#stalwartWebPort').value = stalwart.settings?.webPort || 8088;
+      if (qs('#stalwartSmtpPort')) qs('#stalwartSmtpPort').value = stalwart.settings?.smtpPort || 25;
+      if (qs('#stalwartSubmissionPort')) qs('#stalwartSubmissionPort').value = stalwart.settings?.submissionPort || 587;
+      if (qs('#stalwartImapsPort')) qs('#stalwartImapsPort').value = stalwart.settings?.imapsPort || 993;
+      if (qs('#stalwartComposeEditor')) qs('#stalwartComposeEditor').value = stalwart.compose || '';
+      if (qs('#stalwartAdminPassword')) {
+        qs('#stalwartAdminPassword').value = '';
+        qs('#stalwartAdminPassword').placeholder = stalwart.settings?.adminPasswordSet
+          ? 'Password saved (leave blank to keep)'
+          : 'Admin password (generated if blank)';
+      }
+    }
   } catch {}
   applyDefaultsToServiceForms();
 
 }
+
+function updateDnsProviderForm() {
+  const provider = qs('#dnsProvider')?.value === 'adguard' ? 'adguard' : 'technitium';
+  const password = qs('#dnsAdminPassword');
+  if (password) {
+    password.classList.toggle('hidden', provider === 'adguard');
+    const wrap = password.closest('.field-wrap');
+    if (wrap) wrap.classList.toggle('hidden', provider === 'adguard');
+  }
+  const webPort = qs('#dnsWebPort');
+  if (webPort && !webPort.dataset.touched) webPort.value = provider === 'adguard' ? '3000' : '5380';
+  const runBtn = qs('#dnsRunBtn');
+  if (runBtn && !runBtn.disabled) runBtn.textContent = provider === 'adguard' ? 'Launch AdGuard Home' : 'Launch Technitium';
+  const openBtn = qs('#dnsOpenBtn');
+  if (openBtn) openBtn.textContent = provider === 'adguard' ? 'Open AdGuard Home' : 'Open Technitium';
+  const desc = qs('#dnsDesc');
+  if (desc) desc.textContent = provider === 'adguard'
+    ? 'AdGuard Home provides filtering DNS with a setup wizard and query dashboard. It can replace Technitium for local DNS and ad blocking.'
+    : 'Optional local DNS and ad blocking. Technitium provides a web console for zones, records, and blocklists. AdGuard Home provides a simpler filtering DNS server with its own setup wizard.';
+}
+
+if (qs('#dnsProvider')) qs('#dnsProvider').addEventListener('change', () => {
+  if (qs('#dnsWebPort')) delete qs('#dnsWebPort').dataset.touched;
+  updateDnsProviderForm();
+});
+if (qs('#dnsWebPort')) qs('#dnsWebPort').addEventListener('input', (e) => { e.target.dataset.touched = '1'; });
 
 async function loadCoreDns() {
   try {
     const res = await api('/api/core/dns');
     coreDnsData = res;
     setCoreSections('dns', coreServiceInstalled('dns', res));
-    if (qs('#dnsStatus')) qs('#dnsStatus').textContent = `Technitium status: ${res.state || (res.running ? 'running' : 'stopped')}`;
+    const provider = res.provider === 'adguard' ? 'adguard' : 'technitium';
+    const label = provider === 'adguard' ? 'AdGuard Home' : 'Technitium DNS';
+    if (qs('#dnsProvider')) qs('#dnsProvider').value = provider;
+    if (qs('#dnsKindLabel')) qs('#dnsKindLabel').textContent = `(${label})`;
+    if (qs('#dnsStatus')) qs('#dnsStatus').textContent = `${label} status: ${res.state || (res.running ? 'running' : 'stopped')}`;
     if (qs('#dnsDomain')) qs('#dnsDomain').value = res.settings?.domain || '';
     if (qs('#dnsDomainManage')) qs('#dnsDomainManage').value = res.settings?.domain || '';
     if (qs('#dnsComposeEditor') && res.compose) qs('#dnsComposeEditor').value = res.compose;
+    if (qs('#dnsWebPort')) qs('#dnsWebPort').value = res.settings?.webPort || (provider === 'adguard' ? 3000 : 5380);
+    if (qs('#dnsDnsPort')) qs('#dnsDnsPort').value = res.settings?.dnsPort || 53;
+    updateDnsProviderForm();
   } catch {}
   applyDefaultsToServiceForms();
 
@@ -4568,28 +4785,34 @@ if (qs('#mailpitApplyDomain')) {
   });
 }
 
-if (qs('#dnsRunBtn')) {
-  qs('#dnsRunBtn').addEventListener('click', async () => {
-    const btn = qs('#dnsRunBtn');
-    setLoading(btn, true);
-    try {
-      const res = await api('/api/core/dns/run', jsonBody({
-        adminPassword: qs('#dnsAdminPassword')?.value || '',
-        webPort: Number(qs('#dnsWebPort')?.value || 5380),
-        dnsPort: Number(qs('#dnsDnsPort')?.value || 53),
-        domain: qs('#dnsDomain')?.value.trim() || ''
-      }));
-      qs('#dnsAdminPassword').value = '';
-      if (qs('#dnsMsg')) qs('#dnsMsg').textContent = res.message || '';
-      toast(res.message || 'Technitium launched', false, 12000);
-      await loadCoreDns();
-    } catch (e) {
-      toast(e.message, true);
-    } finally {
-      setLoading(btn, false, 'Launch Technitium');
-    }
-  });
+async function deployDnsProvider(btn) {
+  const provider = qs('#dnsProvider')?.value === 'adguard' ? 'adguard' : 'technitium';
+  const current = coreDnsData?.provider === 'adguard' ? 'adguard' : 'technitium';
+  if (coreDnsData?.exists && provider !== current && !confirm(`Replace the running ${current === 'adguard' ? 'AdGuard Home' : 'Technitium DNS'} service with ${provider === 'adguard' ? 'AdGuard Home' : 'Technitium DNS'}?`)) {
+    return;
+  }
+  setLoading(btn, true);
+  try {
+    const res = await api('/api/core/dns/run', jsonBody({
+      provider,
+      adminPassword: qs('#dnsAdminPassword')?.value || '',
+      webPort: Number(qs('#dnsWebPort')?.value || (provider === 'adguard' ? 3000 : 5380)),
+      dnsPort: Number(qs('#dnsDnsPort')?.value || 53),
+      domain: qs('#dnsDomain')?.value.trim() || ''
+    }));
+    if (qs('#dnsAdminPassword')) qs('#dnsAdminPassword').value = '';
+    if (qs('#dnsMsg')) qs('#dnsMsg').textContent = res.message || '';
+    toast(res.message || 'DNS service launched', false, 12000);
+    await loadCoreDns();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    setLoading(btn, false, provider === 'adguard' ? 'Launch AdGuard Home' : 'Launch Technitium');
+  }
 }
+
+if (qs('#dnsRunBtn')) qs('#dnsRunBtn').addEventListener('click', () => deployDnsProvider(qs('#dnsRunBtn')));
+if (qs('#dnsDeployProvider')) qs('#dnsDeployProvider').addEventListener('click', () => deployDnsProvider(qs('#dnsDeployProvider')));
 if (qs('#dnsEditCompose')) qs('#dnsEditCompose').addEventListener('click', () => { qs('#dnsComposeEditor').classList.remove('hidden'); qs('#dnsEditorActions').classList.remove('hidden'); });
 if (qs('#dnsEditComposeManage')) qs('#dnsEditComposeManage').addEventListener('click', () => { qs('#dnsComposeEditor').classList.remove('hidden'); qs('#dnsEditorActions').classList.remove('hidden'); });
 if (qs('#dnsCancelCompose')) qs('#dnsCancelCompose').addEventListener('click', () => { qs('#dnsComposeEditor').classList.add('hidden'); qs('#dnsEditorActions').classList.add('hidden'); });
@@ -4599,7 +4822,7 @@ if (qs('#dnsSaveCompose')) {
       await api('/api/core/dns/compose', jsonBody({ compose: qs('#dnsComposeEditor').value }));
       qs('#dnsComposeEditor').classList.add('hidden');
       qs('#dnsEditorActions').classList.add('hidden');
-      toast('Technitium compose saved');
+      toast('DNS compose saved');
     } catch (e) { toast(e.message, true); }
   });
 }
@@ -4613,10 +4836,74 @@ if (qs('#dnsApplyDomain')) {
     const msg = qs('#dnsDomainMsg');
     setLoading(btn, true, 'Applying…');
     try {
-      const res = await api('/api/core/dns/domain', jsonBody({ domain: qs('#dnsDomainManage')?.value.trim() || '' }));
+      const res = await api('/api/core/dns/domain', jsonBody({
+        provider: qs('#dnsProvider')?.value === 'adguard' ? 'adguard' : 'technitium',
+        domain: qs('#dnsDomainManage')?.value.trim() || ''
+      }));
       if (msg) msg.textContent = res.domain ? `Applied ${res.domain}${res.restarted ? ' · container recreated' : ' · restart to apply'}` : 'Domain cleared';
-      toast(res.domain ? `Technitium domain set to ${res.domain}` : 'Technitium domain cleared');
+      toast(res.domain ? `DNS domain set to ${res.domain}` : 'DNS domain cleared');
       await loadCoreDns();
+    } catch (e) {
+      if (msg) msg.textContent = e.message;
+      toast(e.message, true);
+    } finally {
+      setLoading(btn, false, 'Apply domain');
+    }
+  });
+}
+
+if (qs('#stalwartRunBtn')) {
+  qs('#stalwartRunBtn').addEventListener('click', async () => {
+    const btn = qs('#stalwartRunBtn');
+    setLoading(btn, true);
+    try {
+      const res = await api('/api/core/stalwart/run', jsonBody({
+        domain: qs('#stalwartDomain')?.value.trim() || '',
+        adminUser: qs('#stalwartAdminUser')?.value.trim() || 'admin',
+        adminPassword: qs('#stalwartAdminPassword')?.value || '',
+        webPort: Number(qs('#stalwartWebPort')?.value || 8088),
+        smtpPort: Number(qs('#stalwartSmtpPort')?.value || 25),
+        submissionPort: Number(qs('#stalwartSubmissionPort')?.value || 587),
+        imapsPort: Number(qs('#stalwartImapsPort')?.value || 993)
+      }));
+      if (qs('#stalwartAdminPassword')) qs('#stalwartAdminPassword').value = '';
+      if (qs('#stalwartMsg')) qs('#stalwartMsg').textContent = res.message || '';
+      toast(res.message || 'Stalwart launched', false, 12000);
+      await loadCoreMail();
+    } catch (e) {
+      toast(e.message, true);
+    } finally {
+      setLoading(btn, false, 'Launch Stalwart');
+    }
+  });
+}
+if (qs('#stalwartEditCompose')) qs('#stalwartEditCompose').addEventListener('click', () => { qs('#stalwartComposeEditor').classList.remove('hidden'); qs('#stalwartEditorActions').classList.remove('hidden'); });
+if (qs('#stalwartEditComposeManage')) qs('#stalwartEditComposeManage').addEventListener('click', () => { qs('#stalwartComposeEditor').classList.remove('hidden'); qs('#stalwartEditorActions').classList.remove('hidden'); });
+if (qs('#stalwartCancelCompose')) qs('#stalwartCancelCompose').addEventListener('click', () => { qs('#stalwartComposeEditor').classList.add('hidden'); qs('#stalwartEditorActions').classList.add('hidden'); });
+if (qs('#stalwartSaveCompose')) {
+  qs('#stalwartSaveCompose').addEventListener('click', async () => {
+    try {
+      await api('/api/core/stalwart/compose', jsonBody({ compose: qs('#stalwartComposeEditor').value }));
+      qs('#stalwartComposeEditor').classList.add('hidden');
+      qs('#stalwartEditorActions').classList.add('hidden');
+      toast('Stalwart compose saved');
+    } catch (e) { toast(e.message, true); }
+  });
+}
+if (qs('#stalwartStartBtn')) qs('#stalwartStartBtn').addEventListener('click', () => coreServiceAction('stalwart', 'start', qs('#stalwartStartBtn'), loadCoreMail));
+if (qs('#stalwartStopBtn')) qs('#stalwartStopBtn').addEventListener('click', () => coreServiceAction('stalwart', 'stop', qs('#stalwartStopBtn'), loadCoreMail));
+if (qs('#stalwartRestartBtn')) qs('#stalwartRestartBtn').addEventListener('click', () => coreServiceAction('stalwart', 'restart', qs('#stalwartRestartBtn'), loadCoreMail));
+if (qs('#stalwartOpenBtn')) qs('#stalwartOpenBtn').addEventListener('click', () => window.open(coreMailData?.stalwart?.url || 'http://localhost:8088', '_blank'));
+if (qs('#stalwartApplyDomain')) {
+  qs('#stalwartApplyDomain').addEventListener('click', async () => {
+    const btn = qs('#stalwartApplyDomain');
+    const msg = qs('#stalwartDomainMsg');
+    setLoading(btn, true, 'Applying…');
+    try {
+      const res = await api('/api/core/stalwart/domain', jsonBody({ domain: qs('#stalwartDomainManage')?.value.trim() || '' }));
+      if (msg) msg.textContent = res.domain ? `Applied ${res.domain}${res.restarted ? ' · container recreated' : ' · restart to apply'}` : 'Domain cleared';
+      toast(res.domain ? `Stalwart domain set to ${res.domain}` : 'Stalwart domain cleared');
+      await loadCoreMail();
     } catch (e) {
       if (msg) msg.textContent = e.message;
       toast(e.message, true);

@@ -293,6 +293,7 @@
         </div>
         <div class="inline">
           <button id="libraryExportBtn" class="btn">Export library</button>
+          <button id="libraryImportRepoBtn" class="btn">Import from repository</button>
           <label class="file-label">Import library<input type="file" id="libraryImportFile" accept=".tar.gz,.tgz,application/gzip"></label>
           <button id="appsRefresh" class="btn">Refresh</button>
         </div>
@@ -358,6 +359,19 @@
               <button id="viewNginxStatus" class="btn">View status</button>
             </div>
             <pre id="nginxStatusOut" class="output hidden"></pre>
+          </div>
+          <div class="card" style="background:rgba(255,255,255,0.02);margin-top:14px">
+            <h4 style="margin:0 0 6px">Certificates</h4>
+            <p class="muted" style="margin:0 0 8px">Use <code>nginxproxy/acme-companion</code> to request and renew Let's Encrypt certificates automatically for containers with <code>LETSENCRYPT_HOST</code>, or place certificates in <code>core/nginx-proxy/certs/</code> yourself.</p>
+            <div class="row">
+              <label class="muted"><input type="checkbox" id="nginxAcmeEnabled"> Enable acme-companion</label>
+              <input id="nginxAcmeEmail" class="input" type="email" placeholder="Certificate email">
+              <label class="muted"><input type="checkbox" id="nginxAcmeStaging"> Use staging certificates</label>
+            </div>
+            <div class="row">
+              <button id="nginxAcmeSave" class="btn">Save certificate settings</button>
+              <span id="nginxAcmeMsg" class="muted"></span>
+            </div>
           </div>
           <textarea id="nginxComposeEditor" class="textarea code tall hidden"></textarea>
           <div class="row hidden" id="nginxEditorActions">
@@ -550,11 +564,61 @@
             <button id="mailpitSaveCompose" class="btn btn-primary">Save compose</button>
             <button id="mailpitCancelCompose" class="btn">Cancel</button>
           </div>
+
+          <div class="row" style="margin-top:18px">
+            <strong>Stalwart Mail Server</strong>
+            <span class="muted">full mail server · IMAP, JMAP, SMTP submission</span>
+          </div>
+          <p class="muted" style="margin:0">Run a complete mail server with its own web admin. Open it after launch to finish setup, then point the SMTP delivery fields above at <code>stalwart:587</code> (or your published submission port).</p>
+          <div id="stalwartCreateSection">
+            <div class="row">
+              <input id="stalwartDomain" class="input flex" placeholder="Web GUI domain, e.g. mail.example.com (optional)">
+              <input id="stalwartAdminUser" class="input" placeholder="Admin user" value="admin">
+              <input id="stalwartAdminPassword" class="input" type="password" placeholder="Admin password (generated if blank)">
+            </div>
+            <div class="row">
+              <input id="stalwartWebPort" class="input" type="number" min="1" max="65535" placeholder="Web port" value="8088">
+              <input id="stalwartSmtpPort" class="input" type="number" min="1" max="65535" placeholder="SMTP port" value="25">
+              <input id="stalwartSubmissionPort" class="input" type="number" min="1" max="65535" placeholder="Submission port" value="587">
+              <input id="stalwartImapsPort" class="input" type="number" min="1" max="65535" placeholder="IMAPS port" value="993">
+            </div>
+            <div class="row">
+              <button id="stalwartEditCompose" class="btn">Edit compose</button>
+              <button id="stalwartRunBtn" class="btn btn-primary">Launch Stalwart</button>
+              <span id="stalwartMsg" class="muted"></span>
+            </div>
+          </div>
+          <div id="stalwartManageSection" class="hidden">
+            <div class="row">
+              <span class="muted" id="stalwartStatus">Stalwart status: —</span>
+              <button id="stalwartStartBtn" class="btn">Start</button>
+              <button id="stalwartStopBtn" class="btn">Stop</button>
+              <button id="stalwartRestartBtn" class="btn">Restart</button>
+              <button id="stalwartEditComposeManage" class="btn">Edit compose</button>
+              <button id="stalwartOpenBtn" class="btn">Open Stalwart</button>
+            </div>
+            <div class="row">
+              <input id="stalwartDomainManage" class="input flex" placeholder="Web GUI domain, e.g. mail.example.com">
+              <button id="stalwartApplyDomain" class="btn">Apply domain</button>
+              <span id="stalwartDomainMsg" class="muted"></span>
+            </div>
+          </div>
+          <textarea id="stalwartComposeEditor" class="textarea code tall hidden"></textarea>
+          <div class="row hidden" id="stalwartEditorActions">
+            <button id="stalwartSaveCompose" class="btn btn-primary">Save compose</button>
+            <button id="stalwartCancelCompose" class="btn">Cancel</button>
+          </div>
         </div>
 
         <div class="card" id="coreDnsCard">
-          <h3>DNS <span class="muted">(Technitium DNS)</span></h3>
-          <p class="muted">Optional local DNS and ad blocking. Technitium provides a web console for zones, records, and blocklists.</p>
+          <h3>DNS <span class="muted" id="dnsKindLabel">(Technitium DNS)</span></h3>
+          <p class="muted" id="dnsDesc">Optional local DNS and ad blocking. Technitium provides a web console for zones, records, and blocklists. AdGuard Home provides a simpler filtering DNS server with its own setup wizard.</p>
+          <div class="row">
+            <select id="dnsProvider" class="input">
+              <option value="technitium">Technitium DNS</option>
+              <option value="adguard">AdGuard Home</option>
+            </select>
+          </div>
           <div id="dnsCreateSection">
             <div class="row">
               <input id="dnsAdminPassword" class="input" type="password" placeholder="Admin password (generated if blank)">
@@ -578,6 +642,7 @@
               <button id="dnsRestartBtn" class="btn">Restart</button>
               <button id="dnsEditComposeManage" class="btn">Edit compose</button>
               <button id="dnsOpenBtn" class="btn">Open Technitium</button>
+              <button id="dnsDeployProvider" class="btn">Deploy selected provider</button>
             </div>
             <div class="row">
               <input id="dnsDomainManage" class="input flex" placeholder="GUI domain, e.g. dns.example.com">
@@ -1039,6 +1104,33 @@
           <button id="libraryExportDo" class="btn btn-primary">Export selected apps</button>
           <button class="btn" data-close="libraryExportModal">Cancel</button>
           <span id="libraryExportMsg" class="muted"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="libraryRepoModal" class="modal hidden">
+    <div class="modal-backdrop" data-close="libraryRepoModal"></div>
+    <div class="modal-card" style="max-width:720px">
+      <div class="modal-header">
+        <h3>Import library from repository</h3>
+        <button class="btn" data-close="libraryRepoModal">Close</button>
+      </div>
+      <div class="app-config">
+        <p class="muted">Clone a git repository and import a Dok library from it. The repository can contain <code>dok-library.json</code> with an <code>apps/</code> folder, or a compose file/Dockerfile that becomes a single app. HTTPS, SSH, and any hosted git server are supported.</p>
+        <label class="muted" for="libraryRepoUrl">Repository URL</label>
+        <input id="libraryRepoUrl" class="input" placeholder="https://github.com/owner/dok-app-library">
+        <div class="row">
+          <input id="libraryRepoBranch" class="input" placeholder="Branch, tag, or commit (optional)">
+          <input id="libraryRepoPath" class="input" placeholder="Library folder inside the repo (optional)">
+        </div>
+        <div class="row">
+          <input id="libraryRepoName" class="input flex" placeholder="App name override for a single-app repository (optional)">
+        </div>
+        <div class="row">
+          <button id="libraryRepoDo" class="btn btn-primary">Clone and import</button>
+          <button class="btn" data-close="libraryRepoModal">Cancel</button>
+          <span id="libraryRepoMsg" class="muted"></span>
         </div>
       </div>
     </div>
