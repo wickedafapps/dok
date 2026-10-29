@@ -82,7 +82,7 @@
         </ul>
         <p>If a git clone or upload has no compose file or Dockerfile, Dok stores it under Projects instead of creating an app. You can deploy it later from that project.</p>
         <p>Every creation method looks for the app&rsquo;s official repository or website and prefills it in <strong>Official repository or website</strong>. Dok checks project metadata, README links, compose and Dockerfile image labels, local image labels, and the git clone URL. If the result is missing or wrong, edit or clear the field before saving. The link appears in Apps for quick configuration reference.</p>
-        <p>Created apps join Dok&rsquo;s default network (normally <code>wicked</code>). If nginx-proxy is installed, the routed service gets a matching <code>VIRTUAL_HOST</code>/<code>VIRTUAL_PORT</code> pair, is attached to that network, and its published host ports are removed so the GUI is served through nginx.</p>
+        <p>Created apps join the network selected in <strong>App network</strong>, which defaults to Dok&rsquo;s configured network (normally <code>wicked</code>). Use the create box beside it to add another network. If nginx-proxy is installed, the routed service gets a matching <code>VIRTUAL_HOST</code>/<code>VIRTUAL_PORT</code> pair, is attached to the selected network, and its published host ports are removed so the GUI is served through nginx.</p>
         <p>Before finalising, Dok validates the compose file, resolves networks and bind mounts, checks published ports, and asks for any missing choices. <strong>Save to library</strong> saves the app stopped. <strong>Test launch (stops after test)</strong> starts it briefly, reports the container states, and stops it again. Nothing stays running until you deploy from Apps.</p>
       `
     },
@@ -161,20 +161,21 @@
         <p><strong>Official repository or website</strong> stores a reference link for the app. Dok prefills it from the image, compose labels, project metadata, or git source when available. Use <strong>Open reference</strong> to check it and clear the field if the detected link is not the official source. The saved link appears in Apps and is preserved through library export and import.</p>
         <h4>Visual builder</h4>
         <ul>
-          <li>Services, networks, named volumes, and top-level settings are editable as fields.</li>
-          <li><strong>+ Add service</strong>, <strong>+ Add field</strong>, <strong>+ Add network</strong>, and <strong>+ Add volume</strong> add new entries. <strong>−</strong> removes one.</li>
-          <li>Each service keeps a stable field order: service, image, container name, restart policy, command, entrypoint, ports, environment, volumes, networks, then additional settings.</li>
-          <li>Multi-value sections use individual rows for ports, environment pairs, volumes, and networks.</li>
+          <li>Services, named volumes, and top-level settings are editable as fields.</li>
+          <li><strong>App network</strong> is the single network control. It defaults to <code>wicked</code> and lists existing Docker networks; use <strong>Create a network</strong> beside it to add one.</li>
+          <li><strong>+ Add service</strong>, <strong>+ Add field</strong>, and <strong>+ Add volume</strong> add new entries. <strong>−</strong> removes one.</li>
+          <li>Each service keeps a stable field order: service, image, container name, restart policy, command, entrypoint, ports, environment, volumes, then additional settings. Service network lists and top-level network definitions stay hidden so routing and the app network are managed in one place; <code>network_mode</code> remains available under Additional settings for host/none/container networking.</li>
+          <li>Multi-value sections use individual rows for ports, environment pairs, and volumes.</li>
           <li>Unknown keys appear under <strong>Additional settings</strong> with a field-type selector and optional raw JSON.</li>
           <li>Required values, duplicate names, duplicate published ports, invalid ports, and invalid JSON are highlighted in red.</li>
           <li>Every change regenerates the compose preview and is validated by the server.</li>
         </ul>
         <p><strong>VIRTUAL_HOST</strong> and <strong>VIRTUAL_PORT</strong> quick fields stay in sync with the service environment. When nginx-proxy, Authelia, or acme-companion is installed (running or stopped), the builder adds the matching environment fields automatically: routing host and container port, optional <code>ENABLE_AUTH=true</code>, and certificate host and email. Suggested hostnames use <code>&lt;app&gt;.&lt;primary domain&gt;</code> from Dok Settings.</p>
-        <p>When nginx-proxy is installed, the routed service joins Dok&rsquo;s default network and uses <code>VIRTUAL_HOST</code> plus a matching container <code>VIRTUAL_PORT</code>. <code>VIRTUAL_PORT</code> is filled from an explicit form value, then an existing <code>VIRTUAL_PORT</code>, then the first published container port, then <code>expose</code>, then the <code>PORT</code> environment variable, then 80. Published host <code>ports</code> are removed from that service because nginx reaches it over the shared network, so several apps can use the same container port without host conflicts. Finalize and Deploy apply the same rule even when you paste or manually edit a compose file.</p>
+        <p>When nginx-proxy is installed, the routed service joins the selected app network and uses <code>VIRTUAL_HOST</code> plus a matching container <code>VIRTUAL_PORT</code>. <code>VIRTUAL_PORT</code> is filled from an explicit form value, then an existing <code>VIRTUAL_PORT</code>, then the first published container port, then <code>expose</code>, then the <code>PORT</code> environment variable, then 80. Published host <code>ports</code> are removed from that service because nginx reaches it over the shared network, so several apps can use the same container port without host conflicts. Finalize and Deploy apply the same rule even when you paste or manually edit a compose file.</p>
         <h4>Manual editing</h4>
         <p><strong>Manually edit compose file</strong> shows a warning and switches to raw text editing. Manual mode bypasses the builder guard but still uses compose validation. Use <strong>Validate compose</strong> before finishing.</p>
         <h4>Missing resources</h4>
-        <p>Missing input networks must be mapped to an existing network or explicitly created. Missing bind paths must be chosen or created; protected system paths cannot be newly created, though existing safe paths such as <code>/var/run/docker.sock</code> remain selectable.</p>
+        <p>Missing app networks can be created from the create box beside <strong>App network</strong>; <code>wicked</code> and Dok&rsquo;s configured default are created automatically when needed. Missing bind paths must be chosen or created; protected system paths cannot be newly created, though existing safe paths such as <code>/var/run/docker.sock</code> remain selectable.</p>
         <h4>Finalise</h4>
         <p><strong>Save to library</strong> saves the app stopped. <strong>Test launch (stops after test)</strong> starts it briefly, reports each container&rsquo;s state, and stops the app again so it remains ready for configuration. If the target app directory already exists, Dok asks for overwrite confirmation. Progress is shown in stages: prepare, build, validate, save, and test.</p>
         <p>Persistent app data is never overwritten or deleted. If the new app targets an existing data directory, Dok tells you that it will connect to the existing data. Overwriting app files preserves <code>data/</code> and existing <code>.env</code> files. For fresh data, use a new app name or data location, or delete the existing data manually first.</p>
@@ -484,7 +485,7 @@
         <h4>Networking</h4>
         <ul>
           <li><strong>Ports</strong> use <code>host:container</code> or <code>container</code>. Published host ports must be unique on the host. With nginx-proxy installed, a routed service should not publish host ports; Dok removes them and routes through the shared network instead.</li>
-          <li><strong>Networks</strong> attach the service to Docker networks. <code>wicked</code> is Dok&rsquo;s default app network and the routed service is always attached to it.</li>
+          <li><strong>App network</strong> selects the Docker network the app joins. It defaults to <code>wicked</code>, Dok&rsquo;s shared app network. Use the separate create box to add a network without leaving the modal.</li>
           <li><strong>VIRTUAL_HOST</strong> is the hostname nginx-proxy serves.</li>
           <li><strong>VIRTUAL_PORT</strong> is the container port nginx-proxy forwards to, not the host port. Dok fills it automatically from the service&rsquo;s container port so the GUI works through nginx.</li>
           <li><strong>ENABLE_AUTH</strong> opts the container into Authelia forward authentication.</li>
@@ -561,7 +562,8 @@
     appCfgCompose: 'Compose file',
     appCfgName: 'App title',
     appCfgReferenceUrl: 'Official repository or website',
-    appCfgNetwork: 'Network',
+    appCfgNetwork: 'App network',
+    appCfgNewNetwork: 'Create a network',
     editContent: 'File content',
     editPath: 'File path',
     runCmd: 'Docker run command',
@@ -586,7 +588,8 @@
     appCfgName: 'Required app title. It becomes the apps/<name> folder and the compose project name.',
     appCfgReferenceUrl: 'Optional official repository, homepage, or documentation URL. Dok detects it from the image, compose labels, project metadata, or the git source when available. It is shown as a link in Apps for configuration reference.',
     appCfgCompose: 'Raw compose file. Editing here switches the modal to manual mode.',
-    appCfgNetwork: 'Default network used by the compose preview when no service network is selected.',
+    appCfgNetwork: 'Docker network the app joins. Defaults to Dok&rsquo;s shared wicked network; choose or create another network here.',
+    appCfgNewNetwork: 'Name of a new Docker network to create and select for this app.',
     runCmd: 'Complete docker run command to convert into an app compose file.',
     composeName: 'Required app title for the pasted compose project.',
     composeYaml: 'Complete docker-compose.yml or compose.yaml content.',

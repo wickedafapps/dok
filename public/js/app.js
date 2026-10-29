@@ -789,9 +789,9 @@ const APP_CFG_STATIC_FIELDS = [
 const APP_CFG_LIST_FIELDS = [
   { key: 'ports', type: 'ports', label: 'Ports', placeholder: '8080:80' },
   { key: 'environment', type: 'environment', label: 'Environment', kv: true, placeholder: 'KEY=value' },
-  { key: 'volumes', type: 'volumes', label: 'Volumes', placeholder: './data:/data' },
-  { key: 'networks', type: 'networks', label: 'Networks', placeholder: 'wicked' }
+  { key: 'volumes', type: 'volumes', label: 'Volumes', placeholder: './data:/data' }
 ];
+const APP_CFG_HIDDEN_FIELDS = new Set(['networks']);
 const APP_CFG_STATIC_KEYS = new Set([...APP_CFG_STATIC_FIELDS, ...APP_CFG_LIST_FIELDS].map(def => def.key));
 
 function appCfgRawLines(value) {
@@ -955,10 +955,11 @@ function appCfgListEditor(service, def) {
 function appCfgAdditionalSection(service) {
   const additional = service.fields
     .map((field, fieldIndex) => ({ field, fieldIndex }))
-    .filter(({ field }) => !APP_CFG_STATIC_KEYS.has(field.key));
+    .filter(({ field }) => !APP_CFG_STATIC_KEYS.has(field.key) && !APP_CFG_HIDDEN_FIELDS.has(field.key));
   const presentTypes = new Set(service.fields.map(field => field.key).filter(key => APP_CFG_FIELD_TYPE_MAP.has(key)));
   const addTypes = APP_CFG_FIELD_TYPES.filter(item =>
-    (item.type === 'raw' || item.type === 'scalar' || !presentTypes.has(item.type)) && !APP_CFG_STATIC_KEYS.has(item.type)
+    (item.type === 'raw' || item.type === 'scalar' || !presentTypes.has(item.type)) &&
+    !APP_CFG_STATIC_KEYS.has(item.type) && !APP_CFG_HIDDEN_FIELDS.has(item.type)
   );
   const rows = additional.length
     ? additional.map(({ field, fieldIndex }) => appCfgBuilderFieldRow(service, field, appCfgBuilderModel.services.indexOf(service), fieldIndex)).join('')
@@ -1016,16 +1017,6 @@ function renderAppCfgBuilder() {
     ${appCfgBuilderModel.volumes.length
       ? appCfgBuilderModel.volumes.map((item, index) => appCfgBuilderMetaRow('volume', item, index)).join('')
       : '<p class="muted">No named volumes.</p>'}
-  </div>
-  <div class="builder-group">
-    <div class="row" style="margin-top:0; justify-content:space-between">
-      <strong>Networks${appCfgFieldHelp('Networks', 'Networks')}</strong>
-      <button class="btn builder-add-network" type="button">+ Add network</button>
-    </div>
-    <p class="muted">Top-level network definitions. Add a network here, then reference it in the service Networks section.</p>
-    ${appCfgBuilderModel.networks.length
-      ? appCfgBuilderModel.networks.map((item, index) => appCfgBuilderMetaRow('network', item, index)).join('')
-      : '<p class="muted">No named networks. The app network field above is still used for the deployment override.</p>'}
   </div>
   <div class="builder-group">
     <strong>Other top-level settings${appCfgFieldHelp('Other top-level settings', 'Other top-level settings')}</strong>
@@ -1735,20 +1726,55 @@ function isSpecialNetworkName(name) {
     text.startsWith('container:') || text.startsWith('service:');
 }
 
+function appCfgDefaultNetworkName() {
+  return String(installDefaults?.defaultNetwork || 'wicked').trim() || 'wicked';
+}
+
+function appCfgNetworkChoices(selected = '') {
+  const fallback = appCfgDefaultNetworkName();
+  const names = [...new Set([
+    'wicked',
+    fallback,
+    ...(appCfgNetworks || []).filter(name => !isSpecialNetworkName(name))
+  ].filter(Boolean))];
+  const wanted = String(selected || '').trim();
+  if (wanted && !isSpecialNetworkName(wanted) && !names.includes(wanted)) names.push(wanted);
+  names.sort((a, b) => {
+    if (a === b) return 0;
+    if (a === fallback) return -1;
+    if (b === fallback) return 1;
+    if (a === 'wicked') return -1;
+    if (b === 'wicked') return 1;
+    return a.localeCompare(b);
+  });
+  return names;
+}
+
+function renderAppCfgNetworkOptions(selected = '') {
+  const select = qs('#appCfgNetwork');
+  if (!select) return;
+  const current = String(selected || select.value || pendingAppConfig?.network || '').trim();
+  const fallback = appCfgDefaultNetworkName();
+  const names = appCfgNetworkChoices(current || fallback);
+  const value = names.includes(current) ? current : (names.includes(fallback) ? fallback : names[0] || '');
+  const known = new Set(appCfgNetworks || []);
+  select.innerHTML = names.map(name => {
+    const missing = appCfgNetworksLoaded && !known.has(name) && name !== 'wicked' && name !== fallback;
+    return `<option value="${escapeHtml(name)}">${escapeHtml(name)}${name === fallback ? ' (default)' : ''}${missing ? ' (not found)' : ''}</option>`;
+  }).join('');
+  select.value = value;
+}
+
 async function loadNetworksForModal() {
+  const selected = qs('#appCfgNetwork')?.value || pendingAppConfig?.network || '';
   try {
     const nets = await api('/api/networks');
     appCfgNetworks = (nets || []).map(n => n.Name).filter(Boolean);
     appCfgNetworksLoaded = true;
-    const list = qs('#appNetworkList');
-    if (list) {
-      list.innerHTML = appCfgNetworks
-        .filter(name => !isSpecialNetworkName(name))
-        .map(name => `<option value="${escapeHtml(name)}"></option>`).join('');
-    }
   } catch {
     appCfgNetworksLoaded = false;
   }
+  renderAppCfgNetworkOptions(selected);
   renderAppCfgNetworkNotice();
   renderAppCfgVolumeNotice();
 }
@@ -1764,7 +1790,7 @@ function renderAppCfgNetworkNotice() {
     return;
   }
   const choices = pendingAppConfig.networkChoices || {};
-  const available = appCfgNetworks.filter(name => !isSpecialNetworkName(name));
+  const available = appCfgNetworkChoices();
   rows.innerHTML = missing.map(ref => {
     const key = String(ref.key || ref.name || '');
     const name = String(ref.name || key);
@@ -1897,7 +1923,8 @@ function openAppConfig(data) {
   qs('#appCfgName').value = data.appName || '';
   if (qs('#appCfgReferenceUrl')) qs('#appCfgReferenceUrl').value = data.referenceUrl || '';
   syncAppCfgReferenceLink();
-  qs('#appCfgNetwork').value = data.network || installDefaults.defaultNetwork || 'wicked';
+  pendingAppConfig.network = data.network || installDefaults.defaultNetwork || 'wicked';
+  renderAppCfgNetworkOptions(pendingAppConfig.network);
   const notices = [];
   if (Array.isArray(data.unsupported) && data.unsupported.length) {
     notices.push(`These docker run options were not converted and may need to be added manually: ${data.unsupported.join(', ')}`);
@@ -2098,6 +2125,7 @@ async function doAppComplete(deployNow = false, force = false, overwrite = false
     try {
       const res = await api(`/api/apps/${encodeURIComponent(data.editAppId)}/compose`, jsonBody({
         compose,
+        network: qs('#appCfgNetwork')?.value.trim() || '',
         referenceUrl: qs('#appCfgReferenceUrl')?.value.trim() || '',
         deploy: deployNow,
         force,
@@ -2156,7 +2184,7 @@ async function doAppComplete(deployNow = false, force = false, overwrite = false
   if (appCfgNetworksLoaded && network && !isSpecialNetworkName(network) && network !== 'wicked' &&
       network !== installDefaults.defaultNetwork &&
       !appCfgNetworks.includes(network)) {
-    msg.textContent = `Network "${network}" does not exist. Click "Create network" or choose an existing network.`;
+    msg.textContent = `Network "${network}" does not exist. Create it in the "Create a network" field or choose an existing network.`;
     fail();
     return;
   }
@@ -3192,7 +3220,7 @@ function applyDefaultsToServiceForms() {
     qs('#nginxDomain').value = defaults.dokDomain;
   }
   if (qs('#appCfgNetwork') && (!qs('#appCfgNetwork').value.trim() || qs('#appCfgNetwork').value === 'wicked')) {
-    qs('#appCfgNetwork').value = defaults.defaultNetwork || 'wicked';
+    renderAppCfgNetworkOptions(defaults.defaultNetwork || 'wicked');
   }
 }
 
@@ -6032,20 +6060,30 @@ if (qs('#appCreationCreateNginxModal')) {
 
 if (qs('#appCfgCreateNetwork')) {
   qs('#appCfgCreateNetwork').addEventListener('click', async () => {
-    const input = qs('#appCfgNetwork');
-    const name = input.value.trim();
-    if (!name) return toast('Enter a network name first', true);
+    const input = qs('#appCfgNewNetwork');
+    const name = String(input?.value || '').trim();
+    if (!name) {
+      toast('Enter a network name first', true);
+      input?.focus();
+      return;
+    }
+    if (isSpecialNetworkName(name)) {
+      toast('Choose a named network, not host, none, bridge, or default', true);
+      return;
+    }
     const btn = qs('#appCfgCreateNetwork');
     setLoading(btn, true, 'Creating…');
     try {
       const res = await api('/api/networks/create', jsonBody({ name }));
       toast(res.existed ? `Network "${name}" already exists` : `Network "${name}" created`);
+      if (input) input.value = '';
       await loadNetworksForModal();
-      input.value = name;
+      renderAppCfgNetworkOptions(name);
+      if (pendingAppConfig) pendingAppConfig.network = name;
     } catch (e) {
       toast(e.message, true);
     } finally {
-      setLoading(btn, false, 'Create network');
+      setLoading(btn, false, 'Create');
     }
   });
 }

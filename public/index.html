@@ -993,11 +993,23 @@
           <div class="row"><button id="appCreationCreateNginxModal" class="btn btn-primary">Open Dok Maintenance</button></div>
         </div>
         <div class="row">
-          <input id="appCfgName" class="input" placeholder="App title (required)" required>
-          <input id="appCfgNetwork" class="input" placeholder="Network" value="wicked" list="appNetworkList">
-          <button id="appCfgCreateNetwork" class="btn" type="button">Create network</button>
-          <datalist id="appNetworkList"></datalist>
+          <label class="field-wrap field-wrap-grow">
+            <span class="field-label-text">App title</span>
+            <input id="appCfgName" class="input" placeholder="App title (required)" required>
+          </label>
+          <label class="field-wrap">
+            <span class="field-label-text">App network</span>
+            <select id="appCfgNetwork" class="input" aria-label="App network"></select>
+          </label>
+          <label class="field-wrap">
+            <span class="field-label-text">Create a network</span>
+            <span class="inline">
+              <input id="appCfgNewNetwork" class="input" placeholder="New network name" aria-label="New network name">
+              <button id="appCfgCreateNetwork" class="btn" type="button">Create</button>
+            </span>
+          </label>
         </div>
+        <p class="muted" style="margin:6px 0 0">Apps join the selected network. <code>wicked</code> is Dok's shared default. Create another network here if the dropdown does not list it.</p>
         <div class="row">
           <input id="appCfgReferenceUrl" class="input flex" type="url" placeholder="Official repository or website (optional)">
           <a id="appCfgReferenceLink" class="btn hidden" target="_blank" rel="noopener noreferrer">Open reference ↗</a>
@@ -1034,7 +1046,7 @@
                 </div>
                 <button id="appCfgAddService" class="btn" type="button">+ Add service</button>
               </div>
-              <p class="muted">Fields follow the same order every time. Use Additional settings for anything not listed. Changes update the compose preview on the left.</p>
+              <p class="muted">Fields follow the same order every time. Use Additional settings for anything not listed. The service network is managed by the App network selector above. Changes update the compose preview on the left.</p>
               <div id="appCfgBuilder"></div>
               <div id="appCfgBuilderIssues" class="builder-issues hidden"></div>
             </div>

@@ -5469,6 +5469,57 @@ function ensureComposeServiceNetwork(composeText, serviceName, key = 'default') 
   return lines.join('\n');
 }
 
+function setComposeDefaultNetworkName(composeText, network) {
+  const text = String(composeText || '');
+  const name = String(network || '').trim();
+  if (!text.trim() || !name) return text;
+  const info = composeNetworkInfo(text);
+  if (info.inline || info.start < 0) return text;
+  const def = (info.defs || []).find(item => item.key === 'default');
+  if (!def) return text;
+  const lines = info.lines;
+  const entryRest = (parseNetworkEntryLine(lines[def.start]) || {}).rest || '';
+  const inline = parseInlineYamlMapping(entryRest);
+  if (inline) {
+    if (!def.external && !inline.name) return text;
+    if (String(inline.name || '').trim() === name) return text;
+    const body = Object.entries({ ...inline, name }).map(([key, value]) => {
+      const raw = String(value ?? '');
+      const rendered = /^(?:true|false|null|~)$/i.test(raw) ? raw : formatYamlKey(raw);
+      return `${formatYamlKey(key)}: ${rendered}`;
+    }).join(', ');
+    const prefix = lines[def.start].match(/^([ \t]*(?:"(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^:#]+?)[ \t]*:[ \t]*)/);
+    const comment = (String(lines[def.start]).match(/[ \t]+#.*$/) || [''])[0];
+    if (prefix) lines[def.start] = `${prefix[1]}{ ${body} }${comment}`;
+    return lines.join('\n');
+  }
+  let nameLine = -1;
+  let childIndent = null;
+  for (let i = def.start + 1; i < def.end; i++) {
+    const line = lines[i];
+    if (!line.trim() || line.trim().startsWith('#')) continue;
+    if (childIndent === null) childIndent = lineIndent(line);
+    const prop = line.match(/^([ \t]+)([A-Za-z0-9_.-]+)[ \t]*:[ \t]*(.*)$/);
+    if (prop && prop[2] === 'name') { nameLine = i; break; }
+  }
+  if (!def.external && nameLine < 0) return text;
+  if (nameLine >= 0) {
+    const line = lines[nameLine];
+    const prop = line.match(/^([ \t]*name[ \t]*:[ \t]*)(.*)$/);
+    if (!prop || unquoteYamlValue(stripYamlComment(prop[2]).trim()) === name) return text;
+    const comment = (String(line).match(/[ \t]+#.*$/) || [''])[0];
+    lines[nameLine] = `${prop[1]}${formatYamlKey(name)}${comment}`;
+    return lines.join('\n');
+  }
+  const indent = ' '.repeat((childIndent === null ? lineIndent(lines[def.start]) : childIndent) + 2);
+  let insertAt = def.start + 1;
+  for (let i = def.start + 1; i < def.end; i++) {
+    if (/^[ \t]*external[ \t]*:/.test(lines[i])) { insertAt = i + 1; break; }
+  }
+  lines.splice(insertAt, 0, `${indent}name: ${formatYamlKey(name)}`);
+  return lines.join('\n');
+}
+
 // Dok apps always join the configured default network (normally `wicked`).
 // Defining it as Compose's external `default` network attaches every service
 // that does not opt into a custom network and keeps the compose portable. When
@@ -5510,6 +5561,7 @@ function ensureComposeDokNetwork(composeText, network = 'wicked', serviceName = 
     }
     if (keys.has('default')) {
       networkKey = 'default';
+      result = setComposeDefaultNetworkName(result, name);
     } else if (keys.has(name)) {
       networkKey = name;
     } else {
@@ -6828,7 +6880,38 @@ async function composeAction(entry, action, { allowStartupGrace = false, confirm
   let renamed = [];
   let amendment = null;
   if (action === 'up' || action === 'start') {
-    const composeText = fs.readFileSync(composeFile, 'utf-8');
+    const defaultsCfg = configuredDefaults();
+    const defaultNetwork = String(defaultsCfg.defaultNetwork || 'wicked').trim() || 'wicked';
+    const selectedNetwork = String(entry?.launch?.network || '').trim();
+    const ensureNames = [...new Set([defaultNetwork, 'wicked', selectedNetwork].filter(isUserNetworkName))];
+    for (const netName of ensureNames) {
+      try {
+        await ensureNetwork(netName);
+      } catch (e) {
+        throw httpError(500, `Could not create the Docker network "${netName}": ${e.message}`);
+      }
+    }
+    const networkNames = await dockerNetworkNames().catch(() => []);
+    for (const netName of ensureNames) {
+      if (!networkNames.includes(netName)) networkNames.push(netName);
+    }
+    const fallbackNetwork = selectedNetwork || defaultNetwork;
+    let composeText = fs.readFileSync(composeFile, 'utf-8');
+    const normalized = normalizeComposeNetworks(composeText, networkNames, fallbackNetwork);
+    let nextComposeText = normalized.changed ? normalized.text : composeText;
+    if (selectedNetwork) nextComposeText = setComposeDefaultNetworkName(nextComposeText, selectedNetwork);
+    if (nextComposeText !== composeText) {
+      writePrivateFile(composeFile, nextComposeText);
+      composeText = nextComposeText;
+    }
+    const deployOverridePath = path.join(appDir, 'docker-compose.wickedafdok.yml');
+    if (fs.existsSync(deployOverridePath)) {
+      try {
+        const overrideText = fs.readFileSync(deployOverridePath, 'utf-8');
+        const normalizedOverride = normalizeComposeNetworks(overrideText, networkNames, fallbackNetwork);
+        if (normalizedOverride.changed) writePrivateFile(deployOverridePath, normalizedOverride.text);
+      } catch {}
+    }
     amendment = await inspectComposeAmendments(name, composeText);
     if (amendment.blocked.length) {
       const item = amendment.blocked[0];
@@ -9303,7 +9386,36 @@ app.post('/api/apps/:id/compose', async (req, res) => {
     let compose = normalizeEditedAppCompose(entry, req.body?.compose || '', { vhostTouched });
     if (!compose.trim()) return res.status(400).json({ error: 'Compose file is empty' });
     const defaultsCfg = configuredDefaults();
-    const defaultNetwork = String(defaultsCfg.defaultNetwork || 'wicked').trim() || 'wicked';
+    const requestedNetwork = String(req.body?.network || '').trim();
+    const defaultNetwork = requestedNetwork || String(defaultsCfg.defaultNetwork || 'wicked').trim() || 'wicked';
+    if (!isUserNetworkName(defaultNetwork) || ['bridge', 'host', 'none', 'default'].includes(defaultNetwork)) {
+      throw httpError(400, 'Choose a named Docker network. Use network_mode in the compose file for host, none, bridge, or container networks.');
+    }
+    const networkNames = await dockerNetworkNames().catch(() => []);
+    const autoCreateNetwork = defaultNetwork === 'wicked' ||
+      defaultNetwork === String(defaultsCfg.defaultNetwork || 'wicked').trim() ||
+      req.body?.createNetwork === true;
+    if (!networkNames.includes(defaultNetwork)) {
+      if (!autoCreateNetwork) {
+        return res.status(400).json({
+          error: `Network "${defaultNetwork}" does not exist. Create it or choose an existing network.`,
+          missingNetworks: [{ key: defaultNetwork, name: defaultNetwork, form: true }]
+        });
+      }
+      try {
+        await createNetworkStrict(defaultNetwork);
+        networkNames.push(defaultNetwork);
+      } catch (e) {
+        throw httpError(500, `Could not create the Docker network "${defaultNetwork}": ${e.message}`);
+      }
+    }
+    if (!networkNames.includes('wicked')) {
+      try {
+        await createNetworkStrict('wicked');
+        networkNames.push('wicked');
+      } catch {}
+    }
+    compose = normalizeComposeNetworks(compose, networkNames, defaultNetwork).text;
     const services = serviceNamesFromCompose(compose);
     let routedService = String(req.body?.vhostService || '').trim();
     if (!services.includes(routedService)) {
@@ -9354,6 +9466,7 @@ app.post('/api/apps/:id/compose', async (req, res) => {
         current.composeFile = path.relative(appDir, composePath) || 'docker-compose.yml';
         if (referenceFieldProvided) current.referenceUrl = normalizedReferenceUrl;
         current.launch = current.launch || {};
+        current.launch.network = defaultNetwork;
         let analyzed = false;
         try {
           const analysis = await analyzeCompose(compose, { projectDir: appDir });
@@ -9370,6 +9483,8 @@ app.post('/api/apps/:id/compose', async (req, res) => {
         writeRegistry(reg);
       }
     } catch {}
+    entry.launch = entry.launch || {};
+    entry.launch.network = defaultNetwork;
     let result = { stdout: 'Base configuration saved', stderr: '', renamed: [] };
     if (deploy) {
       result = await composeAction(entry, 'up', {
