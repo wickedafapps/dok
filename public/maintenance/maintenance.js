@@ -603,6 +603,8 @@
         dataModeAllow: true
       },
       auto: {},
+      existingData: '',
+      inspection: null,
       registries: []
     };
     initializeAutoDomains();
@@ -611,6 +613,7 @@
     qs('#installResult').classList.add('hidden');
     qs('#installWizard').classList.remove('hidden');
     renderWizard();
+    if (state.wizard.fields.dataLocation) inspectDataLocation();
   }
 
   function wizardSteps() {
@@ -732,15 +735,54 @@
     }).join('') || '<div class="card-note">No extra fields are required for this option.</div>';
   }
 
+  function existingDataDetails(inspection) {
+    const items = [];
+    const settings = inspection.settingsFiles || [];
+    if (settings.length) items.push(`Settings, credentials, and secrets: <span class="mono">${settings.join(', ')}</span>`);
+    if (inspection.appCount) items.push(`${inspection.appCount} app ${inspection.appCount === 1 ? 'directory' : 'directories'} in the app library`);
+    if (inspection.appRuntimeCount && inspection.layout !== 'direct') items.push(`${inspection.appRuntimeCount} app data ${inspection.appRuntimeCount === 1 ? 'folder' : 'folders'}`);
+    if (inspection.coreServiceCount) items.push(`${inspection.coreServiceCount} core service ${inspection.coreServiceCount === 1 ? 'configuration' : 'configurations'}`);
+    if (inspection.sourceCount) items.push(`${inspection.sourceCount} project ${inspection.sourceCount === 1 ? 'source' : 'sources'}`);
+    if (inspection.uploadCount) items.push(`${inspection.uploadCount} upload ${inspection.uploadCount === 1 ? 'folder' : 'folders'}`);
+    return items.length ? `<ul class="small" style="margin:6px 0 0 18px">${items.map(item => `<li>${item}</li>`).join('')}</ul>` : '';
+  }
+
+  function inspectionNoticeHtml(inspection) {
+    if (!inspection || inspection.valid === false) return '';
+    const adjusted = inspection.requestedDataLocation &&
+      inspection.requestedDataLocation.replace(/\/+$/, '') !== inspection.dataLocation
+      ? `<div class="small" style="margin-top:4px">The selected folder is a Dok storage folder. The data location was adjusted to <span class="mono">${escapeHtml(inspection.dataLocation)}</span> so app data and the Dok folder stay in the expected place.</div>`
+      : '';
+    if (!inspection.exists) {
+      return `<div class="notice ok" style="margin-top:10px">${adjusted}No previous Dok installation was found. A new <span class="mono">${escapeHtml(inspection.storageRoot || '')}</span> will be created.</div>`;
+    }
+    const layout = inspection.legacyLayout
+      ? '<div class="small" style="margin-top:4px">This installation keeps its data directly in the selected location. Dok will continue using that folder so nothing is moved or hidden.</div>'
+      : '';
+    const conflict = inspection.bothLayouts
+      ? '<div class="small" style="margin-top:4px">Another Dok data layout was also found. Dok will use the newest complete installation and leave the other folder untouched.</div>'
+      : '';
+    const invalid = (inspection.invalidFiles || []).length
+      ? `<div class="small" style="margin-top:4px">Existing files need attention: ${inspection.invalidFiles.map(item => escapeHtml(item)).join('; ')}.</div>`
+      : '';
+    return `<div class="notice warn" style="margin-top:10px"><strong>Previous Dok installation detected.</strong>
+      <div class="small" style="margin-top:4px">Storage: <span class="mono">${escapeHtml(inspection.storageRoot)}</span>${inspection.installation?.completedAt ? ` · last completed ${escapeHtml(when(inspection.installation.completedAt))}` : ''}</div>
+      ${adjusted}${layout}${conflict}${invalid}
+      ${existingDataDetails(inspection)}
+      <div class="small" style="margin-top:6px">You will be asked whether to reuse or replace the settings. The app library, app data, sources, uploads, and backups are never overwritten by the installer, and a safety snapshot is taken before changes.</div>
+    </div>`;
+  }
+
   function renderDefaultsStep() {
     const wizard = state.wizard;
     const fields = DEFAULTS_FIELDS.filter(field => field.key !== 'adminPasswordConfirm' || !!wizard.services.auth);
     return `
       <h3>Dok settings</h3>
-      <div class="sub small" style="margin-bottom:14px">These values populate Dok Settings → Default settings. The persistent data location is required; Dok creates a <span class="mono">Dok</span> folder inside it for all of its data, and Maintenance data is kept under <span class="mono">Dok/maintenance</span>. Secrets are encrypted before they are written.${wizard.type === 'core' ? ' Required fields for the selected core services must also be filled.' : ''}</div>
+      <div class="sub small" style="margin-bottom:14px">These values populate Dok Settings → Default settings. The persistent data location is required; Dok uses <span class="mono">&lt;location&gt;/Dok</span> for new installations and adopts an existing installation in either that folder or the selected location itself. Secrets are encrypted before they are written.${wizard.type === 'core' ? ' Required fields for the selected core services must also be filled.' : ''}</div>
       <div class="grid two">
         <div>
           ${fields.slice(0, 4).map(field => fieldInput(field.key, wizard.fields[field.key], field)).join('')}
+          <div id="dataLocationInspect">${inspectionNoticeHtml(wizard.inspection)}</div>
         </div>
         <div>
           ${fields.slice(4).map(field => fieldInput(field.key, wizard.fields[field.key], field)).join('')}
@@ -811,7 +853,7 @@
             <dt>Mail</dt><dd>${escapeHtml(wizard.fields.mailDomain || '-')}</dd>
             ${wizard.services.mail ? `<dt>Sender</dt><dd>${escapeHtml(wizard.fields.mailFrom || wizard.fields.smtpFrom || '-')}</dd>` : ''}
             ${wizard.services.proxy === 'nginx-proxy' ? `<dt>TLS</dt><dd>${escapeHtml(wizard.fields.acmeEmail ? `ACME${wizard.fields.acmeStaging ? ' staging' : ''}` : 'Manual certificates')}</dd>` : ''}
-            <dt>Data path</dt><dd>${escapeHtml(wizard.fields.dataLocation ? `${wizard.fields.dataLocation.replace(/\/+$/, '')}/Dok` : 'Not set')}</dd>
+            <dt>Data path</dt><dd>${escapeHtml(wizard.inspection?.storageRoot || (wizard.fields.dataLocation ? `${wizard.fields.dataLocation.replace(/\/+$/, '')}/Dok` : 'Not set'))}${wizard.inspection?.exists ? `<br><span class="sub">Existing installation · ${wizard.inspection.legacyLayout ? 'data-location layout' : 'Dok folder layout'}</span>` : ''}</dd>
             <dt>Admin</dt><dd>${escapeHtml(wizard.fields.adminUser || 'admin')} ${wizard.fields.adminEmail ? `· ${escapeHtml(wizard.fields.adminEmail)}` : ''}</dd>
             <dt>Network</dt><dd>${escapeHtml(wizard.fields.defaultNetwork || 'wicked')}</dd>
           </div>
@@ -891,6 +933,34 @@
     }
   }
 
+  let dataInspectTimer = null;
+  async function inspectDataLocation() {
+    const wizard = state.wizard;
+    if (!wizard) return;
+    const location = String(wizard.fields.dataLocation || '').trim();
+    const node = qs('#dataLocationInspect');
+    if (!location.startsWith('/')) {
+      wizard.inspection = null;
+      if (node) node.innerHTML = '';
+      return;
+    }
+    try {
+      const inspection = await api('/api/install/inspect', { method: 'POST', body: { dataLocation: location } });
+      if (!state.wizard || String(state.wizard.fields.dataLocation || '').trim() !== location) return;
+      wizard.inspection = inspection;
+      const target = qs('#dataLocationInspect');
+      if (target) target.innerHTML = inspectionNoticeHtml(inspection);
+    } catch (e) {
+      if (!e.needsToken && node) node.innerHTML = `<div class="notice danger" style="margin-top:10px">Could not inspect the data location: ${escapeHtml(e.message)}</div>`;
+    }
+  }
+  function scheduleDataLocationInspect() {
+    clearTimeout(dataInspectTimer);
+    const wizard = state.wizard;
+    if (wizard) wizard.existingData = '';
+    dataInspectTimer = setTimeout(inspectDataLocation, 350);
+  }
+
   document.addEventListener('input', event => {
     const field = event.target.closest('[data-field]');
     if (field && state.wizard) {
@@ -900,6 +970,7 @@
         applyPrimaryDefaults();
         updatePrimaryPreview();
       }
+      if (key === 'dataLocation') scheduleDataLocationInspect();
       return;
     }
     const registry = event.target.closest('[data-registry]');
@@ -1026,7 +1097,7 @@
   qs('#startInstallBtn').addEventListener('click', () => startWizard('standalone'));
 
   qs('#reinstallBtn').addEventListener('click', async () => {
-    const ok = await confirmDialog('Exact reinstall', '<p>Restore the newest installation snapshot over the current checkout, start Dok, and start the installed core services?</p><p class="sub">This overwrites data/, apps/, core/, and sources/ with the snapshot contents. Backups and maintenance storage stay untouched.</p>', 'Reinstall');
+    const ok = await confirmDialog('Exact reinstall', '<p>Restore the newest installation snapshot over the current checkout, start Dok, and start the installed core services?</p><p class="sub">Settings, credentials, core services, and sources are restored from the snapshot. Existing apps, app data, backups, and maintenance storage are preserved.</p>', 'Reinstall');
     if (!ok) return;
     qs('#installProgress').classList.remove('hidden');
     qs('#installLog').textContent = 'Restoring installation snapshot...\n';
@@ -1079,6 +1150,7 @@
     const wizard = state.wizard;
     return {
       type: wizard.type,
+      existingData: wizard.existingData || '',
       defaults: {
         primaryDomain: wizard.fields.primaryDomain || '',
         dokDomain: wizard.fields.dokDomain || '',
@@ -1134,7 +1206,65 @@
     };
   }
 
+  async function confirmExistingData() {
+    const wizard = state.wizard;
+    const dataLocation = wizard.fields.dataLocation || '';
+    const inspection = await api('/api/install/inspect', {
+      method: 'POST',
+      body: { dataLocation }
+    });
+    wizard.inspection = inspection;
+    wizard.existingData = '';
+    if (!inspection.exists) return true;
+    const details = existingDataDetails(inspection);
+    const adjusted = inspection.requestedDataLocation &&
+      inspection.requestedDataLocation.replace(/\/+$/, '') !== inspection.dataLocation
+      ? `<p class="small">The selected folder is the Dok storage folder. Its parent <span class="mono">${escapeHtml(inspection.dataLocation)}</span> is used as the data location so app data stays in place.</p>`
+      : '';
+    const layout = inspection.legacyLayout
+      ? `<p class="small">This is an older data-location layout. Dok will keep using <span class="mono">${escapeHtml(inspection.storageRoot)}</span> so existing apps and data stay available.</p>`
+      : '';
+    const invalid = (inspection.invalidFiles || []).length
+      ? `<p class="small">Some existing files need attention: ${inspection.invalidFiles.map(item => escapeHtml(item)).join('; ')}.</p>`
+      : '';
+    const protectedNote = '<p class="sub">The app library, app directories, persistent app data, sources, uploads, and maintenance backups are never overwritten or deleted by the installer. A safety snapshot is taken before any change.</p>';
+    const settingsInvalid = (inspection.invalidFiles || []).some(problem => /^settings\.json\b/.test(problem));
+    if (settingsInvalid) {
+      const replace = await confirmDialog(
+        'Existing settings are invalid',
+        `<p>The existing <span class="mono">settings.json</span> cannot be read, so it cannot be reused.</p>${adjusted}${layout}${invalid}<p>Replace the settings, credentials, and configuration at <span class="mono">${escapeHtml(inspection.storageRoot)}</span> with this wizard's values?</p><p class="sub">The app library, app directories, persistent app data, sources, uploads, and backups are still preserved, and a safety snapshot is saved first. Cancel if you would rather restore a backup.</p>`,
+        'Replace settings and install'
+      );
+      if (!replace) return false;
+      wizard.existingData = 'overwrite';
+      return true;
+    }
+    const reuse = await confirmDialog(
+      'Previous installation found',
+      `<p>An existing Dok installation was found at <span class="mono">${escapeHtml(inspection.storageRoot)}</span>.</p>${adjusted}${details}${layout}${invalid}<p>Reuse its settings, credentials, and configuration, then apply values from this wizard?</p>${protectedNote}`,
+      'Reuse existing settings'
+    );
+    if (reuse) {
+      wizard.existingData = 'reuse';
+      return true;
+    }
+    const replace = await confirmDialog(
+      'Replace installation settings?',
+      `<p>Replace the settings, credentials, and configuration at <span class="mono">${escapeHtml(inspection.storageRoot)}</span> with this wizard's values?</p>${adjusted}${details}${layout}${invalid}<p class="sub">This replaces category 2 files only: settings, registry/git connection secrets, authentication, and DNS configuration. The app library, app directories, persistent app data, sources, uploads, and backups are still preserved, and a safety snapshot is saved first.</p>`,
+      'Replace settings and install'
+    );
+    if (!replace) return false;
+    wizard.existingData = 'overwrite';
+    return true;
+  }
+
   async function startInstall() {
+    try {
+      if (!await confirmExistingData()) return;
+    } catch (e) {
+      toast(e.message, 'error');
+      return;
+    }
     const payload = installPayload();
     qs('#installWizard').classList.add('hidden');
     qs('#installProgress').classList.remove('hidden');
@@ -1164,7 +1294,8 @@
 
   const PHASE_PERCENT = {
     starting: 4, prepare: 10, 'write-configuration': 22, 'launch-dok': 40,
-    'wait-for-dok': 62, 'configure-core-services': 78, 'record-snapshot': 92, done: 100, error: 100
+    'verify-dok': 62, 'configure-core-services': 78, 'verify-installation': 88,
+    'record-snapshot': 94, done: 100, error: 100
   };
 
   function pollInstall() {
@@ -1190,10 +1321,10 @@
             return;
           }
           const result = job.result || {};
-          qs('#installBadge').textContent = 'complete';
-          qs('#installBadge').className = 'badge ok';
-          qs('#installBar').style.width = '100%';
           const warnings = result.warnings || [];
+          qs('#installBadge').textContent = warnings.length || result.ok === false ? 'warning' : 'complete';
+          qs('#installBadge').className = `badge ${warnings.length || result.ok === false ? 'warn' : 'ok'}`;
+          qs('#installBar').style.width = '100%';
           qs('#installResult').classList.remove('hidden');
           qs('#installResult').innerHTML = `
             <div class="notice ${warnings.length ? 'warn' : 'ok'}">${escapeHtml(result.message || 'Installation completed.')}</div>
@@ -1285,7 +1416,7 @@
     const remove = event.target.closest('[data-backup-delete]');
     if (restore) {
       const id = restore.dataset.backupRestore;
-      const ok = await confirmDialog('Restore backup', `<p>Restore backup <span class="mono">${escapeHtml(id)}</span> over the current installation?</p><p class="sub">Dok and core services will be stopped, files replaced, and Dok started again. This cannot be undone unless you have another backup.</p>`, 'Restore');
+      const ok = await confirmDialog('Restore backup', `<p>Restore backup <span class="mono">${escapeHtml(id)}</span> over the current installation?</p><p class="sub">Dok and core services will be stopped, settings and core files restored, and Dok started again. Existing apps and app data are preserved. This cannot be undone unless you have another backup.</p>`, 'Restore');
       if (!ok) return;
       restore.disabled = true;
       try {
@@ -1335,7 +1466,7 @@
     } catch (e) { toast(e.message, 'error'); }
   });
   qs('#snapReinstall').addEventListener('click', async () => {
-    const ok = await confirmDialog('Exact reinstall', '<p>Restore the newest snapshot and start Dok plus its core services?</p><p class="sub">This overwrites data/, apps/, core/, and sources/ from the snapshot.</p>', 'Reinstall');
+    const ok = await confirmDialog('Exact reinstall', '<p>Restore the newest snapshot and start Dok plus its core services?</p><p class="sub">Settings, credentials, core services, and sources are restored. Existing apps and app data are preserved.</p>', 'Reinstall');
     if (!ok) return;
     try {
       const result = await api('/api/install/reinstall', { method: 'POST', body: {} });
@@ -1350,7 +1481,7 @@
     const remove = event.target.closest('[data-snapshot-delete]');
     if (restore) {
       const id = restore.dataset.snapshotReinstall;
-      const ok = await confirmDialog('Restore snapshot', `<p>Restore snapshot <span class="mono">${escapeHtml(id)}</span>?</p><p class="sub">Dok and core services are stopped, files are replaced, and Dok is started again.</p>`, 'Restore');
+      const ok = await confirmDialog('Restore snapshot', `<p>Restore snapshot <span class="mono">${escapeHtml(id)}</span>?</p><p class="sub">Dok and core services are stopped, settings and core files are restored, and Dok is started again. Existing apps and app data are preserved.</p>`, 'Restore');
       if (!ok) return;
       restore.disabled = true;
       try {

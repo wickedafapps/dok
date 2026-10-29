@@ -22,7 +22,8 @@ import {
   installationSummary, writeInstallationCompose, captureSnapshot, listSnapshots,
   listBackups, createBackup, restoreArchive, repairInstallation, systemInfo, dockerInfo,
   maintenanceVersion, installationExists, dokComposeContext, dokComposeSupportFiles,
-  dokSocketOverridePath, relocateDokStorage, mirrorMaintenanceData, hostVisiblePath, dokStorageRoot
+  dokSocketOverridePath, relocateDokStorage, mirrorMaintenanceData, hostVisiblePath, dokStorageRoot,
+  inspectDokStorage, normalizeDokDataLocation, verifyDokInstallation
 } from './lib.js';
 
 ensureDirs();
@@ -276,10 +277,46 @@ app.get('/api/install', api(async (req, res) => {
   });
 }));
 
+app.post('/api/install/inspect', api(async (req, res) => {
+  const requested = String(req.body?.dataLocation || '').trim();
+  if (!requested || !path.isAbsolute(requested)) {
+    return res.status(400).json({ error: 'An absolute data location is required.' });
+  }
+  const dataLocation = normalizeDokDataLocation(requested);
+  const inspection = inspectDokStorage(dataLocation);
+  res.json({ ok: true, ...inspection, requestedDataLocation: path.resolve(requested) });
+}));
+
 app.post('/api/install/validate', api(async (req, res) => {
   const plan = normalizeInstallPlan(req.body || {});
   const issues = validateInstallPlan(plan);
-  res.json({ ok: issues.length === 0, issues, plan: { type: plan.type, services: plan.services, defaults: { ...plan.defaults, adminPassword: plan.defaults.adminPassword ? 'set' : '' } } });
+  const warnings = [];
+  const inspection = plan.defaults.dataLocation ? inspectDokStorage(plan.defaults.dataLocation) : null;
+  if (inspection?.exists && !plan.existingData) {
+    issues.push('An existing Dok installation was found in this data location. Choose whether to reuse or replace its settings before continuing.');
+  }
+  if (inspection?.exists && plan.existingData === 'reuse') {
+    for (const problem of inspection.invalidFiles || []) {
+      if (/^settings\.json\b/.test(problem)) {
+        issues.push(`The existing settings cannot be reused (${problem}). Choose Replace settings or restore a backup first.`);
+      } else {
+        warnings.push(`Existing ${problem}; review it after installation.`);
+      }
+    }
+  }
+  if (inspection?.bothLayouts) {
+    warnings.push('More than one Dok data layout was found. The newest complete installation is selected; the other folder is left untouched.');
+  }
+  if (inspection?.legacyLayout) {
+    warnings.push(`This installation uses its data location directly (${inspection.storageRoot}). Dok will keep using that folder so existing apps and data stay available.`);
+  }
+  res.json({
+    ok: issues.length === 0,
+    issues,
+    warnings,
+    existingData: inspection,
+    plan: { type: plan.type, services: plan.services, defaults: { ...plan.defaults, adminPassword: plan.defaults.adminPassword ? 'set' : '' } }
+  });
 }));
 
 app.get('/api/install/opencode-prompt', api(async (req, res) => {
@@ -646,11 +683,40 @@ async function runInstall(plan) {
     phase('prepare');
     ensureDirs();
     await ensureNetwork(plan.defaults.defaultNetwork || DEFAULT_NETWORK);
+    const targetInspection = inspectDokStorage(plan.defaults.dataLocation);
+
+    // A reinstall, repair, or update must never begin by replacing user data
+    // without a recovery point. Snapshot the detected storage root (including
+    // legacy layouts that use the data location directly) before writing any
+    // configuration. The snapshot is best-effort so a read-only or full
+    // storage does not block recovery through the installer.
+    let preInstallSnapshot = null;
+    if (targetInspection.exists) {
+      phase('safety-snapshot');
+      const status = await dokStatus().catch(() => ({ exists: false, running: false }));
+      if (status.running) {
+        await docker(['stop', DOK_CONTAINER], { timeout: 120000 }).catch(() => {});
+        log('Stopped the running Dok container before snapshotting the existing installation.');
+      }
+      preInstallSnapshot = await captureSnapshot({
+        reason: 'pre-install',
+        label: 'Before reinstall or repair',
+        root: targetInspection.containerRoot
+      }).catch(e => {
+        log(`Safety snapshot warning: ${e.message}`);
+        return null;
+      });
+      if (preInstallSnapshot) {
+        log(`Existing installation snapshot ${preInstallSnapshot.id} saved before changes.`);
+      }
+    }
+
     await ensurePlanDirectories(plan);
 
     phase('write-configuration');
-    const existing = readSettings();
-    if (!plan.defaults.adminPassword && existing.defaults?.adminPassword) {
+    const reuseExisting = targetInspection.exists && plan.existingData === 'reuse';
+    const existing = reuseExisting ? readSettings(targetInspection.dataRoot) : {};
+    if (reuseExisting && !plan.defaults.adminPassword && existing.defaults?.adminPassword) {
       plan.defaults.adminPassword = existing.defaults.adminPassword;
     }
     const installationId = readInstallation()?.id || `dok-${Date.now().toString(36)}-${randomSecret(3)}`;
@@ -663,7 +729,7 @@ async function runInstall(plan) {
         ...fresh.defaults,
         ...existing.defaults,
         ...plan.defaults,
-        storageRoot: dokStorageRoot(plan.defaults.dataLocation)
+        storageRoot: targetInspection.storageRoot || dokStorageRoot(plan.defaults.dataLocation)
       },
       designer: { ...fresh.designer, ...(existing.designer || {}) },
       installation: {
@@ -716,18 +782,56 @@ async function runInstall(plan) {
       await docker(['stop', DOK_CONTAINER], { timeout: 120000 }).catch(() => {});
       log('Stopped the existing Dok container before moving its persistent data.');
     }
-    const storage = await relocateDokStorage(plan, log);
+    const storage = await relocateDokStorage(plan, log, { existingData: plan.existingData });
     const storageData = path.join(storage.containerRoot, 'data');
     const storageCore = path.join(storage.containerRoot, 'core');
-    log(`Dok persistent data root: ${storage.hostRoot}`);
+    // Settings are re-encrypted with the destination installation's own
+    // credential key. Existing app directories and app data were preserved by
+    // the storage merge above; only settings/config/secrets are replaced here.
+    const replaceConfiguration = plan.existingData === 'overwrite';
+    writeSettings(settings, storageData);
+    if (plan.registries.length || replaceConfiguration) {
+      writeRegistriesFromPlan(plan, storageData, { replace: replaceConfiguration });
+    }
+    if (replaceConfiguration) {
+      // Authentication and DNS configuration belong to the configurable
+      // category and were explicitly replaced by the user. App groups, app
+      // libraries, app data, sources, uploads, and backups remain untouched.
+      writeJson(path.join(storageData, 'auth.json'), { enabled: false, users: [] });
+      writeJson(path.join(storageData, 'dns.json'), { enabled: false, provider: 'technitium', url: '', token: '' });
+    }
+    for (const [file, value] of [
+      ['registry.json', []],
+      ['groups.json', { groups: [] }],
+      ['auth.json', { enabled: false, users: [] }],
+      ['dns.json', { enabled: false, provider: 'technitium', url: '', token: '' }]
+    ]) {
+      if (!fs.existsSync(path.join(storageData, file))) writeJson(path.join(storageData, file), value);
+    }
+    chownTree(storageData);
+    chownDokPath(path.join(storageData, '.credentials-key'));
+    // Keep the Maintenance token that setup.sh printed and this browser is
+    // using. Otherwise a reinstall leaves the relocated container reading an
+    // older token from the existing data directory and the UI locks itself out.
+    try {
+      const currentToken = fs.readFileSync(tokenPath, 'utf-8').trim();
+      if (currentToken) {
+        writePrivateFile(path.join(storageData, '.maintenance-token'), `${currentToken}\n`);
+        chownDokPath(path.join(storageData, '.maintenance-token'));
+      }
+    } catch (e) {
+      log(`Maintenance token handoff warning: ${e.message}`);
+    }
+    log(`Dok persistent data root: ${storage.hostRoot}${storage.inspected?.legacyLayout ? ' (existing data-location layout adopted)' : ''}`);
 
     phase('launch-dok');
     const out = await launchDok({ build: true });
     log((out.stdout || '').trim().slice(-4000) || 'Dok image built and container started.');
 
-    phase('wait-for-dok');
-    await waitForDok(300000);
-    log(`Dok is healthy at http://${DOK_CONTAINER}:${DOK_PORT}.`);
+    phase('verify-dok');
+    const verification = await verifyDokInstallation({ timeoutMs: 300000, dataRoot: storageData });
+    if (!verification.ok) throw new Error(`Dok started but failed verification: ${verification.error}`);
+    log(`Dok verified at http://${DOK_CONTAINER}:${DOK_PORT} (${verification.checks.map(item => item.name).join(', ')}).`);
 
     let serviceResults = [];
     if (plan.type === 'core') {
@@ -736,6 +840,11 @@ async function runInstall(plan) {
     } else {
       log('Standalone installation selected; core service configuration skipped.');
     }
+
+    phase('verify-installation');
+    const finalVerification = await verifyDokInstallation({ timeoutMs: 120000, dataRoot: storageData });
+    if (!finalVerification.ok) throw new Error(`Installation verification failed: ${finalVerification.error}`);
+    log('Dok API, UI, settings, Docker access, and installation state verified.');
 
     phase('record-snapshot');
     try { writeInstallationCompose({ dataRoot: storageData }); } catch (e) { log(`Installation compose warning: ${e.message}`); }
@@ -834,6 +943,9 @@ async function runInstall(plan) {
       services: serviceResults,
       warnings: failures,
       snapshot: snapshot ? snapshot.id : '',
+      preInstallSnapshot: preInstallSnapshot ? preInstallSnapshot.id : '',
+      storageRoot: storage.hostRoot,
+      storageLayout: storage.inspected?.layout || '',
       opencodePrompt,
       message: resultMessage
     };
@@ -880,6 +992,21 @@ app.post('/api/install/run', api(async (req, res) => {
   if (installJob?.running) return res.status(409).json({ error: 'An installation is already running', job: jobSnapshot(installJob) });
   const plan = normalizeInstallPlan(req.body || {});
   const issues = validateInstallPlan(plan);
+  const inspection = plan.defaults.dataLocation ? inspectDokStorage(plan.defaults.dataLocation) : null;
+  if (inspection?.exists && !plan.existingData) {
+    return res.status(409).json({
+      error: 'An existing Dok installation was found in this data location. Choose whether to reuse or replace its settings.',
+      needsExistingDataDecision: true,
+      existingData: inspection
+    });
+  }
+  if (inspection?.exists && plan.existingData === 'reuse' &&
+      (inspection.invalidFiles || []).some(problem => /^settings\.json\b/.test(problem))) {
+    return res.status(400).json({
+      error: 'The existing settings cannot be reused because they are invalid. Choose Replace settings or restore a backup first.',
+      existingData: inspection
+    });
+  }
   if (issues.length) return res.status(400).json({ error: issues.join(' '), issues });
   installJob = {
     running: true,
@@ -904,8 +1031,9 @@ app.post('/api/install/reinstall', api(async (req, res) => {
   const snapshots = listSnapshots();
   const target = id ? snapshots.find(item => item.id === id) : snapshots[0];
   if (!target) return res.status(404).json({ error: 'No installation snapshot is available for an exact reinstall. Create a backup first.' });
-  const result = await restoreArchive(target.archive, { overwrite: true, restart: true });
-  await waitForDok(300000).catch(() => {});
+  const result = await restoreArchive(target.archive, { overwrite: true, restart: true, preserveApps: true });
+  const verification = await verifyDokInstallation({ timeoutMs: 300000 });
+  if (!verification.ok) throw new Error(`Exact reinstall restored files, but Dok failed verification: ${verification.error}`);
   const start = await dokApi('/api/core/all/start', { method: 'POST', body: {} }).catch(e => ({ error: e.message }));
   refreshInstallationState();
   saveInstallation({ completedAt: new Date().toISOString(), reinstall: { snapshot: target.id, at: new Date().toISOString() }, summary: installationSummary() });
@@ -1194,7 +1322,9 @@ async function runUpdate({ repo = '', branch = '', force = false }) {
     log(`Recreating Dok from the ${ctx.managed ? 'managed' : 'root'} compose...`);
     await run('docker', [...composeArgs, 'up', '-d', '--force-recreate', '--remove-orphans'], { cwd: ctx.dir, timeout: 0 });
     job.phase = 'waiting';
-    await waitForDok(300000).catch(() => {});
+    const verification = await verifyDokInstallation({ timeoutMs: 300000 });
+    if (!verification.ok) throw new Error(`Update recreated Dok, but verification failed: ${verification.error}`);
+    log('Dok API, settings, Docker access, and installation state verified after update.');
     try { await dokApi('/api/installation/sync', { method: 'POST', body: { snapshot: true }, timeout: 120000 }); } catch {}
     // The update rebuilt the shared image. Recreate the Maintenance container
     // after this request finishes so its next start uses the new image.

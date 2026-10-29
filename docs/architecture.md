@@ -21,6 +21,16 @@ Load this file for startup/setup work, storage layout, networking, file handling
 
 Dok's persistent data root is `<data location>/Dok` and is required during installation. It contains `data`, `apps`, `core`, `sources`, `uploads`, and `maintenance`; app runtime data remains `<data location>/apps/<app>/data`. Before an installation the storage root is the checkout. Maintenance storage starts at `<checkout>-maintenance-data` (or `MAINTENANCE_DATA_PATH` / `setup.sh --maintenance-data`) and moves to `<data location>/Dok/maintenance` during installation.
 
+The installer also detects older installations that used the selected data location itself as the storage root (with `data/`, `apps/`, `core/`, and `sources/` directly inside it). It reports what it found before writing anything, adopts the folder that contains the newest complete installation instead of creating an empty `Dok` folder beside it, and leaves any alternate layout untouched. Detection never treats the source checkout, an unrelated `apps/` folder, or a bare maintenance token as a previous installation.
+
+Persistent state is handled in three protection categories:
+
+1. **Replaceable** — generated Dok compose files, temporary files, and logs. These can be regenerated on install, repair, or update.
+2. **Configurable** — `data/settings.json`, `data/registries.json`, `data/auth.json`, `data/dns.json`, `.credentials-key`, and core service configuration. On reinstall the user chooses **Reuse existing settings** or **Replace settings**; only the replace path rewrites these files. Reuse keeps existing credentials/secrets and merges the wizard values.
+3. **User data** — the app library (`apps/` plus `data/registry.json`), app runtime data under `<data location>/apps`, app groups, `sources/`, `uploads/`, and Maintenance backups/snapshots. These are never overwritten or deleted by installation, repair, update, or restore; only the user removes them manually.
+
+Before a reinstall or repair changes an existing storage root, Maintenance records a `pre-install` snapshot (best effort) so the previous state can be restored. Installation verifies the Dok container, API, HTML UI, stored settings, app-library JSON, credential key, Docker access, and installation state before it reports completion.
+
 ## Network
 
 - Default network is `wicked` (bridge), declared external in root `docker-compose.yml` and created by `setup.sh` or `start.sh`

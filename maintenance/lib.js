@@ -202,22 +202,23 @@ export function projectName(value, fallback = 'app') {
 }
 
 // ---------- credential encryption ----------
-const credentialsKeyPath = path.join(dataDir, '.credentials-key');
+export const credentialsKeyPath = path.join(dataDir, '.credentials-key');
 
-export function credentialsKey({ create = true } = {}) {
+export function credentialsKey({ create = true, root = dataDir } = {}) {
+  const keyPath = path.join(root, '.credentials-key');
   try {
-    if (fs.existsSync(credentialsKeyPath)) {
-      const key = fs.readFileSync(credentialsKeyPath);
+    if (fs.existsSync(keyPath)) {
+      const key = fs.readFileSync(keyPath);
       if (key.length === 32) return key;
       if (!create) return null;
-      const backup = `${credentialsKeyPath}.invalid-${Date.now()}`;
-      fs.copyFileSync(credentialsKeyPath, backup);
+      const backup = `${keyPath}.invalid-${Date.now()}`;
+      fs.copyFileSync(keyPath, backup);
       fs.chmodSync(backup, 0o600);
     }
   } catch {}
   if (!create) return null;
   const key = crypto.randomBytes(32);
-  writePrivateFile(credentialsKeyPath, key);
+  writePrivateFile(keyPath, key);
   return key;
 }
 
@@ -228,22 +229,22 @@ export function isStoredSecret(value) {
     parts.slice(1).every(part => /^[A-Za-z0-9+/=]+$/.test(part));
 }
 
-export function encryptSecret(plain) {
+export function encryptSecret(plain, root = dataDir) {
   const text = String(plain ?? '');
   if (!text) return '';
   if (isStoredSecret(text)) return text;
   const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', credentialsKey(), iv);
+  const cipher = crypto.createCipheriv('aes-256-gcm', credentialsKey({ root }), iv);
   const encrypted = Buffer.concat([cipher.update(text, 'utf8'), cipher.final()]);
   return `v1:${iv.toString('base64')}:${cipher.getAuthTag().toString('base64')}:${encrypted.toString('base64')}`;
 }
 
-export function decryptSecret(value) {
+export function decryptSecret(value, root = dataDir) {
   const text = String(value ?? '');
   if (!text.startsWith('v1:')) return text;
   const [, iv, tag, payload] = text.split(':');
   if (!iv || !tag || !payload) throw new Error('Malformed stored credential');
-  const decipher = crypto.createDecipheriv('aes-256-gcm', credentialsKey(), Buffer.from(iv, 'base64'));
+  const decipher = crypto.createDecipheriv('aes-256-gcm', credentialsKey({ root }), Buffer.from(iv, 'base64'));
   decipher.setAuthTag(Buffer.from(tag, 'base64'));
   return Buffer.concat([decipher.update(Buffer.from(payload, 'base64')), decipher.final()]).toString('utf8');
 }
@@ -286,17 +287,17 @@ export function readSettings(root = dataDir) {
   const raw = readJson(path.join(root, 'settings.json'), {}) || {};
   return mapSettingsSecrets(JSON.parse(JSON.stringify(raw)), value => {
     if (!isStoredSecret(value)) return value;
-    try { return decryptSecret(value); } catch { return ''; }
+    try { return decryptSecret(value, root); } catch { return ''; }
   });
 }
 
-export function encryptSettings(settings) {
+export function encryptSettings(settings, root = dataDir) {
   const clone = JSON.parse(JSON.stringify(settings || {}));
-  return mapSettingsSecrets(clone, value => isStoredSecret(value) ? value : encryptSecret(value));
+  return mapSettingsSecrets(clone, value => isStoredSecret(value) ? value : encryptSecret(value, root));
 }
 
-export function writeSettings(settings) {
-  writeJson(path.join(dataDir, 'settings.json'), encryptSettings(settings));
+export function writeSettings(settings, root = dataDir) {
+  writeJson(path.join(root, 'settings.json'), encryptSettings(settings, root));
   return settings;
 }
 
@@ -306,8 +307,8 @@ export function readRegistries(root = dataDir) {
   return data;
 }
 
-export function writeRegistries(data) {
-  return writeJson(path.join(dataDir, 'registries.json'), data || { connections: [] });
+export function writeRegistries(data, root = dataDir) {
+  return writeJson(path.join(root, 'registries.json'), data || { connections: [] });
 }
 
 export function readRegistry(root = dataDir) {
@@ -535,6 +536,87 @@ export async function waitForDok(timeoutMs = 180000) {
   throw new Error(`Dok did not become ready: ${lastError}`);
 }
 
+export async function verifyDokInstallation({ timeoutMs = 300000, dataRoot = dataDir } = {}) {
+  await waitForDok(timeoutMs);
+  const checks = [];
+  const check = async (name, pathname, validate) => {
+    try {
+      const data = await dokApi(pathname, { timeout: 15000 });
+      const ok = validate ? validate(data) : true;
+      checks.push({ name, ok, detail: ok ? 'OK' : `Unexpected response from ${pathname}` });
+      return ok;
+    } catch (e) {
+      checks.push({ name, ok: false, detail: e.message });
+      return false;
+    }
+  };
+  const checkPage = async (name, pathname, validate) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    try {
+      const url = `http://${DOK_CONTAINER}:${DOK_PORT}${pathname}`;
+      const response = await fetch(url, { signal: controller.signal });
+      const text = await response.text();
+      const ok = response.ok && !!text && validate(text, response);
+      checks.push({ name, ok, detail: ok ? 'OK' : `Unexpected response from ${pathname}` });
+      return ok;
+    } catch (e) {
+      checks.push({ name, ok: false, detail: e.message });
+      return false;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  let containerOk = false;
+  try {
+    const info = await dockerInspect();
+    containerOk = info?.State?.Running === true;
+    checks.push({ name: 'Dok container', ok: containerOk, detail: containerOk ? `Running ${info.Id?.slice(0, 12) || ''}`.trim() : 'Dok container is not running' });
+  } catch (e) {
+    checks.push({ name: 'Dok container', ok: false, detail: e.message });
+  }
+  const health = await check('Dok API health', '/api/health', data => data?.ok === true);
+  const settings = await check('Settings API', '/api/settings', data => !!data && typeof data === 'object');
+  const containers = await check('Docker API', '/api/containers', data => Array.isArray(data) || Array.isArray(data?.containers));
+  const installation = await check('Installation API', '/api/installation', data => data?.ok === true);
+  const registry = await check('App library API', '/api/registry', data => Array.isArray(data));
+  // A healthy API is not enough: the user opens the HTML UI. Verify that the
+  // static frontend is actually served so an install cannot finish with a
+  // working API and a blank or error page.
+  const ui = await checkPage('Dok web UI', '/', text => /<html[\s>]/i.test(text) && /<body[\s>]/i.test(text));
+  let storageOk = true;
+  if (dataRoot) {
+    let settingsFileOk = false;
+    let settingsDetail = `${path.join(dataRoot, 'settings.json')} is missing or invalid`;
+    try {
+      const raw = JSON.parse(fs.readFileSync(path.join(dataRoot, 'settings.json'), 'utf-8'));
+      settingsFileOk = !!raw && typeof raw === 'object' && !Array.isArray(raw);
+      if (settingsFileOk) settingsDetail = 'settings.json is readable';
+    } catch (e) { settingsDetail = e.message; }
+    checks.push({ name: 'Stored settings', ok: settingsFileOk, detail: settingsDetail });
+    storageOk = storageOk && settingsFileOk;
+    let libraryOk = false;
+    let libraryDetail = `${path.join(dataRoot, 'registry.json')} is missing or invalid`;
+    try {
+      const raw = JSON.parse(fs.readFileSync(path.join(dataRoot, 'registry.json'), 'utf-8'));
+      libraryOk = Array.isArray(raw);
+      if (libraryOk) libraryDetail = `${raw.length} app record(s)`;
+    } catch (e) { libraryDetail = e.message; }
+    checks.push({ name: 'Stored app library', ok: libraryOk, detail: libraryDetail });
+    storageOk = storageOk && libraryOk;
+    const key = credentialsKey({ create: false, root: dataRoot });
+    checks.push({ name: 'Credential key', ok: !!key, detail: key ? 'Encryption key present' : 'data/.credentials-key is missing' });
+    storageOk = storageOk && !!key;
+  }
+  const ok = containerOk && health && settings && containers && installation && registry && ui && storageOk;
+  const failures = checks.filter(item => !item.ok);
+  return {
+    ok,
+    checks,
+    error: ok ? '' : failures.map(item => `${item.name}: ${item.detail}`).join('; ')
+  };
+}
+
 // ---------- maintenance auth token ----------
 export function maintenanceToken({ create = false } = {}) {
   try {
@@ -708,10 +790,11 @@ export function normalizeInstallPlan(body = {}) {
   const registries = Array.isArray(body.registries) ? body.registries : [];
   const plan = {
     type,
+    existingData: body.existingData === 'overwrite' || body.existingData === 'reuse' ? body.existingData : '',
     defaults: {
       primaryDomain: normalizeDomain(defaults.primaryDomain || body.primaryDomain || '').toLowerCase(),
       dokDomain: normalizeDomain(defaults.dokDomain || '').toLowerCase(),
-      dataLocation: String(defaults.dataLocation || '').trim(),
+      dataLocation: normalizeDokDataLocation(defaults.dataLocation || ''),
       dataMode: String(defaults.dataMode || '0775').trim(),
       allowOutsideData: defaults.allowOutsideData !== false,
       autoAppData: defaults.autoAppData !== false,
@@ -910,8 +993,8 @@ export function baseSettings(plan) {
   };
 }
 
-export function writeRegistriesFromPlan(plan) {
-  const existing = readRegistries();
+export function writeRegistriesFromPlan(plan, root = dataDir, { replace = false } = {}) {
+  const existing = replace ? { connections: [] } : readRegistries(root);
   const byKey = new Map(existing.connections.map(item => [`${item.kind}:${item.host}:${item.username}`, item]));
   const connections = [];
   for (const item of plan.registries || []) {
@@ -926,12 +1009,12 @@ export function writeRegistriesFromPlan(plan) {
       name: item.name || host,
       host,
       username: item.username || '',
-      secretEnc: item.secret ? encryptSecret(item.secret) : (previous?.secretEnc || ''),
+      secretEnc: item.secret ? encryptSecret(item.secret, root) : (previous?.secretEnc || ''),
       created: previous?.created || new Date().toISOString(),
       updated: new Date().toISOString()
     });
   }
-  writeRegistries({ connections });
+  writeRegistries({ connections }, root);
   return connections;
 }
 
@@ -946,11 +1029,268 @@ export function hostVisiblePath(target) {
 
 // The installer keeps every Dok-owned persistent directory under a single
 // "Dok" folder inside the user's data location. App runtime data stays at
-// <data location>/apps/<app>/data; Dok's own state lives here.
+// <data location>/apps/<app>/data; Dok's own state lives here. Older installs
+// used the data location itself as the storage root, so detection must support
+// both layouts and never assume the current one is the only possibility.
 export function dokStorageRoot(dataLocation) {
   const location = String(dataLocation || '').trim();
   if (!path.isAbsolute(location)) return '';
   return path.join(path.resolve(location), 'Dok');
+}
+
+function childDirectoryNames(dir) {
+  try {
+    return fs.readdirSync(dir, { withFileTypes: true })
+      .filter(entry => entry.isDirectory() && !entry.name.startsWith('.') && entry.name !== 'node_modules')
+      .map(entry => entry.name)
+      .sort((a, b) => a.localeCompare(b));
+  } catch {
+    return [];
+  }
+}
+
+function samePath(a, b) {
+  try { return path.resolve(a) === path.resolve(b); } catch { return false; }
+}
+
+// Dok state is split into three protection categories:
+//   1. replaceable: generated compose files, temporary files, and logs
+//   2. configurable: settings, credentials, secrets, and service configuration
+//   3. user data: app library, app directories, app runtime data, sources,
+//      uploads, groups, and maintenance backups/snapshots
+// Only category 2 is ever replaced, and only after the user confirms it.
+const STORAGE_CONFIG_FILES = ['settings.json', 'registries.json', 'auth.json', 'dns.json', '.credentials-key'];
+const STORAGE_LIBRARY_FILES = ['registry.json'];
+const STORAGE_STATE_FILES = ['installation.json', 'installation-state.json'];
+const STORAGE_DATA_FILES = [...STORAGE_CONFIG_FILES, ...STORAGE_LIBRARY_FILES, ...STORAGE_STATE_FILES];
+
+function parseProblem(file, validator = () => true) {
+  try {
+    const value = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    return validator(value) ? '' : 'is not valid JSON for this file';
+  } catch (e) {
+    return e.code === 'ENOENT' ? '' : e.message;
+  }
+}
+
+function inspectStorageRoot(root, dataLocation, { requireDataEvidence = false } = {}) {
+  const containerRoot = hostVisiblePath(root);
+  const directories = {
+    data: path.join(containerRoot, 'data'),
+    apps: path.join(containerRoot, 'apps'),
+    core: path.join(containerRoot, 'core'),
+    sources: path.join(containerRoot, 'sources'),
+    uploads: path.join(containerRoot, 'uploads'),
+    maintenance: path.join(containerRoot, 'maintenance')
+  };
+  const dataFiles = STORAGE_DATA_FILES.filter(name => fs.existsSync(path.join(directories.data, name)));
+  const settingsFiles = STORAGE_CONFIG_FILES.filter(name => fs.existsSync(path.join(directories.data, name)));
+  const appLibraryFiles = STORAGE_LIBRARY_FILES.filter(name => fs.existsSync(path.join(directories.data, name)));
+  const appNames = childDirectoryNames(directories.apps);
+  const coreServices = childDirectoryNames(directories.core);
+  const sourceNames = childDirectoryNames(directories.sources);
+  const uploadNames = childDirectoryNames(directories.uploads);
+  const appRuntimeRoot = path.join(hostVisiblePath(dataLocation), 'apps');
+  const appRuntimeNames = samePath(appRuntimeRoot, directories.apps)
+    ? appNames
+    : childDirectoryNames(appRuntimeRoot);
+  let storagePresent = false;
+  try { storagePresent = fs.statSync(containerRoot).isDirectory(); } catch {}
+  const installation = readJson(path.join(directories.data, 'installation.json'), null) ||
+    readJson(path.join(directories.maintenance, 'installation.json'), null);
+  const state = readJson(path.join(directories.data, 'installation-state.json'), null) ||
+    readJson(path.join(directories.maintenance, 'installation-state.json'), null);
+  const invalidFiles = [];
+  for (const [name, validator] of [
+    ['settings.json', value => value && typeof value === 'object' && !Array.isArray(value)],
+    ['registries.json', value => value && typeof value === 'object' && Array.isArray(value.connections)],
+    ['registry.json', value => Array.isArray(value)],
+    ['groups.json', value => value && typeof value === 'object' && Array.isArray(value.groups)],
+    ['auth.json', value => value && typeof value === 'object'],
+    ['dns.json', value => value && typeof value === 'object']
+  ]) {
+    const file = path.join(directories.data, name);
+    const problem = parseProblem(file, validator);
+    if (problem) invalidFiles.push(`${name} ${problem}`);
+  }
+  // A bare token or log directory is not an installation. Require evidence of
+  // real Dok state so an unrelated directory is not mistaken for user data.
+  // For a direct data-location layout, also require Dok's own data files: an
+  // unrelated /srv/apps folder must not turn /srv into a previous install.
+  const directoryEvidence = [appNames.length, coreServices.length, sourceNames.length, uploadNames.length].filter(Boolean).length;
+  const exists = requireDataEvidence
+    ? !!(dataFiles.length || installation || directoryEvidence >= 2 ||
+      fs.existsSync(path.join(directories.maintenance, 'installation.json')))
+    : !!(dataFiles.length || directoryEvidence || installation || fs.existsSync(path.join(directories.maintenance, 'installation.json')));
+  return {
+    root,
+    containerRoot,
+    storagePresent,
+    dataRoot: directories.data,
+    appsRoot: directories.apps,
+    coreRoot: directories.core,
+    sourcesRoot: directories.sources,
+    uploadsRoot: directories.uploads,
+    maintenanceRoot: directories.maintenance,
+    appRuntimeRoot,
+    dataFiles,
+    settingsFiles,
+    appLibraryFiles,
+    apps: appNames.slice(0, 100),
+    appCount: appNames.length,
+    appRuntime: appRuntimeNames.slice(0, 100),
+    appRuntimeCount: appRuntimeNames.length,
+    coreServices: coreServices.slice(0, 100),
+    coreServiceCount: coreServices.length,
+    sources: sourceNames.slice(0, 100),
+    sourceCount: sourceNames.length,
+    uploads: uploadNames.slice(0, 100),
+    uploadCount: uploadNames.length,
+    installation: installation && typeof installation === 'object' ? {
+      id: installation.id || '',
+      type: installation.type || '',
+      completedAt: installation.completedAt || '',
+      created: installation.created || '',
+      updated: installation.updated || ''
+    } : null,
+    summary: state?.summary || installation?.summary || null,
+    invalidFiles,
+    exists
+  };
+}
+
+function installationTimestamp(inspection) {
+  const candidates = [inspection?.installation?.completedAt, inspection?.installation?.updated, inspection?.summary?.updated];
+  for (const value of candidates) {
+    const time = Date.parse(String(value || ''));
+    if (Number.isFinite(time)) return time;
+  }
+  return 0;
+}
+
+// Chooses the storage root to use. Existing data wins over creating a new
+// empty folder: preferably the documented <location>/Dok layout, but a legacy
+// installation that used <location> directly is adopted instead of being
+// silently ignored and replaced with an empty directory.
+function chooseStorageRoot(canonical, direct) {
+  const candidates = [canonical, direct].filter(Boolean);
+  const existing = candidates.filter(item => item.exists);
+  if (!existing.length) return canonical;
+  if (existing.length === 1) return existing[0];
+  const canonicalTime = installationTimestamp(canonical);
+  const directTime = installationTimestamp(direct);
+  if (canonicalTime !== directTime) return canonicalTime > directTime ? canonical : direct;
+  if (!!canonical.installation !== !!direct.installation) return canonical.installation ? canonical : direct;
+  const rank = item => (item.settingsFiles.length * 100) + (item.appCount * 10) + item.coreServiceCount;
+  return rank(direct) > rank(canonical) ? direct : canonical;
+}
+
+// The UI asks for the data location, but users often paste the actual storage
+// folder (for example /srv/dok/Dok) shown by an earlier install. When that
+// folder is itself a complete Dok storage root, its parent is the correct data
+// location: the canonical root and the app runtime data root then line up again
+// instead of creating a second "Dok/Dok" folder or orphaning app data.
+export function normalizeDokDataLocation(dataLocation) {
+  const location = String(dataLocation || '').trim();
+  if (!path.isAbsolute(location)) return location;
+  const resolved = path.resolve(location);
+  if (path.basename(resolved) !== 'Dok') return location;
+  const inspection = inspectStorageRoot(resolved, resolved);
+  if (!inspection.exists) return location;
+  const parent = path.dirname(resolved);
+
+  // Prefer the location Dok itself recorded. This distinguishes an actual
+  // canonical storage folder from a legacy installation that happens to use a
+  // folder named "Dok" as its data location.
+  const settings = readJson(path.join(inspection.dataRoot, 'settings.json'), null);
+  const stored = settings?.defaults?.dataLocation;
+  if (stored && path.isAbsolute(stored)) {
+    if (stored === resolved || samePath(stored, resolved)) return location;
+    if (stored === parent || samePath(stored, parent)) return parent;
+  }
+
+  // Canonical installs always create <dataLocation>/apps for app runtime data,
+  // while the Dok storage folder has its own apps directory for the library.
+  if (fs.existsSync(path.join(parent, 'apps'))) return parent;
+  if (fs.existsSync(inspection.appsRoot)) return location;
+  return parent;
+}
+
+// Inspects the storage root the installer is about to use. This must never
+// create anything: the UI uses it before the user has confirmed how an
+// existing installation should be handled.
+export function inspectDokStorage(dataLocation) {
+  const location = String(dataLocation || '').trim();
+  const canonicalRoot = dokStorageRoot(location);
+  if (!canonicalRoot) return { valid: false, exists: false, dataLocation: location };
+  const canonical = inspectStorageRoot(canonicalRoot, location);
+  const directRoot = path.resolve(location);
+  // Never treat the source checkout as a previous installation just because a
+  // development run left data/apps directories in it.
+  const directEligible = !samePath(directRoot, DOK_SOURCE_ROOT) && !samePath(directRoot, DOK_HOST_PATH);
+  const direct = directEligible ? inspectStorageRoot(directRoot, location, { requireDataEvidence: true }) : null;
+  const chosen = chooseStorageRoot(canonical, direct);
+  const layout = samePath(chosen.root, directRoot) ? 'direct' : 'dok-subfolder';
+  const bothLayouts = !!(canonical.exists && direct?.exists && !samePath(canonical.root, direct.root));
+  return {
+    valid: true,
+    exists: !!chosen.exists,
+    storagePresent: !!chosen.storagePresent,
+    dataLocation: location,
+    storageRoot: chosen.root,
+    containerRoot: chosen.containerRoot,
+    layout,
+    legacyLayout: layout === 'direct',
+    bothLayouts,
+    canonical: {
+      storageRoot: canonical.root,
+      exists: canonical.exists,
+      appCount: canonical.appCount,
+      appRuntimeCount: canonical.appRuntimeCount,
+      settingsFiles: canonical.settingsFiles
+    },
+    direct: direct ? {
+      storageRoot: direct.root,
+      exists: direct.exists,
+      appCount: direct.appCount,
+      appRuntimeCount: direct.appRuntimeCount,
+      settingsFiles: direct.settingsFiles
+    } : null,
+    dataRoot: chosen.dataRoot,
+    appsRoot: chosen.appsRoot,
+    appRuntimeRoot: chosen.appRuntimeRoot,
+    coreRoot: chosen.coreRoot,
+    sourcesRoot: chosen.sourcesRoot,
+    uploadsRoot: chosen.uploadsRoot,
+    maintenanceRoot: chosen.maintenanceRoot,
+    dataFiles: chosen.dataFiles,
+    settingsFiles: chosen.settingsFiles,
+    appLibraryFiles: chosen.appLibraryFiles,
+    apps: chosen.apps,
+    appCount: chosen.appCount,
+    appRuntime: chosen.appRuntime,
+    appRuntimeCount: chosen.appRuntimeCount,
+    coreServices: chosen.coreServices,
+    coreServiceCount: chosen.coreServiceCount,
+    sources: chosen.sources,
+    sourceCount: chosen.sourceCount,
+    uploads: chosen.uploads,
+    uploadCount: chosen.uploadCount,
+    installation: chosen.installation,
+    summary: chosen.summary,
+    invalidFiles: chosen.invalidFiles,
+    categories: {
+      replaceable: ['Generated Dok compose files', 'Temporary files', 'Log files'],
+      configurable: chosen.settingsFiles,
+      appLibrary: chosen.apps,
+      appLibraryIndex: chosen.appLibraryFiles,
+      appData: chosen.appRuntime.slice(0, 100),
+      appDataCount: chosen.appRuntimeCount,
+      sources: chosen.sources,
+      uploads: chosen.uploads.slice(0, 100),
+      maintenance: chosen.exists ? path.join(chosen.root, 'maintenance') : ''
+    }
+  };
 }
 
 function writeEnvFile(file, values) {
@@ -976,20 +1316,23 @@ function writeEnvFile(file, values) {
   writePrivateFile(file, text, { mode: 0o600 });
 }
 
-function copyTree(source, target) {
+function copyTree(source, target, { overwrite = true, excludeTopLevel = [] } = {}) {
   if (!fs.existsSync(source)) return;
   const resolvedSource = path.resolve(source);
   const resolvedTarget = path.resolve(target);
   if (resolvedSource === resolvedTarget) return;
+  const excluded = new Set(excludeTopLevel);
   fs.mkdirSync(resolvedTarget, { recursive: true });
   fs.cpSync(resolvedSource, resolvedTarget, {
     recursive: true,
-    force: true,
+    force: overwrite,
     errorOnExist: false,
     filter: entry => {
       const name = path.basename(entry);
       if (name === 'node_modules' || name === '.git') return false;
       if (name.startsWith('.preview-')) return false;
+      const relative = path.relative(resolvedSource, entry);
+      if (relative && excluded.has(relative.split(path.sep)[0])) return false;
       try {
         const stat = fs.lstatSync(entry);
         if (stat.isSocket() || stat.isFIFO() || stat.isBlockDevice() || stat.isCharacterDevice()) return false;
@@ -1002,9 +1345,10 @@ function copyTree(source, target) {
 // Copy the live checkout data into the selected storage root, write the
 // compose environment, and drop the generated managed compose so the root
 // compose (which now points at the storage root) is used on the next launch.
-export async function relocateDokStorage(plan, log = () => {}) {
+export async function relocateDokStorage(plan, log = () => {}, { existingData = '' } = {}) {
   const defaults = plan.defaults || {};
-  const hostRoot = dokStorageRoot(defaults.dataLocation);
+  const inspected = inspectDokStorage(defaults.dataLocation);
+  const hostRoot = inspected.storageRoot || dokStorageRoot(defaults.dataLocation);
   if (!hostRoot) throw new Error('A persistent data location is required before Dok can store its data.');
   const containerRoot = hostVisiblePath(hostRoot);
   const mode = parseInt(String(defaults.dataMode || '0775').replace(/^0o/i, ''), 8);
@@ -1014,18 +1358,38 @@ export async function relocateDokStorage(plan, log = () => {}) {
     try { if (Number.isInteger(mode)) fs.chmodSync(dir, mode); } catch {}
     chownDokPath(dir);
   }
+  if (inspected.legacyLayout) {
+    log(`Existing Dok data found directly in ${hostRoot}; continuing to use that folder (no data was moved).`);
+  }
+  const existingRoot = inspected.exists && existingData !== 'overwrite';
+  // When the destination already has Dok state, its settings, encrypted
+  // credentials, auth, and DNS configuration are authoritative. Copying the
+  // checkout's matching files would mix encryption keys and could make the
+  // existing secrets unreadable.
+  const destinationConfig = inspected.exists
+    ? ['settings.json', 'registries.json', 'auth.json', 'dns.json', '.credentials-key', 'installation.json', 'installation-state.json', '.maintenance-token']
+    : [];
   for (const name of ['data', 'apps', 'core', 'sources', 'uploads']) {
     const source = path.join(DOK_ROOT, name);
     const target = path.join(containerRoot, name);
-    copyTree(source, target);
+    // App code, app data, project sources, and existing settings are user data.
+    // Core service files may be refreshed, and only when the user explicitly
+    // chose to replace the configuration. Never delete files that the source
+    // does not provide (certificates, app data, uploads, or local edits).
+    const overwrite = name === 'core' && existingData === 'overwrite';
+    copyTree(source, target, {
+      overwrite,
+      excludeTopLevel: name === 'data' ? destinationConfig : []
+    });
     chownTree(target);
-    log(`Migrated ${name} to ${hostRoot}`);
+    const protection = existingRoot ? ' (existing files preserved)' : (existingData === 'overwrite' ? ' (replaceable files refreshed)' : '');
+    log(`Prepared ${name} at ${path.join(hostRoot, name)}${protection}`);
   }
   const maintTarget = path.join(containerRoot, 'maintenance');
   if (path.resolve(MAINT_DATA) !== path.resolve(maintTarget)) {
-    copyTree(MAINT_DATA, maintTarget);
+    copyTree(MAINT_DATA, maintTarget, { overwrite: false });
     chownTree(maintTarget);
-    log(`Migrated maintenance data to ${path.join(hostRoot, 'maintenance')}`);
+    log(`Merged maintenance data into ${path.join(hostRoot, 'maintenance')}`);
   }
   writeEnvFile(path.join(DOK_COMPOSE_ROOT, '.env'), {
     DOK_STORAGE_ROOT: hostRoot,
@@ -1036,7 +1400,7 @@ export async function relocateDokStorage(plan, log = () => {}) {
       try { fs.rmSync(path.join(dir, name), { force: true }); } catch {}
     }
   }
-  return { hostRoot, containerRoot };
+  return { hostRoot, containerRoot, inspected };
 }
 
 export function mirrorMaintenanceData(hostRoot) {
@@ -1052,13 +1416,17 @@ export async function ensurePlanDirectories(plan) {
   const defaults = plan.defaults || {};
   const targets = [dataDir, appsDir, coreDir, sourcesDir, uploadsDir];
   if (defaults.dataLocation) {
+    const inspected = inspectDokStorage(defaults.dataLocation);
+    const storage = inspected.storageRoot || dokStorageRoot(defaults.dataLocation);
     targets.push(defaults.dataLocation);
-    targets.push(path.join(defaults.dataLocation, 'apps'));
-    const storage = dokStorageRoot(defaults.dataLocation);
     targets.push(storage);
     for (const name of ['data', 'apps', 'core', 'sources', 'uploads', 'maintenance']) {
       targets.push(path.join(storage, name));
     }
+    // Keep the app runtime data root separate from the Dok storage root in the
+    // documented layout, but avoid creating an unused Dok folder when an
+    // existing installation uses the data location directly.
+    if (!inspected.legacyLayout) targets.push(path.join(defaults.dataLocation, 'apps'));
   }
   const mode = parseInt(String(defaults.dataMode || '0775').replace(/^0o/i, ''), 8);
   for (const target of targets) {
@@ -1308,7 +1676,7 @@ export function safeArchiveEntries(entries) {
   }
 }
 
-export async function restoreArchive(archive, { overwrite = false, restart = true } = {}) {
+export async function restoreArchive(archive, { overwrite = false, restart = true, preserveApps = true } = {}) {
   if (!overwrite) {
     const err = new Error('Restoring an archive overwrites the Dok installation files. Confirm to continue.');
     err.status = 409;
@@ -1319,6 +1687,8 @@ export async function restoreArchive(archive, { overwrite = false, restart = tru
   const entries = String(list.stdout || '').split('\n').filter(Boolean);
   safeArchiveEntries(entries);
   const topLevel = new Set(entries.map(entry => entry.replace(/^\.?\//, '').split('/')[0]).filter(Boolean));
+  const preservedRegistry = preserveApps ? readRegistry() : [];
+  const preservedGroups = preserveApps ? readJson(path.join(dataDir, 'groups.json'), null) : null;
   let preservedToken = '';
   try { preservedToken = fs.readFileSync(tokenPath, 'utf-8').trim(); } catch {}
   let preservedHelperToken = '';
@@ -1345,20 +1715,59 @@ export async function restoreArchive(archive, { overwrite = false, restart = tru
       } catch {}
     }
   }
-  for (const target of ['apps', 'core', 'sources']) {
-    if (!topLevel.has(target)) continue;
-    const dir = path.join(DOK_ROOT, target);
-    try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
-    try { fs.mkdirSync(dir, { recursive: true }); } catch {}
-  }
-  if (topLevel.has('data')) {
-    let names = [];
-    try { names = fs.readdirSync(dataDir); } catch {}
-    for (const name of names.filter(item => !['backups', 'tmp', 'logs', 'docker-config', 'host-helper'].includes(item))) {
-      try { fs.rmSync(path.join(dataDir, name), { recursive: true, force: true }); } catch {}
+  if (preserveApps) {
+    const tempRoot = path.join(MAINT_DATA, 'tmp', `restore-${Date.now()}-${randomSecret(3)}`);
+    try {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+      fs.mkdirSync(tempRoot, { recursive: true });
+      await run('tar', ['-xzf', archive, '-C', tempRoot]);
+      if (topLevel.has('data')) {
+        let names = [];
+        try { names = fs.readdirSync(dataDir); } catch {}
+        for (const name of names.filter(item => !['backups', 'tmp', 'logs', 'docker-config', 'host-helper'].includes(item))) {
+          try { fs.rmSync(path.join(dataDir, name), { recursive: true, force: true }); } catch {}
+        }
+        copyTree(path.join(tempRoot, 'data'), dataDir, { overwrite: true });
+        const restoredRegistry = readJson(path.join(tempRoot, 'data', 'registry.json'), []);
+        const merged = Array.isArray(preservedRegistry) ? [...preservedRegistry] : [];
+        const seen = new Set(merged.map(entry => String(entry?.id || entry?.appDir || entry?.name || entry?.path || '')));
+        for (const entry of Array.isArray(restoredRegistry) ? restoredRegistry : []) {
+          const key = String(entry?.id || entry?.appDir || entry?.name || entry?.path || '');
+          if (key && seen.has(key)) continue;
+          if (key) seen.add(key);
+          merged.push(entry);
+        }
+        writeJson(path.join(dataDir, 'registry.json'), merged);
+        if (preservedGroups) writeJson(path.join(dataDir, 'groups.json'), preservedGroups);
+      }
+      // The app library and every apps/<app> directory are user data. Add apps
+      // that are missing from the restored snapshot, but never overwrite or
+      // delete an app that already exists here.
+      copyTree(path.join(tempRoot, 'apps'), appsDir, { overwrite: false });
+      if (topLevel.has('core')) {
+        try { fs.rmSync(coreDir, { recursive: true, force: true }); } catch {}
+        copyTree(path.join(tempRoot, 'core'), coreDir, { overwrite: true });
+      }
+      copyTree(path.join(tempRoot, 'sources'), sourcesDir, { overwrite: false });
+    } finally {
+      try { fs.rmSync(tempRoot, { recursive: true, force: true }); } catch {}
     }
+  } else {
+    for (const target of ['apps', 'core', 'sources']) {
+      if (!topLevel.has(target)) continue;
+      const dir = path.join(DOK_ROOT, target);
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+      try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+    }
+    if (topLevel.has('data')) {
+      let names = [];
+      try { names = fs.readdirSync(dataDir); } catch {}
+      for (const name of names.filter(item => !['backups', 'tmp', 'logs', 'docker-config', 'host-helper'].includes(item))) {
+        try { fs.rmSync(path.join(dataDir, name), { recursive: true, force: true }); } catch {}
+      }
+    }
+    await run('tar', ['-xzf', archive, '-C', DOK_ROOT]);
   }
-  await run('tar', ['-xzf', archive, '-C', DOK_ROOT]);
   if (preservedToken) {
     try { writePrivateFile(tokenPath, preservedToken); } catch {}
   }
