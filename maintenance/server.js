@@ -1109,6 +1109,28 @@ async function runUpdate({ repo = '', branch = '', force = false }) {
   try {
     job.running = true;
     job.phase = 'checking';
+    let initialized = false;
+    try {
+      await run('git', ['rev-parse', '--git-dir'], { cwd: DOK_SOURCE_ROOT });
+    } catch {
+      const looksLikeDok = ['Dockerfile', path.join('server', 'index.js')]
+        .every(file => fs.existsSync(path.join(DOK_SOURCE_ROOT, file)));
+      if (!looksLikeDok) {
+        throw new Error(
+          `The source directory ${DOK_SOURCE_ROOT} is not a git checkout. ` +
+          'Point DOK_SOURCE_PATH at the Dok checkout and try again.'
+        );
+      }
+      try {
+        await run('git', ['init'], { cwd: DOK_SOURCE_ROOT });
+        initialized = true;
+        log('Initialized a new git checkout in the source directory.');
+      } catch (e) {
+        throw new Error(
+          `The source directory ${DOK_SOURCE_ROOT} is not a git checkout and could not be initialized: ${e.message}`
+        );
+      }
+    }
     if (repo && /^(https?:\/\/|git:\/\/|ssh:\/\/|git@)[^\s]+$/.test(repo)) {
       await run('git', ['remote', 'set-url', 'origin', repo], { cwd: DOK_SOURCE_ROOT }).catch(async () => {
         await run('git', ['remote', 'add', 'origin', repo], { cwd: DOK_SOURCE_ROOT });
@@ -1120,7 +1142,7 @@ async function runUpdate({ repo = '', branch = '', force = false }) {
     }
     if (!resolvedBranch || resolvedBranch === 'HEAD') resolvedBranch = 'main';
     const dirty = (await run('git', ['status', '--porcelain'], { cwd: DOK_SOURCE_ROOT }).catch(() => ({ stdout: '' }))).stdout.trim();
-    if (dirty && !force) {
+    if (!initialized && dirty && !force) {
       const err = new Error('The checkout has local changes. Re-run with force to discard them, or commit them first.');
       err.status = 409;
       err.dirty = true;
@@ -1134,17 +1156,29 @@ async function runUpdate({ repo = '', branch = '', force = false }) {
       await run('git', ['fetch', '--all', '--prune'], { cwd: DOK_SOURCE_ROOT });
     }
     job.phase = 'checkout';
-    try {
-      const out = await run('git', ['merge', '--ff-only', `origin/${resolvedBranch}`], { cwd: DOK_SOURCE_ROOT });
-      log(out.stdout.trim() || 'Already up to date.');
-    } catch (e) {
-      if (!force) {
-        const err = new Error(`Cannot fast-forward to origin/${resolvedBranch}. Re-run with force to reset the checkout.`);
-        err.status = 409;
-        throw err;
+    if (initialized) {
+      try {
+        const out = await run('git', ['reset', '--hard', `origin/${resolvedBranch}`], { cwd: DOK_SOURCE_ROOT });
+        log(out.stdout.trim() || `Checked out origin/${resolvedBranch}.`);
+      } catch (e) {
+        throw new Error(
+          `Fetched ${repo || 'origin'}, but could not check out ${resolvedBranch}: ` +
+          `${String(e.stderr || e.message).trim()}`
+        );
       }
-      await run('git', ['reset', '--hard', `origin/${resolvedBranch}`], { cwd: DOK_SOURCE_ROOT });
-      log('Checkout reset to origin.');
+    } else {
+      try {
+        const out = await run('git', ['merge', '--ff-only', `origin/${resolvedBranch}`], { cwd: DOK_SOURCE_ROOT });
+        log(out.stdout.trim() || 'Already up to date.');
+      } catch (e) {
+        if (!force) {
+          const err = new Error(`Cannot fast-forward to origin/${resolvedBranch}. Re-run with force to reset the checkout.`);
+          err.status = 409;
+          throw err;
+        }
+        await run('git', ['reset', '--hard', `origin/${resolvedBranch}`], { cwd: DOK_SOURCE_ROOT });
+        log('Checkout reset to origin.');
+      }
     }
     const commit = (await run('git', ['rev-parse', '--short', 'HEAD'], { cwd: DOK_SOURCE_ROOT }).catch(() => ({ stdout: '' }))).stdout.trim();
     job.phase = 'building';
