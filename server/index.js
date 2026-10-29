@@ -1341,9 +1341,20 @@ function runCommandToCompose(command, appName, opts = {}) {
   if (dropsPorts && requestedPorts.length) {
     parsed.unsupported.push(`Port mappings are ignored because network_mode is ${networkMode}`);
   }
+  // A docker run command can set VIRTUAL_HOST without VIRTUAL_PORT. Infer the
+  // matching container port instead of defaulting every routed app to 80.
+  let inferredVhostPort = String(opts.vhostPort || '').trim();
+  if (!inferredVhostPort && !envEntriesValue(parsed.env, 'VIRTUAL_PORT')) {
+    const publishedTarget = ports.map(composePortTarget).find(Boolean);
+    const exposedTarget = (parsed.expose || [])
+      .map(value => String(value).split(/[-\/]/)[0])
+      .find(value => /^\d+$/.test(value));
+    const envPort = envEntriesValue(parsed.env, 'PORT');
+    inferredVhostPort = publishedTarget || exposedTarget || (/^\d+$/.test(envPort) ? envPort : '');
+  }
   const envInfo = normalizeVhostEnv(parsed.env, {
     vhost: opts.vhost,
-    vhostPort: opts.vhostPort,
+    vhostPort: inferredVhostPort,
     clearVhost: opts.clearVhost
   });
   const env = envInfo.env;
@@ -5186,6 +5197,9 @@ function setComposeServiceEnv(compose, serviceName, values = {}) {
       ? `${' '.repeat(itemIndent)}${key}: ${yamlScalar(value)}`
       : `${' '.repeat(itemIndent)}- ${yamlScalar(`${key}=${value}`)}`);
   }
+  // Drop trailing blank lines left inside the environment block before
+  // appending new keys, so they do not land between environment entries.
+  while (next.length && !next[next.length - 1].trim()) next.pop();
   for (const [key, value] of entries) {
     if (handled.has(key) || String(value ?? '') === '') continue;
     next.push(mappingStyle
@@ -5196,6 +5210,332 @@ function setComposeServiceEnv(compose, serviceName, values = {}) {
   if (!next.some(line => line.trim())) lines.splice(envIdx, envEnd - envIdx);
   else lines.splice(envIdx + 1, envEnd - (envIdx + 1), ...next);
   return lines.join('\n');
+}
+
+// nginx-proxy is treated as installed when it is enabled in settings or has a
+// managed compose on disk. This matches the app-hints behavior so routing
+// fields appear before the proxy is first started.
+function nginxProxyInstalledSync() {
+  try {
+    if (readSettings().services?.nginxProxy?.enabled === true) return true;
+    return fs.existsSync(path.join(coreServiceDir('nginx-proxy'), 'docker-compose.yml'));
+  } catch {
+    return false;
+  }
+}
+
+function composeServiceRange(compose, serviceName) {
+  const target = String(serviceName || '').trim();
+  if (!target) return null;
+  const lines = String(compose || '').replace(/\r\n/g, '\n').split('\n');
+  let servicesLine = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^services\s*:\s*(?:#.*)?$/.test(lines[i])) { servicesLine = i; break; }
+  }
+  if (servicesLine < 0) return null;
+  let serviceIndent = null;
+  let start = -1;
+  let end = lines.length;
+  for (let i = servicesLine + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim() || line.trim().startsWith('#')) continue;
+    const indent = lineIndent(line);
+    if (indent === 0) {
+      if (start >= 0) end = i;
+      break;
+    }
+    if (start < 0) {
+      if (serviceIndent === null) serviceIndent = indent;
+      if (indent !== serviceIndent) continue;
+      const match = line.trim().match(/^(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_.-]+))\s*:\s*(?:#.*)?$/);
+      if (match && (match[1] || match[2] || match[3]) === target) start = i;
+    } else if (indent <= serviceIndent) {
+      end = i;
+      break;
+    }
+  }
+  if (start < 0) return null;
+  return { lines, start, end, serviceIndent };
+}
+
+function composeServiceChildBlock(compose, serviceName, key) {
+  const range = composeServiceRange(compose, serviceName);
+  if (!range) return null;
+  let childIndent = null;
+  for (let i = range.start + 1; i < range.end; i++) {
+    const line = range.lines[i];
+    if (!line.trim() || line.trim().startsWith('#')) continue;
+    const indent = lineIndent(line);
+    if (indent <= range.serviceIndent) break;
+    if (childIndent === null) childIndent = indent;
+    if (indent !== childIndent) continue;
+    const match = line.trim().match(/^(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_.-]+))\s*:\s*(.*)$/);
+    if (!match || (match[1] || match[2] || match[3]) !== key) continue;
+    let end = range.end;
+    for (let j = i + 1; j < range.end; j++) {
+      const nextLine = range.lines[j];
+      if (!nextLine.trim()) continue;
+      if (lineIndent(nextLine) <= childIndent) { end = j; break; }
+    }
+    return {
+      lines: range.lines,
+      start: i,
+      end,
+      keyIndent: childIndent,
+      rest: stripYamlComment(match[4] || '').trim()
+    };
+  }
+  return null;
+}
+
+function composeServiceSeqValues(compose, serviceName, key) {
+  const block = composeServiceChildBlock(compose, serviceName, key);
+  if (!block) return [];
+  if (block.rest) {
+    if (block.rest.startsWith('[') && block.rest.endsWith(']')) {
+      return splitFlowItems(block.rest.slice(1, -1))
+        .map(item => unquoteYamlValue(stripYamlComment(item).trim()))
+        .filter(Boolean);
+    }
+    if (/^[|>]/.test(block.rest)) return [];
+    return [unquoteYamlValue(block.rest)].filter(Boolean);
+  }
+  const values = [];
+  let current = '';
+  for (let i = block.start + 1; i < block.end; i++) {
+    const line = block.lines[i];
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    if (/^-\s*/.test(trimmed)) {
+      if (current) values.push(current);
+      current = trimmed.replace(/^-\s*/, '');
+    } else if (current) {
+      current += ' ' + trimmed;
+    }
+  }
+  if (current) values.push(current);
+  return values.map(value => stripYamlComment(value).trim()).filter(Boolean);
+}
+
+function composeServiceEnvValue(compose, serviceName, key) {
+  const block = composeServiceChildBlock(compose, serviceName, 'environment');
+  if (!block) return '';
+  const wanted = String(key || '').trim();
+  if (!wanted) return '';
+  const readEntry = (text) => {
+    const clean = stripYamlComment(text).trim();
+    if (!clean) return null;
+    // A list entry is often written as `- "KEY=value"`. Unquote the whole entry
+    // first so the value does not keep the closing quote.
+    const dashless = unquoteYamlValue(clean.replace(/^-\s*/, ''));
+    const idx = dashless.indexOf('=');
+    if (idx >= 0) {
+      const name = dashless.slice(0, idx).trim().replace(/^["']|["']$/g, '');
+      return name === wanted ? unquoteYamlValue(dashless.slice(idx + 1).trim()) : null;
+    }
+    const match = dashless.match(/^(?:"([^"]+)"|'([^']+)'|([^:]+?))\s*:\s*(.*)$/);
+    if (!match) return null;
+    const name = (match[1] || match[2] || match[3] || '').trim();
+    return name === wanted ? unquoteYamlValue(stripYamlComment(match[4] || '').trim()) : null;
+  };
+  if (block.rest) {
+    const entries = block.rest.startsWith('[') && block.rest.endsWith(']')
+      ? splitFlowItems(block.rest.slice(1, -1))
+      : [block.rest];
+    for (const entry of entries) {
+      const value = readEntry(entry);
+      if (value !== null) return String(value).trim();
+    }
+    return '';
+  }
+  for (let i = block.start + 1; i < block.end; i++) {
+    const line = block.lines[i];
+    if (!line.trim() || line.trim().startsWith('#')) continue;
+    const value = readEntry(line);
+    if (value !== null) return String(value).trim();
+  }
+  return '';
+}
+
+function composePortTarget(entry) {
+  const text = String(entry || '').trim();
+  if (!text) return '';
+  const longTarget = text.match(/(?:^|\s)target\s*:\s*["']?(\d{1,5})/);
+  if (longTarget) return longTarget[1];
+  let value = unquoteYamlValue(text).replace(/\s+#.*$/, '').trim();
+  value = value.replace(/\/(?:tcp|udp|sctp)$/i, '');
+  const parts = value.split(':');
+  let target = String(parts[parts.length - 1] || '').trim().replace(/^["']|["']$/g, '');
+  const match = target.match(/^(\d{1,5})(?:-\d+)?$/);
+  return match ? match[1] : '';
+}
+
+function composeServicePortTargets(compose, serviceName) {
+  return composeServiceSeqValues(compose, serviceName, 'ports')
+    .map(composePortTarget)
+    .filter(Boolean);
+}
+
+function composeServiceExposeTargets(compose, serviceName) {
+  return composeServiceSeqValues(compose, serviceName, 'expose')
+    .map(value => String(unquoteYamlValue(value)).trim().split(/[-\/]/)[0])
+    .filter(value => /^\d{1,5}$/.test(value));
+}
+
+function composeVhostPortForService(compose, serviceName, requested = '', fallback = 80) {
+  const explicit = String(requested || '').trim();
+  if (/^\d+$/.test(explicit) && Number(explicit) >= 1 && Number(explicit) <= 65535) return explicit;
+  // Respect an explicit VIRTUAL_PORT already in the compose (docker run env,
+  // OC Assist, imported app) before guessing from published ports.
+  const existing = composeServiceEnvValue(compose, serviceName, 'VIRTUAL_PORT');
+  if (/^\d+$/.test(existing) && Number(existing) >= 1 && Number(existing) <= 65535) return existing;
+  const port = composeServicePortTargets(compose, serviceName)[0];
+  if (port) return port;
+  const exposed = composeServiceExposeTargets(compose, serviceName)[0];
+  if (exposed) return exposed;
+  const envPort = composeServiceEnvValue(compose, serviceName, 'PORT');
+  if (/^\d+$/.test(envPort)) return envPort;
+  return String(fallback || 80);
+}
+
+function removeComposeServiceKey(compose, serviceName, key) {
+  const block = composeServiceChildBlock(compose, serviceName, key);
+  if (!block) return compose;
+  const lines = [...block.lines];
+  lines.splice(block.start, block.end - block.start);
+  return lines.join('\n');
+}
+
+function ensureComposeServiceNetwork(composeText, serviceName, key = 'default') {
+  const text = String(composeText || '');
+  if (!text.trim() || !serviceName) return text;
+  if (composeServiceChildBlock(text, serviceName, 'network_mode')) return text;
+  const block = composeServiceChildBlock(text, serviceName, 'networks');
+  if (!block) return text;
+  const lines = [...block.lines];
+  if (block.rest) {
+    if (!block.rest.startsWith('[') || !block.rest.endsWith(']')) return text;
+    const values = splitFlowItems(block.rest.slice(1, -1))
+      .map(item => unquoteYamlValue(stripYamlComment(item).trim()))
+      .filter(Boolean);
+    if (values.includes(key)) return text;
+    const indent = ' '.repeat(block.keyIndent);
+    const itemIndent = ' '.repeat(block.keyIndent + 2);
+    lines.splice(block.start, block.end - block.start,
+      `${indent}networks:`,
+      ...values.map(value => `${itemIndent}- ${yamlScalar(value)}`),
+      `${itemIndent}- ${yamlScalar(key)}`);
+    return lines.join('\n');
+  }
+  let firstChild = '';
+  for (let i = block.start + 1; i < block.end; i++) {
+    if (block.lines[i].trim() && !block.lines[i].trim().startsWith('#')) {
+      firstChild = block.lines[i];
+      break;
+    }
+  }
+  const itemIndent = ' '.repeat(firstChild ? lineIndent(firstChild) : block.keyIndent + 2);
+  if (firstChild && !/^-\s*/.test(firstChild.trim())) {
+    for (let i = block.start + 1; i < block.end; i++) {
+      const match = block.lines[i].trim().match(/^(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_.-]+))\s*:/);
+      if (match && (match[1] || match[2] || match[3]) === key) return text;
+    }
+    lines.splice(block.end, 0, `${itemIndent}${yamlScalar(key)}:`);
+    return lines.join('\n');
+  }
+  const values = composeServiceSeqValues(text, serviceName, 'networks')
+    .map(value => unquoteYamlValue(value));
+  if (values.includes(key)) return text;
+  lines.splice(block.end, 0, `${itemIndent}- ${yamlScalar(key)}`);
+  return lines.join('\n');
+}
+
+// Dok apps always join the configured default network (normally `wicked`).
+// Defining it as Compose's external `default` network attaches every service
+// that does not opt into a custom network and keeps the compose portable. When
+// a service is named, its existing explicit network list also gets `default`
+// so a routed app cannot be left outside nginx-proxy's network.
+function ensureComposeDokNetwork(composeText, network = 'wicked', serviceName = '') {
+  const text = String(composeText || '').replace(/\r\n/g, '\n');
+  if (!text.trim()) return text;
+  const name = String(network || 'wicked').trim() || 'wicked';
+  let result = text;
+  let networkKey = 'default';
+  let attachService = true;
+  const lines = text.split('\n');
+  const networksLine = lines.findIndex(line => /^networks\s*:\s*(?:#.*)?$/.test(line));
+  if (networksLine < 0) {
+    // An inline top-level networks mapping cannot be edited safely line by
+    // line; leave it untouched rather than emitting a duplicate key.
+    if (/^networks\s*:/m.test(text)) attachService = false;
+    else {
+      result = text.replace(/\s*$/, '') +
+        `\n\nnetworks:\n  default:\n    name: ${yamlScalar(name)}\n    external: true\n`;
+    }
+  } else {
+    let end = lines.length;
+    for (let i = networksLine + 1; i < lines.length; i++) {
+      if (!lines[i].trim() || lines[i].trim().startsWith('#')) continue;
+      if (lineIndent(lines[i]) === 0) { end = i; break; }
+    }
+    let childIndent = null;
+    const keys = new Set();
+    for (let i = networksLine + 1; i < end; i++) {
+      const line = lines[i];
+      if (!line.trim() || line.trim().startsWith('#')) continue;
+      const indent = lineIndent(line);
+      if (childIndent === null) childIndent = indent;
+      if (indent !== childIndent) continue;
+      const match = line.trim().match(/^(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_.-]+))\s*:/);
+      if (match) keys.add(match[1] || match[2] || match[3]);
+    }
+    if (keys.has('default')) {
+      networkKey = 'default';
+    } else if (keys.has(name)) {
+      networkKey = name;
+    } else {
+      const indent = ' '.repeat(childIndent === null ? 2 : childIndent);
+      const propIndent = indent + '  ';
+      lines.splice(end, 0,
+        `${indent}default:`,
+        `${propIndent}name: ${yamlScalar(name)}`,
+        `${propIndent}external: true`);
+      result = lines.join('\n');
+    }
+  }
+  if (serviceName && attachService) result = ensureComposeServiceNetwork(result, serviceName, networkKey);
+  return result;
+}
+
+// When nginx-proxy is installed the routed service is reached over the shared
+// network. Publishing a host port is unnecessary and causes collisions, so the
+// service keeps only VIRTUAL_PORT and its published mappings are removed.
+function routedServiceFromCompose(composeText, preferred = '') {
+  const services = serviceNamesFromCompose(composeText);
+  const wanted = String(preferred || '').trim();
+  if (wanted && services.includes(wanted)) {
+    const host = composeServiceEnvValue(composeText, wanted, 'VIRTUAL_HOST');
+    if (host) return { service: wanted, host };
+  }
+  const routed = services.find(name => composeServiceEnvValue(composeText, name, 'VIRTUAL_HOST'));
+  if (routed) return { service: routed, host: composeServiceEnvValue(composeText, routed, 'VIRTUAL_HOST') };
+  return { service: wanted && services.includes(wanted) ? wanted : (services[0] || ''), host: '' };
+}
+
+function applyNginxRoutingPolicy(compose, {
+  service = '', vhost = '', vhostPort = '', fallbackPort = 80, removePorts = true, network = ''
+} = {}) {
+  const services = serviceNamesFromCompose(compose);
+  const routed = routedServiceFromCompose(compose, service);
+  const serviceName = routed.service || services[0] || '';
+  if (!serviceName) return { compose, changed: false, service: '', vhost: '', vhostPort: '' };
+  const host = String(vhost || '').trim() || routed.host || composeServiceEnvValue(compose, serviceName, 'VIRTUAL_HOST');
+  if (!host) return { compose, changed: false, service: serviceName, vhost: '', vhostPort: '' };
+  const port = composeVhostPortForService(compose, serviceName, vhostPort, fallbackPort);
+  let next = setComposeServiceEnv(compose, serviceName, { VIRTUAL_HOST: host, VIRTUAL_PORT: port });
+  if (removePorts) next = removeComposeServiceKey(next, serviceName, 'ports');
+  if (network) next = ensureComposeDokNetwork(next, network, serviceName);
+  return { compose: next, changed: next !== compose, service: serviceName, vhost: host, vhostPort: port };
 }
 
 function coreServiceUrl(domain, port) {
@@ -7345,11 +7685,43 @@ app.post('/api/launch/finalize', async (req, res) => {
       throw httpError(400, 'Invalid domain name');
     }
     const settingsVhostPort = readSettings().services?.nginxProxy?.defaultVhostPort || 80;
-    const cleanVhostPort = String(vhostPort || settingsVhostPort).trim() || '80';
+    const requestedVhostPort = String(vhostPort || '').trim();
+    let cleanVhostPort = requestedVhostPort || String(settingsVhostPort).trim() || '80';
     if (cleanVhost && (!/^\d+$/.test(cleanVhostPort) || Number(cleanVhostPort) < 1 || Number(cleanVhostPort) > 65535)) {
       throw httpError(400, 'VIRTUAL_PORT must be a port between 1 and 65535');
     }
     const clearVhost = vhostTouched === true && !cleanVhost;
+    const nginxInstalled = nginxProxyInstalledSync();
+    const runConv = runMode ? runCommandToCompose(command, name) : null;
+    // Routing can come from the form quick fields or from the compose itself
+    // (docker run env, pasted/imported compose, OC Assist). Either source must
+    // produce the same paired network + VIRTUAL_HOST + VIRTUAL_PORT result.
+    const nginxRoutingActive = nginxInstalled &&
+      (!!cleanVhost || (!clearVhost && composeHasVhostKey(runConv?.compose || '')));
+    // nginx-proxy reaches the routed service over the shared Docker network.
+    // Keep VIRTUAL_HOST/VIRTUAL_PORT paired and remove published host ports so
+    // independently created apps can listen on the same container port.
+    const applyAppRoutingPolicy = (compose) => {
+      const services = serviceNamesFromCompose(compose);
+      const preferred = services.includes(String(vhostService || '').trim())
+        ? String(vhostService).trim()
+        : services.includes(name) ? name : services[0];
+      if (!nginxInstalled) return ensureComposeDokNetwork(compose, useNetwork, preferred);
+      const existing = routedServiceFromCompose(compose, preferred);
+      const host = cleanVhost || (clearVhost ? '' : existing.host);
+      if (!host) return ensureComposeDokNetwork(compose, useNetwork, preferred);
+      const routed = applyNginxRoutingPolicy(compose, {
+        service: cleanVhost ? preferred : (existing.service || preferred),
+        vhost: host,
+        vhostPort: requestedVhostPort,
+        fallbackPort: settingsVhostPort,
+        removePorts: true,
+        network: useNetwork
+      });
+      if (routed.vhostPort) cleanVhostPort = routed.vhostPort;
+      portList.splice(0, portList.length);
+      return routed.compose;
+    };
 
     const networkNames = await dockerNetworkNames();
     // The setup script creates the default network, but keep creation here so
@@ -7372,7 +7744,12 @@ app.post('/api/launch/finalize', async (req, res) => {
       }
     }
 
-    const runConv = runMode ? runCommandToCompose(command, name) : null;
+    // The compose editor removes host ports from routed services, so the run
+    // command's VIRTUAL_PORT (explicit or inferred from its container port) is
+    // the remaining source. Respect an explicit VPORT or form port list first.
+    if (runMode && nginxRoutingActive && !requestedVhostPort && !portList.length && runConv?.vhostPort) {
+      cleanVhostPort = runConv.vhostPort;
+    }
     const runNetworkPlan = runConv ? planRunNetworks(runConv, networkNames) : null;
 
     let staged = '';
@@ -7432,6 +7809,7 @@ app.post('/api/launch/finalize', async (req, res) => {
       // network that does not exist with the setup-managed default network and
       // apply the shared app-compose standard before analysis and saving.
       finalCompose = standardizeAppCompose(finalCompose, { networkNames });
+      finalCompose = applyAppRoutingPolicy(finalCompose);
     }
 
     let analysis = null;
@@ -7492,6 +7870,7 @@ app.post('/api/launch/finalize', async (req, res) => {
         replacePorts: true,
         clearVhost
       }).compose;
+      finalCompose = applyAppRoutingPolicy(finalCompose);
       analysis = await analyzeCompose(finalCompose, {
         projectDir: targetDir,
         networkNames: networkNamesForAnalysis(networkNames)
@@ -7676,6 +8055,15 @@ app.post('/api/launch/finalize', async (req, res) => {
     if (overrideText) fs.writeFileSync(overridePath, overrideText);
     else { try { fs.unlinkSync(overridePath); } catch {} }
 
+    // Keep the registry routing fields in sync with the saved compose even when
+    // Docker Compose inspection is unavailable; the text helpers can still
+    // read the paired VIRTUAL_HOST/VIRTUAL_PORT.
+    const finalRouting = routedServiceFromCompose(finalCompose, effectiveVhostService || name);
+    const finalVhost = analysis?.vhost || finalRouting.host || cleanVhost;
+    const finalVhostPort = analysis?.vhostPort || (finalVhost
+      ? composeVhostPortForService(finalCompose, finalRouting.service || targetService, cleanVhostPort, settingsVhostPort)
+      : '');
+
     addRegistryEntry({
       type: type || 'compose',
       name,
@@ -7692,8 +8080,8 @@ app.post('/api/launch/finalize', async (req, res) => {
         name,
         command: command || '',
         ports: portList,
-        vhost: cleanVhost,
-        vhostPort: cleanVhostPort,
+        vhost: finalVhost,
+        vhostPort: finalVhostPort,
         appDir: targetDir,
         network: useNetwork,
         type
@@ -8566,9 +8954,10 @@ function composeHasVhostKey(text) {
 function normalizeEditedAppCompose(entry, compose, { vhostTouched = false, addDefaultNetwork = true } = {}) {
   let next = stripComposeProjectName(String(compose || ''));
   next = ensureManagedComposeHeader(next);
+  const defaultNetwork = String(configuredDefaults().defaultNetwork || 'wicked').trim() || 'wicked';
   if (addDefaultNetwork && !/^networks\s*:/m.test(next) && !/\bnetwork_mode\s*:/.test(next)) {
     next = next.replace(/\s*$/, '') +
-      '\n\nnetworks:\n  default:\n    name: wicked\n    external: true\n';
+      `\n\nnetworks:\n  default:\n    name: ${yamlScalar(defaultNetwork)}\n    external: true\n`;
   }
   const vhost = String(entry?.launch?.vhost || '').trim();
   // Keep legacy routing for apps whose saved compose predates VIRTUAL_HOST, but
@@ -8578,11 +8967,11 @@ function normalizeEditedAppCompose(entry, compose, { vhostTouched = false, addDe
     const preferred = String(entry?.launch?.name || '').trim();
     const service = services.includes(preferred) ? preferred : services[0];
     if (service) {
-      const vhostPort = String(entry?.launch?.vhostPort || '').trim();
-      next = setComposeServiceEnv(next, service, {
-        VIRTUAL_HOST: vhost,
-        ...(vhostPort ? { VIRTUAL_PORT: vhostPort } : {})
-      });
+      // VIRTUAL_HOST and VIRTUAL_PORT are always written as a pair; the port is
+      // resolved from the container mapping so nginx never receives a host
+      // name without a target port.
+      const vhostPort = composeVhostPortForService(next, service, entry?.launch?.vhostPort, 80);
+      next = setComposeServiceEnv(next, service, { VIRTUAL_HOST: vhost, VIRTUAL_PORT: vhostPort });
     }
   }
   return next;
@@ -8633,8 +9022,29 @@ app.post('/api/apps/:id/compose', async (req, res) => {
     const force = req.body?.force === true;
     const vhostTouched = req.body?.vhostTouched === true;
     const existingComposePath = findComposeFile(appDir);
-    const compose = normalizeEditedAppCompose(entry, req.body?.compose || '', { vhostTouched });
+    let compose = normalizeEditedAppCompose(entry, req.body?.compose || '', { vhostTouched });
     if (!compose.trim()) return res.status(400).json({ error: 'Compose file is empty' });
+    const defaultsCfg = configuredDefaults();
+    const defaultNetwork = String(defaultsCfg.defaultNetwork || 'wicked').trim() || 'wicked';
+    const services = serviceNamesFromCompose(compose);
+    let routedService = String(req.body?.vhostService || '').trim();
+    if (!services.includes(routedService)) {
+      routedService = services.find(service => composeServiceEnvValue(compose, service, 'VIRTUAL_HOST')) || '';
+    }
+    const preferredService = services.includes(String(entry.launch?.name || entry.name || '').trim())
+      ? String(entry.launch?.name || entry.name || '').trim()
+      : services[0];
+    if (nginxProxyInstalledSync() && routedService) {
+      compose = applyNginxRoutingPolicy(compose, {
+        service: routedService,
+        vhostPort: String(req.body?.vhostPort || '').trim(),
+        fallbackPort: readSettings().services?.nginxProxy?.defaultVhostPort || 80,
+        removePorts: true,
+        network: defaultNetwork
+      }).compose;
+    } else {
+      compose = ensureComposeDokNetwork(compose, defaultNetwork, preferredService);
+    }
     const validation = await validateCompose(compose, { projectDir: appDir });
     if (!validation.ok && !force) {
       return res.status(400).json({
@@ -11598,8 +12008,22 @@ function terminalSessionSummary(session) {
   };
 }
 
+function terminalOutputSince(session, after = 0) {
+  const requested = Number(after);
+  const cursor = Number.isFinite(requested) && requested > 0 ? Math.floor(requested) : 0;
+  const buffer = session.buffer || [];
+  const chunks = cursor > 0 ? buffer.filter(chunk => chunk.seq > cursor) : buffer.slice();
+  const oldest = buffer.length ? buffer[0].seq : session.sequence + 1;
+  return {
+    chunks: chunks.map(chunk => chunk.data),
+    cursor: session.sequence,
+    oldest,
+    truncated: cursor > 0 && cursor < oldest - 1
+  };
+}
+
 function terminalBufferText(session, max = 2000) {
-  const raw = (session.buffer || []).join('');
+  const raw = (session.buffer || []).map(chunk => typeof chunk === 'string' ? chunk : chunk.data).join('');
   const clean = raw
     .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
     .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
@@ -11618,9 +12042,12 @@ async function createTerminalSession({ mode = 'admin', app = 'shell', agent = ''
   }
   if (terminalSessions.size >= OPENCODE_MAX_SESSIONS) {
     // Prefer reclaiming an abandoned, clientless session over refusing to start
-    // a new one. This is what accumulates after a failed chat attach.
+    // a new one. This is what accumulates after a failed chat attach. Sessions
+    // using the HTTP polling fallback have no WebSocket in `clients`, so a
+    // recent poll counts as an attached client.
+    const now = Date.now();
     const abandoned = Array.from(terminalSessions.values())
-      .filter(session => !session.clients.size)
+      .filter(session => !session.clients.size && now - (session.lastClientAt || session.createdAtMs || 0) > 10000)
       .sort((a, b) => (a.lastClientAt || 0) - (b.lastClientAt || 0))[0];
     if (abandoned) {
       appendServerLog('INFO', `evicting abandoned terminal session ${abandoned.id} to make room`);
@@ -11631,7 +12058,7 @@ async function createTerminalSession({ mode = 'admin', app = 'shell', agent = ''
   }
 
   const settings = readSettings();
-  let binary = '/bin/bash';
+  let binary = '';
   let args = ['-i'];
   let cwd = mode === 'user' ? appsDir : root;
   let version = '';
@@ -11650,6 +12077,16 @@ async function createTerminalSession({ mode = 'admin', app = 'shell', agent = ''
     args = ['--agent', selectedAgent];
     if (prompt) args.push('--prompt', String(prompt));
     version = info.version;
+  } else {
+    // The Docker image bundles bash, but direct development runs on Alpine or
+    // other minimal hosts may only have sh. Use the user's shell when it exists
+    // and fall back to a POSIX shell instead of failing every terminal launch.
+    binary = [process.env.SHELL, '/bin/bash', '/bin/sh']
+      .map(candidate => findExecutable(candidate))
+      .find(Boolean) || '';
+    if (!binary) {
+      throw httpError(503, 'No interactive shell was found in this container. Rebuild the WickedAFDok image or install bash or sh.');
+    }
   }
 
   fs.mkdirSync(cwd, { recursive: true });
@@ -11669,6 +12106,7 @@ async function createTerminalSession({ mode = 'admin', app = 'shell', agent = ''
     lastClientAt: Date.now(),
     buffer: [],
     bufferBytes: 0,
+    sequence: 0,
     clients: new Set(),
     exited: false,
     exitCode: null,
@@ -11694,11 +12132,12 @@ async function createTerminalSession({ mode = 'admin', app = 'shell', agent = ''
 
   child.onData((data) => {
     session.lastActivity = Date.now();
-    session.buffer.push(data);
+    session.sequence += 1;
+    session.buffer.push({ seq: session.sequence, data });
     session.bufferBytes += Buffer.byteLength(data);
     while (session.bufferBytes > TERMINAL_BUFFER_LIMIT && session.buffer.length > 1) {
       const removed = session.buffer.shift();
-      session.bufferBytes -= Buffer.byteLength(removed);
+      session.bufferBytes -= Buffer.byteLength(removed.data);
     }
     if (session.clients.size) {
       const payload = JSON.stringify({ type: 'output', data });
@@ -11774,6 +12213,47 @@ app.post('/api/terminal/sessions/stop-all', (req, res) => {
 app.post('/api/terminal/sessions/:id/stop', (req, res) => {
   const stopped = stopTerminalSession(req.params.id);
   res.json({ ok: true, stopped });
+});
+
+// HTTP transport used when a browser or reverse proxy cannot complete a
+// WebSocket upgrade. Polling is slower than the WebSocket path, but it keeps
+// the terminal and OC Assist usable behind proxies that strip `Upgrade`.
+app.get('/api/terminal/sessions/:id/output', (req, res) => {
+  const session = terminalSessions.get(req.params.id);
+  if (!session) return res.status(404).json({ error: 'Terminal session is no longer running' });
+  session.lastActivity = Date.now();
+  session.lastClientAt = Date.now();
+  const output = terminalOutputSince(session, req.query.after);
+  res.set('Cache-Control', 'no-store');
+  res.json({
+    ok: true,
+    session: terminalSessionSummary(session),
+    ...output,
+    exited: session.exited,
+    exitCode: session.exitCode
+  });
+});
+
+app.post('/api/terminal/sessions/:id/input', (req, res) => {
+  const session = terminalSessions.get(req.params.id);
+  if (!session) return res.status(404).json({ error: 'Terminal session is no longer running' });
+  session.lastActivity = Date.now();
+  session.lastClientAt = Date.now();
+  const data = typeof req.body?.data === 'string' ? req.body.data : '';
+  if (data.length > 65536) {
+    return res.status(413).json({ error: 'Terminal input is too large' });
+  }
+  if (data && !session.exited) {
+    try { session.pty.write(data); } catch {}
+  }
+  if (!session.exited) {
+    const cols = Math.max(20, Math.min(400, Number(req.body?.cols) || 0));
+    const rows = Math.max(5, Math.min(200, Number(req.body?.rows) || 0));
+    if (cols && rows) {
+      try { session.pty.resize(cols, rows); } catch {}
+    }
+  }
+  res.json({ ok: true, exited: session.exited, exitCode: session.exitCode });
 });
 
 app.get('/api/core/opencode', async (req, res) => {
@@ -12635,11 +13115,13 @@ server.on('upgrade', (req, socket, head) => {
           host === originHost ||
           host.split(':')[0] === originHostname);
         if (hosts.length && !allowed) {
+          appendServerLog('WARN', `terminal websocket rejected: origin ${origin} does not match host ${hosts.join(', ')}`);
           socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
           socket.destroy();
           return;
         }
       } catch {
+        appendServerLog('WARN', `terminal websocket rejected: invalid origin ${origin}`);
         socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
         socket.destroy();
         return;
@@ -12676,7 +13158,7 @@ terminalWss.on('connection', (ws, req, session) => {
       session: terminalSessionSummary(session),
       modes: TERMINAL_MODES
     }));
-    for (const chunk of session.buffer) ws.send(JSON.stringify({ type: 'output', data: chunk }));
+    for (const chunk of session.buffer) ws.send(JSON.stringify({ type: 'output', data: chunk.data }));
     if (session.exited) ws.send(JSON.stringify({ type: 'exit', code: session.exitCode }));
   } catch {}
 

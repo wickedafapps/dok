@@ -34,6 +34,7 @@ Reopen Maintenance from **Settings → Maintenance** for installs, updates, back
 
 - Manage containers, images, apps, compose stacks, and core services from one UI. The Containers tab splits protected **Core Services** from workloads and has an **Apps interface** button.
 - Create apps with **OC Assist** (default) or import a docker run command, compose file, git repository, or upload. Every app requires an app title and is saved to the library stopped. Use **Apps → Deploy** to review the compose, configure routing, ports, paths, and secrets, then save or save and deploy. Deploy is the only way to start or redeploy an app; duplicate container names are renamed safely after approval.
+- Apps join the configured Dok default network (normally `wicked`). When nginx-proxy is installed, the compose editor and server keep `VIRTUAL_HOST` and the matching container `VIRTUAL_PORT` paired, remove published host ports from the routed service, and attach it to the default network so every app GUI is served through nginx without port collisions.
 - Customize the installation from **Settings → Dok Settings → Designer**: logo, name, tagline, CSS override, and direct editing of nginx-proxy error pages and configuration files.
 - Install, update, back up, repair, and recover the whole installation from the on-demand **Dok Maintenance** container. It keeps an exact installation record and snapshots in `maintenance-data/`, runs Admin OpenCode, and replaces the old Host Helper.
 - Open a browser terminal from the dashboard, or launch OpenCode in User mode without any setup. Admin OpenCode runs from Dok Maintenance, where the host checkout and repair tools live. OpenCode starts on demand and stops when you close the terminal.
@@ -156,7 +157,7 @@ OpenCode is preconfigured, so launching it needs no input. Set a model and API k
 
 Closing the terminal stops the session. OpenCode is intentionally not part of **Start all/Stop all**, because it is a launch-on-demand tool rather than a long-running service.
 
-If WickedAFDok is behind a reverse proxy, that proxy must forward WebSocket upgrades for `/api/terminal/ws`; otherwise the terminal and OpenCode cannot connect.
+The terminal normally uses a WebSocket at `/api/terminal/ws`. If a preview or reverse proxy blocks the upgrade, Dok automatically switches that session to HTTP polling so the shell and OC Assist still work. Forwarding WebSocket upgrades is still recommended because it has lower latency and less overhead.
 
 > User mode is a guardrail for the agent, not a hard security boundary: it still runs as the Dok container user. Keep the UI and Maintenance token behind a trusted network or an authenticated reverse proxy, since an Admin shell in Maintenance has full host, container, and Docker access.
 

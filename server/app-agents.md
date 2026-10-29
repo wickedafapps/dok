@@ -34,7 +34,9 @@ apps/<app-name>/
 - Use `depends_on` with health or start ordering where startup order matters.
 - Prefer a healthcheck for the primary service when the image provides a probe.
 - Use `init: true` when the image does not handle signals and child processes well.
-- Do not publish host ports in library apps. Expose container ports and use `VIRTUAL_PORT` for routed traffic. Host ports are installation-specific and are stripped from library exports.
+- Do not publish host ports in library apps. Expose container ports and use `VIRTUAL_PORT` for routed traffic. Host ports are installation-specific and are stripped from library exports. When nginx-proxy is installed, Dok removes published `ports` from the routed service and fills `VIRTUAL_PORT` from the first container port, `expose`, or `PORT`, so the app is reachable only through nginx.
+- Join the Dok default network (normally `wicked`, exposed as Compose's external `default` network) for every service that must be reachable by nginx-proxy or another Dok service. Dok enforces this at save time.
+- `VIRTUAL_HOST` and `VIRTUAL_PORT` are a required pair. Never set `VIRTUAL_HOST` without a container-port `VIRTUAL_PORT`, even if Dok can infer it. When both are present, do not also publish host `ports` for that service.
 - Do not declare arbitrary external networks. Use the default app network, or the shared `wicked` network when the app must be reachable by nginx-proxy or another Dok service.
 - Do not use `container_name` to claim a global Docker name unless it is required and documented. Dok can rename conflicting containers.
 - Do not use `network_mode: host`, `privileged: true`, or mount `/var/run/docker.sock` unless the app cannot work any other way. Document the reason and the security impact in the README.
@@ -52,7 +54,10 @@ Use these environment variables only when the app is routed through nginx-proxy:
 Rules:
 
 - `VIRTUAL_HOST` and `LETSENCRYPT_HOST` must be literal host names, not wildcard or regex patterns.
+- `VIRTUAL_HOST` and `VIRTUAL_PORT` must always be set together on the same service. Never leave a host without a container-port target.
 - `VIRTUAL_PORT` is the container port, never the published host port.
+- Remove published host `ports` from the routed service; nginx-proxy reaches it through the shared network, so the app GUI must not depend on a host port.
+- Keep the routed service on the Dok default network (normally `wicked`, exposed as Compose's external `default` network) so nginx-proxy can reach it.
 - Do not invent domains. Ask the user when a hostname is required, or omit routing variables and let them configure routing after import.
 - Do not enable Authelia or Let's Encrypt without the user asking for it.
 - Keep routing variables on the single primary routed service, not every service.

@@ -1340,15 +1340,37 @@ async function getCoreAppHints(appName = '') {
 }
 
 function appCfgPrimaryContainerPort(service) {
-  const portsField = (service?.fields || []).find(field => field.key === 'ports');
+  const fields = service?.fields || [];
+  const portsField = fields.find(field => field.key === 'ports');
+  const portsRaw = String(portsField?.value || '').trim();
+  // Long-syntax ports are stored as raw JSON; read their container target so
+  // VIRTUAL_PORT matches what the container actually listens on.
+  if (portsRaw.startsWith('[') || portsRaw.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(portsRaw);
+      for (const item of (Array.isArray(parsed) ? parsed : [parsed])) {
+        const target = item && typeof item === 'object' ? (item.target ?? item.published) : item;
+        const match = String(target ?? '').match(/^(\d+)(?:-\d+)?$/);
+        if (match) return match[1];
+      }
+    } catch {}
+  }
   for (const line of appCfgRawLines(portsField?.value)) {
-    const text = line.trim().replace(/\/(?:tcp|udp)$/i, '');
+    const text = line.trim().replace(/\/(?:tcp|udp|sctp)$/i, '');
     if (!text) continue;
     const target = text.split(':').pop();
     const match = String(target || '').match(/^(\d+)(?:-\d+)?$/);
     if (match) return match[1];
   }
-  return '';
+  const exposeField = fields.find(field => field.key === 'expose');
+  for (const line of appCfgRawLines(exposeField?.value)) {
+    const match = String(line || '').trim().split(/[-\/]/)[0].match(/^(\d+)$/);
+    if (match) return match[1];
+  }
+  const env = appCfgBuilderEnvMap(fields.find(field => field.key === 'environment'));
+  const envPort = String(env.PORT || '').trim();
+  if (/^\d+$/.test(envPort)) return envPort;
+  return '80';
 }
 
 function applyCoreServiceHintsToModel(model, hints) {
@@ -1365,9 +1387,20 @@ function applyCoreServiceHintsToModel(model, hints) {
     service.fields = service.fields || [];
     service.fields.push(envField);
   }
-  const existing = new Set(Object.keys(appCfgBuilderEnvMap(envField)));
-  const lines = appCfgRawLines(envField.value).map(line => line.trim()).filter(Boolean);
-  let changed = false;
+  const existingMap = appCfgBuilderEnvMap(envField);
+  const existing = new Set(Object.entries(existingMap)
+    .filter(([, value]) => String(value ?? '').trim())
+    .map(([key]) => key));
+  // A blank placeholder (for example VIRTUAL_PORT=) must not block the hint.
+  // Drop blank values for hint keys so the filled entry is not duplicated.
+  const hintKeys = new Set(fields.map(hint => String(hint?.key || '').trim()).filter(Boolean));
+  const originalLines = appCfgRawLines(envField.value).map(line => line.trim()).filter(Boolean);
+  const lines = originalLines.filter(line => {
+    const idx = line.indexOf('=');
+    const key = (idx < 0 ? line : line.slice(0, idx)).trim();
+    return !(hintKeys.has(key) && !String(existingMap[key] ?? '').trim());
+  });
+  let changed = lines.length !== originalLines.length;
   for (const hint of fields) {
     const key = String(hint?.key || '').trim();
     if (!key || existing.has(key)) continue;
@@ -1385,6 +1418,17 @@ function applyCoreServiceHintsToModel(model, hints) {
     changed = true;
   }
   if (changed) envField.value = lines.join('\n');
+  // With nginx-proxy installed the app is reached through VIRTUAL_HOST on the
+  // shared Docker network. Publishing a host port is unnecessary and would
+  // prevent another app from using the same container port.
+  const routedEnv = appCfgBuilderEnvMap(envField);
+  if (hints?.services?.nginxProxy && routedEnv.VIRTUAL_HOST) {
+    const portsField = (service.fields || []).find(field => field.key === 'ports');
+    if (portsField && String(portsField.value || '').trim()) {
+      portsField.value = '';
+      changed = true;
+    }
+  }
   return changed;
 }
 
@@ -4126,7 +4170,20 @@ let terminalOpenToken = 0;
 let terminalReconnectTimer = null;
 let terminalReconnectAttempt = 0;
 let terminalHeartbeatTimer = null;
+let terminalTransport = 'ws';
+let terminalHttpTimer = null;
+let terminalHttpCursor = 0;
+let terminalHttpErrors = 0;
+let terminalHttpReady = false;
+let terminalHttpInputQueue = '';
+let terminalHttpInputTimer = null;
+let terminalHttpInputSending = false;
+let terminalHttpFallbackNoticeShown = false;
+let terminalHttpNoticePending = false;
+let terminalHttpTruncatedShown = false;
 const TERMINAL_MAX_RECONNECT = 10;
+const TERMINAL_WS_FALLBACK_ATTEMPTS = 2;
+const TERMINAL_HTTP_IDLE_MS = 350;
 
 function clearTerminalConnectionTimers() {
   if (terminalReconnectTimer) {
@@ -4137,6 +4194,26 @@ function clearTerminalConnectionTimers() {
     clearInterval(terminalHeartbeatTimer);
     terminalHeartbeatTimer = null;
   }
+  if (terminalHttpTimer) {
+    clearTimeout(terminalHttpTimer);
+    terminalHttpTimer = null;
+  }
+  if (terminalHttpInputTimer) {
+    clearTimeout(terminalHttpInputTimer);
+    terminalHttpInputTimer = null;
+  }
+}
+
+function resetTerminalHttpState() {
+  terminalTransport = 'ws';
+  terminalHttpCursor = 0;
+  terminalHttpErrors = 0;
+  terminalHttpReady = false;
+  terminalHttpInputQueue = '';
+  terminalHttpInputSending = false;
+  terminalHttpFallbackNoticeShown = false;
+  terminalHttpNoticePending = false;
+  terminalHttpTruncatedShown = false;
 }
 
 function resetTerminalView() {
@@ -4150,6 +4227,7 @@ function resetTerminalView() {
     terminal = null;
   }
   terminalFit = null;
+  resetTerminalHttpState();
   const container = qs('#terminalContainer');
   if (container) container.innerHTML = '';
 }
@@ -4219,8 +4297,7 @@ function ensureTerminal() {
   }
   terminal.open(container);
   terminal.onData((data) => {
-    if (!terminalSocket || terminalSocket.readyState !== WebSocket.OPEN) return;
-    terminalSocket.send(JSON.stringify({ type: 'input', data }));
+    sendTerminalMessage({ type: 'input', data });
   });
   terminal.onResize(({ cols, rows }) => {
     if (cols && rows) sendTerminalMessage({ type: 'resize', cols, rows });
@@ -4238,6 +4315,56 @@ function ensureTerminal() {
 function sendTerminalMessage(message) {
   if (terminalSocket && terminalSocket.readyState === WebSocket.OPEN) {
     try { terminalSocket.send(JSON.stringify(message)); } catch {}
+    return;
+  }
+  if (terminalTransport !== 'http' || !terminalSessionId) return;
+  if (message.type === 'input' && typeof message.data === 'string') {
+    terminalHttpInputQueue += message.data;
+    if (terminalHttpInputQueue.length > 65536) {
+      terminalHttpInputQueue = terminalHttpInputQueue.slice(-65536);
+    }
+    if (!terminalHttpInputTimer) {
+      terminalHttpInputTimer = setTimeout(flushTerminalHttpInput, 25);
+    }
+  } else if (message.type === 'resize' && message.cols && message.rows) {
+    postTerminalHttp({ cols: message.cols, rows: message.rows });
+  }
+}
+
+function postTerminalHttp(payload) {
+  const sessionId = terminalSessionId;
+  if (!sessionId || terminalTransport !== 'http') return Promise.resolve();
+  return fetch(`/api/terminal/sessions/${encodeURIComponent(sessionId)}/input`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+    cache: 'no-store'
+  }).then(async res => {
+    if (res.status === 404 && sessionId === terminalSessionId) {
+      handleLostTerminalSession(sessionId);
+      return;
+    }
+    if (!res.ok) throw new Error(`Terminal input failed (${res.status})`);
+    return res.json().catch(() => ({}));
+  });
+}
+
+async function flushTerminalHttpInput() {
+  terminalHttpInputTimer = null;
+  if (!terminalHttpInputQueue || terminalHttpInputSending) return;
+  const data = terminalHttpInputQueue;
+  terminalHttpInputQueue = '';
+  terminalHttpInputSending = true;
+  try {
+    await postTerminalHttp({ data });
+  } catch {
+    // The poll loop owns connection errors; dropping one batch is better than
+    // replaying the same keystrokes twice after a partial write.
+  } finally {
+    terminalHttpInputSending = false;
+    if (terminalHttpInputQueue) {
+      terminalHttpInputTimer = setTimeout(flushTerminalHttpInput, 0);
+    }
   }
 }
 
@@ -4255,6 +4382,19 @@ function setTerminalStatus(text) {
   if (el) el.textContent = text;
 }
 
+function applyTerminalReady(session = {}) {
+  if (terminal) {
+    try { terminal.reset(); } catch {}
+  }
+  if (qs('#terminalTitle')) qs('#terminalTitle').textContent = session.title || 'Terminal';
+  if (qs('#terminalSessionLabel')) {
+    qs('#terminalSessionLabel').textContent = session.app === 'opencode'
+      ? 'OC Assist can ask follow-up questions. The app appears in Apps when it is ready.'
+      : `Shell · ${session.cwd || ''} · pid ${session.pid || '—'}`;
+  }
+  setTerminalStatus('Connected');
+}
+
 function startTerminalHeartbeat(ws, token) {
   if (terminalHeartbeatTimer) clearInterval(terminalHeartbeatTimer);
   terminalHeartbeatTimer = setInterval(() => {
@@ -4265,7 +4405,9 @@ function startTerminalHeartbeat(ws, token) {
 
 function handleLostTerminalSession(sessionId) {
   if (sessionId !== terminalSessionId) return;
+  const wasOpencode = terminalSessionApp === 'opencode';
   clearTerminalConnectionTimers();
+  terminalTransport = 'ws';
   terminalSessionId = null;
   terminalSessionApp = '';
   terminalConnectToken += 1;
@@ -4274,8 +4416,12 @@ function handleLostTerminalSession(sessionId) {
     terminalSocket = null;
   }
   setTerminalStatus('Session ended');
-  terminalNotice('This OpenCode session is no longer running. Close this window and start OC Assist again from the App Creation tab.');
-  toast('The OC Assist session ended. Start OC Assist again to continue.', true, 8000);
+  terminalNotice(wasOpencode
+    ? 'This OpenCode session is no longer running. Close this window and start OC Assist again from the App Creation tab.'
+    : 'This terminal session is no longer running. Close this window and open the terminal again.');
+  toast(wasOpencode
+    ? 'The OC Assist session ended. Start OC Assist again to continue.'
+    : 'The terminal session ended. Open the terminal again to start a new session.', true, 8000);
   loadCoreOpencode();
 }
 
@@ -4310,8 +4456,116 @@ async function scheduleTerminalReconnect(sessionId) {
       handleLostTerminalSession(sessionId);
       return;
     }
+    if (terminalReconnectAttempt >= TERMINAL_WS_FALLBACK_ATTEMPTS) {
+      startTerminalHttp(sessionId, terminalConnectToken);
+      return;
+    }
     connectTerminal({ reconnect: true });
   }, delay);
+}
+
+function scheduleTerminalHttpPoll(sessionId, token, delay) {
+  if (terminalHttpTimer) clearTimeout(terminalHttpTimer);
+  terminalHttpTimer = setTimeout(() => {
+    terminalHttpTimer = null;
+    pollTerminalHttp(sessionId, token);
+  }, Math.max(0, delay));
+}
+
+function failTerminalHttp(sessionId, token, message) {
+  if (token !== terminalConnectToken || sessionId !== terminalSessionId || terminalTransport !== 'http') return;
+  terminalHttpErrors += 1;
+  if (terminalHttpErrors >= TERMINAL_MAX_RECONNECT) {
+    setTerminalStatus('Disconnected');
+    terminalNotice(`${message} Close this window and start again.`);
+    return;
+  }
+  setTerminalStatus(`Connection lost — retrying (${terminalHttpErrors}/${TERMINAL_MAX_RECONNECT})…`);
+  scheduleTerminalHttpPoll(sessionId, token, Math.min(500 * terminalHttpErrors, 5000));
+}
+
+async function pollTerminalHttp(sessionId, token) {
+  if (token !== terminalConnectToken || sessionId !== terminalSessionId || terminalTransport !== 'http') return;
+  let res;
+  try {
+    res = await fetch(
+      `/api/terminal/sessions/${encodeURIComponent(sessionId)}/output?after=${terminalHttpCursor}`,
+      { cache: 'no-store' }
+    );
+  } catch {
+    failTerminalHttp(sessionId, token, 'The terminal connection was lost.');
+    return;
+  }
+  if (token !== terminalConnectToken || sessionId !== terminalSessionId || terminalTransport !== 'http') return;
+  if (res.status === 404) {
+    handleLostTerminalSession(sessionId);
+    return;
+  }
+  if (!res.ok) {
+    failTerminalHttp(sessionId, token, `The terminal connection failed (HTTP ${res.status}).`);
+    return;
+  }
+  let data;
+  try {
+    data = await res.json();
+  } catch {
+    failTerminalHttp(sessionId, token, 'The terminal returned an invalid response.');
+    return;
+  }
+  if (token !== terminalConnectToken || sessionId !== terminalSessionId || terminalTransport !== 'http') return;
+  terminalHttpErrors = 0;
+  if (!terminalHttpReady) {
+    applyTerminalReady(data.session || {});
+    terminalHttpReady = true;
+    setTimeout(fitTerminal, 30);
+  }
+  if (terminalHttpNoticePending) {
+    terminalHttpNoticePending = false;
+    setTerminalStatus('Connected (compatibility mode)');
+    const message = 'WebSocket is unavailable here; using HTTP compatibility mode.';
+    if (terminalSessionApp === 'opencode') toast(message, false, 6000);
+    else terminalNotice(message);
+  }
+  if (data.truncated && !terminalHttpTruncatedShown) {
+    terminalHttpTruncatedShown = true;
+    const message = 'Some earlier terminal output is no longer in the replay buffer.';
+    if (terminalSessionApp === 'opencode') toast(message, true, 6000);
+    else terminalNotice(message);
+  }
+  const chunks = Array.isArray(data.chunks) ? data.chunks : [];
+  for (const chunk of chunks) {
+    if (terminal && typeof chunk === 'string') terminal.write(chunk);
+  }
+  const cursor = Number(data.cursor);
+  if (Number.isFinite(cursor)) terminalHttpCursor = cursor;
+  if (data.exited) {
+    clearTerminalConnectionTimers();
+    setTerminalStatus(`Exited (${data.exitCode})`);
+    toast(`Terminal session ended${data.exitCode === 0 ? '' : ` with code ${data.exitCode}`}`, data.exitCode !== 0);
+    loadCoreOpencode();
+    return;
+  }
+  scheduleTerminalHttpPoll(sessionId, token, chunks.length ? 25 : TERMINAL_HTTP_IDLE_MS);
+}
+
+function startTerminalHttp(sessionId, token) {
+  if (token !== terminalConnectToken || sessionId !== terminalSessionId) return;
+  clearTerminalConnectionTimers();
+  terminalTransport = 'http';
+  if (terminalSocket) {
+    try { terminalSocket.close(); } catch {}
+    terminalSocket = null;
+  }
+  terminalHttpCursor = 0;
+  terminalHttpErrors = 0;
+  terminalHttpReady = false;
+  terminalHttpInputQueue = '';
+  if (!terminalHttpFallbackNoticeShown) {
+    terminalHttpFallbackNoticeShown = true;
+    terminalHttpNoticePending = true;
+  }
+  setTerminalStatus('Connecting without WebSocket…');
+  pollTerminalHttp(sessionId, token);
 }
 
 function connectTerminal({ reconnect = false } = {}) {
@@ -4328,14 +4582,18 @@ function connectTerminal({ reconnect = false } = {}) {
   try {
     ws = new WebSocket(url);
   } catch {
-    scheduleTerminalReconnect(sessionId);
+    startTerminalHttp(sessionId, token);
     return;
   }
+  let opened = false;
+  terminalTransport = 'ws';
   terminalSocket = ws;
   setTerminalStatus(reconnect ? 'Reconnecting…' : 'Connecting…');
 
   ws.onopen = () => {
     if (token !== terminalConnectToken || terminalSessionId !== sessionId) return;
+    opened = true;
+    terminalTransport = 'ws';
     terminalReconnectAttempt = 0;
     setTerminalStatus('Connected');
     startTerminalHeartbeat(ws, token);
@@ -4351,17 +4609,7 @@ function connectTerminal({ reconnect = false } = {}) {
     if (message.type === 'output' && terminal) {
       terminal.write(message.data);
     } else if (message.type === 'ready') {
-      const session = message.session || {};
-      if (terminal) {
-        try { terminal.reset(); } catch {}
-      }
-      if (qs('#terminalTitle')) qs('#terminalTitle').textContent = session.title || 'Terminal';
-      if (qs('#terminalSessionLabel')) {
-        qs('#terminalSessionLabel').textContent = session.app === 'opencode'
-          ? 'OC Assist can ask follow-up questions. The app appears in Apps when it is ready.'
-          : `Shell · ${session.cwd || ''} · pid ${session.pid || '—'}`;
-      }
-      setTerminalStatus('Connected');
+      applyTerminalReady(message.session || {});
     } else if (message.type === 'ping') {
       try { ws.send(JSON.stringify({ type: 'pong', at: Date.now() })); } catch {}
     } else if (message.type === 'exit') {
@@ -4379,9 +4627,16 @@ function connectTerminal({ reconnect = false } = {}) {
       terminalHeartbeatTimer = null;
     }
     if (terminalSocket === ws) terminalSocket = null;
+    if (terminalTransport !== 'ws') return;
     const status = qs('#terminalStatus')?.textContent || '';
     if (status.startsWith('Exited')) return;
     if (!terminalSessionId || terminalSessionId !== sessionId) return;
+    // A proxy that strips the upgrade header closes before `open`. Switch to
+    // HTTP polling immediately instead of making the user wait through retries.
+    if (!opened) {
+      startTerminalHttp(sessionId, token);
+      return;
+    }
     scheduleTerminalReconnect(sessionId);
   };
 

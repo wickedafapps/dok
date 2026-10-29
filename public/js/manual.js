@@ -81,6 +81,7 @@
           <li><strong>Local upload</strong> uploads files or a folder from your computer.</li>
         </ul>
         <p>If a git clone or upload has no compose file or Dockerfile, Dok stores it under Projects instead of creating an app. You can deploy it later from that project.</p>
+        <p>Created apps join Dok&rsquo;s default network (normally <code>wicked</code>). If nginx-proxy is installed, the routed service gets a matching <code>VIRTUAL_HOST</code>/<code>VIRTUAL_PORT</code> pair, is attached to that network, and its published host ports are removed so the GUI is served through nginx.</p>
         <p>Before finalising, Dok validates the compose file, resolves networks and bind mounts, checks published ports, and asks for any missing choices. <strong>Save to library</strong> saves the app stopped. <strong>Test launch (stops after test)</strong> starts it briefly, reports the container states, and stops it again. Nothing stays running until you deploy from Apps.</p>
       `
     },
@@ -165,6 +166,7 @@
           <li>Every change regenerates the compose preview and is validated by the server.</li>
         </ul>
         <p><strong>VIRTUAL_HOST</strong> and <strong>VIRTUAL_PORT</strong> quick fields stay in sync with the service environment. When nginx-proxy, Authelia, or acme-companion is installed (running or stopped), the builder adds the matching environment fields automatically: routing host and container port, optional <code>ENABLE_AUTH=true</code>, and certificate host and email. Suggested hostnames use <code>&lt;app&gt;.&lt;primary domain&gt;</code> from Dok Settings.</p>
+        <p>When nginx-proxy is installed, the routed service joins Dok&rsquo;s default network and uses <code>VIRTUAL_HOST</code> plus a matching container <code>VIRTUAL_PORT</code>. <code>VIRTUAL_PORT</code> is filled from an explicit form value, then an existing <code>VIRTUAL_PORT</code>, then the first published container port, then <code>expose</code>, then the <code>PORT</code> environment variable, then 80. Published host <code>ports</code> are removed from that service because nginx reaches it over the shared network, so several apps can use the same container port without host conflicts. Finalize and Deploy apply the same rule even when you paste or manually edit a compose file.</p>
         <h4>Manual editing</h4>
         <p><strong>Manually edit compose file</strong> shows a warning and switches to raw text editing. Manual mode bypasses the builder guard but still uses compose validation. Use <strong>Validate compose</strong> before finishing.</p>
         <h4>Missing resources</h4>
@@ -475,10 +477,10 @@
         </ul>
         <h4>Networking</h4>
         <ul>
-          <li><strong>Ports</strong> use <code>host:container</code> or <code>container</code>. Published host ports must be unique on the host.</li>
-          <li><strong>Networks</strong> attach the service to Docker networks. <code>wicked</code> is Dok&rsquo;s default app network.</li>
+          <li><strong>Ports</strong> use <code>host:container</code> or <code>container</code>. Published host ports must be unique on the host. With nginx-proxy installed, a routed service should not publish host ports; Dok removes them and routes through the shared network instead.</li>
+          <li><strong>Networks</strong> attach the service to Docker networks. <code>wicked</code> is Dok&rsquo;s default app network and the routed service is always attached to it.</li>
           <li><strong>VIRTUAL_HOST</strong> is the hostname nginx-proxy serves.</li>
-          <li><strong>VIRTUAL_PORT</strong> is the container port nginx-proxy forwards to. It is required when the container exposes more than one port.</li>
+          <li><strong>VIRTUAL_PORT</strong> is the container port nginx-proxy forwards to, not the host port. Dok fills it automatically from the service&rsquo;s container port so the GUI works through nginx.</li>
           <li><strong>ENABLE_AUTH</strong> opts the container into Authelia forward authentication.</li>
         </ul>
         <h4>Storage</h4>
@@ -519,8 +521,8 @@
         </ul>
         <h4>Terminal or OpenCode will not open</h4>
         <ul>
-          <li>Check the server log for PTY or OpenCode errors.</li>
-          <li>Ensure the WebSocket path <code>/api/terminal/ws</code> is forwarded by your reverse proxy.</li>
+          <li>Check the server log for PTY, shell, or OpenCode errors.</li>
+          <li>The terminal switches to HTTP compatibility mode when a proxy blocks <code>/api/terminal/ws</code>. Forwarding WebSocket upgrades is still faster.</li>
           <li>Rebuild the image if OpenCode is missing from an older deployment.</li>
         </ul>
         <h4>Imported app needs setup</h4>
