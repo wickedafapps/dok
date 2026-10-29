@@ -7,7 +7,7 @@ import multer from 'multer';
 import pty from 'node-pty';
 import { WebSocketServer } from 'ws';
 import {
-  DOK_ROOT, DOK_COMPOSE_ROOT, HOST_ROOT, MAINT_DATA, DOK_CONTAINER, DOK_PORT, DOK_IMAGE, DOK_HOST_PATH,
+  DOK_ROOT, DOK_COMPOSE_ROOT, HOST_ROOT, MAINT_DATA, MAINT_DATA_HOST, DOK_CONTAINER, DOK_PORT, DOK_IMAGE, DOK_HOST_PATH,
   MAINTENANCE_URL, DEFAULT_NETWORK, dataDir, appsDir, coreDir, sourcesDir, uploadsDir,
   backupsDir, snapshotsDir, logsDir, opencodeDir, installationPath, installationStatePath, tokenPath,
   ensureDirs, readJson, writeJson, writePrivateFile, run, tail, randomSecret, yamlScalar,
@@ -153,7 +153,7 @@ app.get('/api/system', api(async (req, res) => {
       apps: listApps(),
       tokenRequired: MAINTENANCE_REQUIRE_TOKEN,
       root: DOK_ROOT,
-      dataRoot: MAINT_DATA,
+      dataRoot: MAINT_DATA_HOST,
       hostPath: DOK_HOST_PATH,
       maintenanceUrl: MAINTENANCE_URL
     },

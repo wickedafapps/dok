@@ -450,7 +450,7 @@
     'settings-backups': {
       title: 'Backups and updates',
       html: `
-        <p>Backups, snapshots, imports, and updates are now managed by the Dok Maintenance container under <strong>Settings → Maintenance</strong>. The legacy Dok backup routes remain available for compatibility, but the Maintenance store is separate from <code>data/</code> and is never exported with an app.</p>
+        <p>Backups, snapshots, imports, and updates are now managed by the Dok Maintenance container under <strong>Settings → Maintenance</strong>. The legacy Dok backup routes remain available for compatibility, but the Maintenance store lives outside the Dok checkout (normally <code>&lt;checkout&gt;-maintenance-data</code>, or <code>MAINTENANCE_DATA_PATH</code>) and is never exported with an app.</p>
         <p>Legacy backups are stored locally under <code>data/backups</code> as a <code>.tar.gz</code> archive plus JSON metadata.</p>
         <h4>Scopes</h4>
         <ul>

@@ -5,6 +5,7 @@ DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 SOCK=${DOCKER_SOCK:-/var/run/docker.sock}
 PUID=${PUID:-${SUDO_UID:-}}
 PGID=${PGID:-${SUDO_GID:-}}
+MAINT_DATA=${MAINTENANCE_DATA_PATH:-}
 OVERRIDE_FAILED=0
 GROUP_ADDED=0
 
@@ -18,10 +19,13 @@ Options:
   --uid UID       UID for the WickedAFDok container user (default: sudo user, else repo owner)
   --gid GID       GID for the WickedAFDok container user (default: sudo user, else repo owner)
   --socket PATH   Docker socket path (default: /var/run/docker.sock)
+  --maintenance-data PATH
+                  Host store for Maintenance backups/snapshots (default:
+                  <checkout>-maintenance-data beside the checkout)
   --root          Run the container as root (UID/GID 0)
   -h, --help      Show this help
 
-Environment: PUID, PGID, DOCKER_SOCK, MAINTENANCE_PORT, SKIP_BUILD
+Environment: PUID, PGID, DOCKER_SOCK, MAINTENANCE_DATA_PATH, MAINTENANCE_PORT, SKIP_BUILD
 EOF
 }
 
@@ -40,6 +44,11 @@ while [ "$#" -gt 0 ]; do
     --socket)
       [ "$#" -ge 2 ] || { echo "Missing value for --socket" >&2; exit 2; }
       SOCK=$2
+      shift 2
+      ;;
+    --maintenance-data)
+      [ "$#" -ge 2 ] || { echo "Missing value for --maintenance-data" >&2; exit 2; }
+      MAINT_DATA=$2
       shift 2
       ;;
     --root)
@@ -84,6 +93,56 @@ esac
 if printf '%s' "$SOCK" | grep -q '[[:cntrl:]"$`\\]'; then
   echo "Unsupported characters in Docker socket path: $SOCK" >&2
   exit 2
+fi
+
+# Maintenance storage belongs beside the checkout, not inside it: replacing or
+# re-cloning Dok must never put backups, snapshots, or installation records at
+# risk. --maintenance-data / MAINTENANCE_DATA_PATH can point anywhere else.
+DIR_REAL=$(cd -- "$DIR" && pwd -P)
+if [ -z "$MAINT_DATA" ]; then
+  MAINT_DATA="$(dirname "$DIR_REAL")/$(basename "$DIR_REAL")-maintenance-data"
+fi
+case "$MAINT_DATA" in
+  /*) ;;
+  *) echo "The maintenance data path must be absolute: $MAINT_DATA" >&2; exit 2 ;;
+esac
+MAINT_NAME=$(basename "$MAINT_DATA")
+case "$MAINT_NAME" in
+  ''|.|..) echo "Invalid maintenance data path: $MAINT_DATA" >&2; exit 2 ;;
+esac
+MAINT_PARENT=$(dirname "$MAINT_DATA")
+mkdir -p "$MAINT_PARENT"
+MAINT_PARENT=$(cd -- "$MAINT_PARENT" && pwd -P)
+MAINT_DATA="$MAINT_PARENT/$MAINT_NAME"
+case "$MAINT_DATA/" in
+  "$DIR_REAL"/*)
+    echo "The maintenance data store must be outside the Dok checkout: $MAINT_DATA" >&2
+    exit 2
+    ;;
+esac
+
+# Move a legacy in-checkout store on first run. When the new store already has
+# data, keep the old one under a timestamped folder there instead of
+# overwriting either copy.
+LEGACY_MAINT_DATA="$DIR_REAL/maintenance-data"
+if [ -d "$LEGACY_MAINT_DATA" ] && [ "$LEGACY_MAINT_DATA" != "$MAINT_DATA" ]; then
+  if [ ! -e "$MAINT_DATA" ] || { [ -d "$MAINT_DATA" ] && [ -z "$(ls -A "$MAINT_DATA" 2>/dev/null)" ]; }; then
+    rmdir "$MAINT_DATA" 2>/dev/null || true
+    if mv "$LEGACY_MAINT_DATA" "$MAINT_DATA" 2>/dev/null; then
+      echo "Moved maintenance data to $MAINT_DATA"
+    else
+      mkdir -p "$MAINT_DATA"
+      cp -Rp "$LEGACY_MAINT_DATA/." "$MAINT_DATA/" && rm -rf "$LEGACY_MAINT_DATA"
+      echo "Moved maintenance data to $MAINT_DATA"
+    fi
+  else
+    archive="$MAINT_DATA/legacy-import-$(date +%Y%m%d%H%M%S)"
+    mkdir -p "$archive"
+    if mv "$LEGACY_MAINT_DATA" "$archive/legacy" 2>/dev/null; then :; else
+      cp -Rp "$LEGACY_MAINT_DATA/." "$archive/" && rm -rf "$LEGACY_MAINT_DATA"
+    fi
+    echo "WARNING: kept the previous in-checkout maintenance data at $archive" >&2
+  fi
 fi
 
 if [ "$SOCK" != "/var/run/docker.sock" ] && [ -z "${DOCKER_HOST:-}" ]; then
@@ -189,9 +248,10 @@ add_host_user_to_socket_group() {
 
 add_host_user_to_socket_group
 
-for d in data sources uploads apps core data/wickedafdok data/.home data/opencode data/docker-config data/tmp maintenance-data; do
+for d in data sources uploads apps core data/wickedafdok data/.home data/opencode data/docker-config data/tmp; do
   mkdir -p "$DIR/$d"
 done
+mkdir -p "$MAINT_DATA"
 
 # Take ownership of the whole checkout so the container user can update code,
 # write runtime state, and manage compose files without root-owned leftovers.
@@ -229,7 +289,7 @@ if [ -f "$DIR/.env" ]; then
   chmod 600 "$DIR/.env" 2>/dev/null || true
 fi
 chmod 700 "$DIR/data/.home" "$DIR/data/backups" "$DIR/data/host-helper" "$DIR/data/opencode" \
-  "$DIR/data/docker-config" "$DIR/data/tmp" "$DIR/maintenance-data" 2>/dev/null || true
+  "$DIR/data/docker-config" "$DIR/data/tmp" "$MAINT_DATA" 2>/dev/null || true
 chmod 600 "$DIR/data/.credentials-key" 2>/dev/null || true
 chmod 700 "$DIR/data/tmp/git-askpass.sh" 2>/dev/null || true
 # OpenCode stores provider auth, session state, and generated configs here.
@@ -266,6 +326,7 @@ services:
       - HOME=/app/data/.home
       - "DOCKER_SOCK=$SOCK"
       - "MAINTENANCE_PORT=${MAINTENANCE_PORT:-8090}"
+      - "MAINTENANCE_DATA_PATH=$MAINT_DATA"
 EOF
   then
     rm -f "$tmp"
@@ -318,10 +379,10 @@ fi
 MAINTENANCE_TOKEN=$(cat "$TOKEN_FILE")
 MAINTENANCE_PORT=${MAINTENANCE_PORT:-8090}
 
-find "$DIR/maintenance-data" -type d -exec chmod 700 {} + 2>/dev/null || true
-find "$DIR/maintenance-data" -type f -exec chmod 600 {} + 2>/dev/null || true
+find "$MAINT_DATA" -type d -exec chmod 700 {} + 2>/dev/null || true
+find "$MAINT_DATA" -type f -exec chmod 600 {} + 2>/dev/null || true
 if [ "$PUID" -ne 0 ] || [ "$PGID" -ne 0 ]; then
-  chown -R "$PUID:$PGID" "$DIR/maintenance-data" 2>/dev/null || true
+  chown -R "$PUID:$PGID" "$MAINT_DATA" 2>/dev/null || true
 fi
 
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
@@ -337,6 +398,7 @@ if docker inspect wickedafdok-maintenance >/dev/null 2>&1; then
 fi
 if ! DOK_PATH="$DIR" HOST_PATH=/ PUID="$PUID" PGID="$PGID" \
   DOCKER_SOCK="$SOCK" MAINTENANCE_PORT="$MAINTENANCE_PORT" \
+  MAINTENANCE_DATA_PATH="$MAINT_DATA" \
   MAINTENANCE_URL="http://localhost:$MAINTENANCE_PORT" MAINTENANCE_REQUIRE_TOKEN=1 \
   docker compose -p wickedafdok-maintenance -f "$DIR/maintenance/docker-compose.yml" up -d --remove-orphans --force-recreate; then
   echo "Could not start the Dok Maintenance container." >&2

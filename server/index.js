@@ -853,10 +853,28 @@ async function gitText(args, cwd, env = process.env) {
   return String(stdout || '').trim();
 }
 
+// Git refuses to operate on a checkout owned by another user ("dubious
+// ownership"). Dok commonly runs as a container UID while the checkout is
+// owned by the host user, so every git command trusts exactly the directory
+// it runs in instead of requiring a host-level safe.directory entry.
+function gitArgsWithSafeDirectory(args, cwd) {
+  const dirs = new Set();
+  for (const candidate of [cwd, path.resolve(cwd || root)]) {
+    if (!candidate) continue;
+    const resolved = path.resolve(String(candidate));
+    dirs.add(resolved);
+    try { dirs.add(fs.realpathSync(resolved)); } catch {}
+  }
+  const prefix = [];
+  for (const dir of dirs) prefix.push('-c', `safe.directory=${dir}`);
+  return [...prefix, ...args];
+}
+
 function run(cmd, args, opts = {}) {
   return new Promise((resolve, reject) => {
     const env = opts.env || (cmd === 'docker' ? dockerEnvironment() : process.env);
-    execFile(cmd, args, { cwd: root, env, maxBuffer: 1024 * 1024 * 50, ...opts }, (err, stdout, stderr) => {
+    const execArgs = cmd === 'git' ? gitArgsWithSafeDirectory(args, opts.cwd || root) : args;
+    execFile(cmd, execArgs, { cwd: root, env, maxBuffer: 1024 * 1024 * 50, ...opts }, (err, stdout, stderr) => {
       if (err) {
         err.stdout = stdout;
         err.stderr = stderr;
@@ -5626,8 +5644,20 @@ async function maintenanceHostCheckout() {
   return checkout;
 }
 
+// Maintenance storage must survive a replaced checkout, so it lives beside
+// the cloned directory instead of inside it. setup.sh defaults to
+// <checkout>-maintenance-data and passes MAINTENANCE_DATA_PATH through the
+// compose override; deriving the same path here keeps UI-started containers
+// aligned when Dok was launched without that override.
+function maintenanceDataHostPath(checkout) {
+  const configured = String(process.env.MAINTENANCE_DATA_PATH || '').trim();
+  if (configured && path.isAbsolute(configured)) return path.normalize(configured);
+  const resolved = path.resolve(String(checkout || ''));
+  return `${resolved.replace(/[/\\]+$/, '')}-maintenance-data`;
+}
+
 function maintenanceComposeText({ checkout, image, installationId: id, hostPort, uid, gid, socket }) {
-  const dataPath = path.join(checkout, 'maintenance-data');
+  const dataPath = maintenanceDataHostPath(checkout);
   const lines = [
     '# managed-by: wickedafdok',
     'name: wickedafdok-maintenance',
@@ -5655,6 +5685,7 @@ function maintenanceComposeText({ checkout, image, installationId: id, hostPort,
     '    environment:',
     '      - DOK_ROOT=/dok',
     '      - MAINTENANCE_DATA=/maintenance-data',
+    `      - ${yamlScalar(`MAINTENANCE_DATA_HOST_PATH=${dataPath}`)}`,
     '      - HOST_ROOT=/host',
     `      - ${yamlScalar(`DOK_HOST_PATH=${checkout}`)}`,
     '      - DOK_CONTAINER=wickedafdok',
@@ -5710,14 +5741,15 @@ async function ensureMaintenanceCompose() {
   });
   fs.mkdirSync(path.dirname(maintenanceComposePath), { recursive: true });
   writePrivateFile(maintenanceComposePath, text);
-  // The host checkout is mounted at /app/host-source in the Dok container.
-  // Create the dedicated store here when the checkout is bind-mounted so the
-  // Maintenance container never has to guess at its host location.
+  // The store normally comes from setup.sh outside the checkout. An old Host
+  // Helper can also create it with the right owner; without one, Docker will
+  // create the bind source, and Maintenance (which runs privileged) migrates
+  // any legacy data on start.
+  const dataPath = maintenanceDataHostPath(checkout);
   try {
-    const hostSource = updateSourceDir();
-    if (hostSource !== root) fs.mkdirSync(path.join(hostSource, 'maintenance-data'), { recursive: true });
+    if (await hostHelperAvailable()) await hostMkdir(dataPath, { mode: 0o700 });
   } catch {}
-  return { composePath: maintenanceComposePath, checkout, image, hostPort, token, id };
+  return { composePath: maintenanceComposePath, checkout, image, hostPort, token, id, dataPath };
 }
 
 async function maintenanceContainerInfo() {
@@ -5770,6 +5802,11 @@ function maintenanceUrl(req) {
 async function maintenanceStatus(req) {
   const info = await maintenanceContainerInfo();
   const running = info?.State?.Running === true;
+  let dataPath = '';
+  try {
+    const checkout = await maintenanceHostCheckout();
+    if (checkout) dataPath = maintenanceDataHostPath(checkout);
+  } catch {}
   return {
     installed: !!info,
     running,
@@ -5780,6 +5817,7 @@ async function maintenanceStatus(req) {
     tokenRequired: true,
     port: maintenanceHostPort(),
     composePath: maintenanceComposePath,
+    dataPath,
     image: info?.Config?.Image || ''
   };
 }

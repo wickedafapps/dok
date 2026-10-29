@@ -878,7 +878,7 @@
         <div class="card">
           <h3>Installation and core services</h3>
           <p class="muted">Dok and its core services are now installed by the Maintenance installer. The Core Services tab only shows services that are already installed, with the same start, stop, restart, domain, and compose controls.</p>
-          <p class="muted">Backups, updates, snapshots, repair tools, and the full installation record live in the Maintenance container at <code>maintenance-data/</code>. That folder is separate from <code>data/</code> and is never exported with an app.</p>
+          <p class="muted">Backups, updates, snapshots, repair tools, and the full installation record live beside the checkout in <code>&lt;checkout&gt;-maintenance-data</code> (or <code>MAINTENANCE_DATA_PATH</code>). That folder is separate from the checkout and <code>data/</code> and is never exported with an app.</p>
         </div>
         <div class="card">
           <h3>Admin OpenCode</h3>

@@ -8,6 +8,7 @@ import { execFile } from 'child_process';
 export const DOK_ROOT = path.resolve(process.env.DOK_ROOT || '/dok');
 export const HOST_ROOT = path.resolve(process.env.HOST_ROOT || '/host');
 export const MAINT_DATA = path.resolve(process.env.MAINTENANCE_DATA || '/maintenance-data');
+export const MAINT_DATA_HOST = String(process.env.MAINTENANCE_DATA_HOST_PATH || '').trim() || MAINT_DATA;
 export const DOK_CONTAINER = String(process.env.DOK_CONTAINER || 'wickedafdok').trim();
 export const DOK_PORT = Number(process.env.DOK_PORT) || 8080;
 export const DOK_IMAGE = String(process.env.DOK_IMAGE || 'wickedafdok:latest').trim();
@@ -38,7 +39,38 @@ export const dokInstallationStatePath = path.join(dataDir, 'installation-state.j
 export const dokInstallationPath = path.join(dataDir, 'installation.json');
 export const tokenPath = process.env.MAINTENANCE_TOKEN_FILE || path.join(dataDir, '.maintenance-token');
 
+// Older installs kept the store inside the checkout. Move it beside the
+// checkout on first start so replacing the Dok checkout no longer risks the
+// maintenance records. Conflicts are copied into a timestamped folder under
+// the new store rather than overwritten.
+function migrateLegacyMaintenanceData() {
+  const legacy = path.join(DOK_ROOT, 'maintenance-data');
+  if (path.resolve(legacy) === path.resolve(MAINT_DATA)) return;
+  let stat;
+  try { stat = fs.lstatSync(legacy); } catch { return; }
+  if (!stat.isDirectory()) return;
+  try {
+    fs.mkdirSync(MAINT_DATA, { recursive: true });
+    const empty = !fs.readdirSync(MAINT_DATA).length;
+    if (empty) {
+      try { fs.rmdirSync(MAINT_DATA); } catch {}
+      try { fs.renameSync(legacy, MAINT_DATA); return; } catch {}
+      fs.mkdirSync(MAINT_DATA, { recursive: true });
+    }
+    for (const entry of fs.readdirSync(legacy)) {
+      const src = path.join(legacy, entry);
+      const dest = path.join(MAINT_DATA, entry);
+      if (fs.existsSync(dest)) continue;
+      fs.cpSync(src, dest, { recursive: true, force: false, errorOnExist: false });
+      fs.rmSync(src, { recursive: true, force: true });
+    }
+    if (!fs.readdirSync(legacy).length) fs.rmdirSync(legacy);
+    else fs.renameSync(legacy, path.join(MAINT_DATA, `legacy-import-${Date.now()}`));
+  } catch {}
+}
+
 export function ensureDirs() {
+  migrateLegacyMaintenanceData();
   for (const dir of [MAINT_DATA, backupsDir, snapshotsDir, logsDir, opencodeDir,
     path.join(MAINT_DATA, 'tmp'),
     path.join(opencodeDir, 'home'), path.join(opencodeDir, 'config'),
@@ -85,9 +117,26 @@ function chownIfDokFile(file) {
   try { chownDokPath(target); } catch {}
 }
 
+// Git rejects a checkout owned by another user ("dubious ownership"). Dok's
+// checkout is usually owned by the host user while Maintenance runs privileged,
+// so trust exactly the directory each git command operates in.
+function gitArgsWithSafeDirectory(args, cwd) {
+  const dirs = new Set();
+  for (const candidate of [cwd, path.resolve(cwd || DOK_ROOT)]) {
+    if (!candidate) continue;
+    const resolved = path.resolve(String(candidate));
+    dirs.add(resolved);
+    try { dirs.add(fs.realpathSync(resolved)); } catch {}
+  }
+  const prefix = [];
+  for (const dir of dirs) prefix.push('-c', `safe.directory=${dir}`);
+  return [...prefix, ...args];
+}
+
 export function run(command, args = [], { cwd = DOK_ROOT, env = {}, timeout = 0, input = '' } = {}) {
   return new Promise((resolve, reject) => {
-    const child = execFile(command, args, {
+    const execArgs = command === 'git' ? gitArgsWithSafeDirectory(args, cwd) : args;
+    const child = execFile(command, execArgs, {
       cwd,
       timeout: timeout || 0,
       maxBuffer: 32 * 1024 * 1024,
