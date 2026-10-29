@@ -961,6 +961,43 @@ export function composeFilesFor(dir) {
     });
 }
 
+export function managedDokCompose() {
+  const dir = path.join(DOK_COMPOSE_ROOT, 'data', 'wickedafdok');
+  const file = path.join(dir, 'docker-compose.yml');
+  try {
+    if (!fs.statSync(file).isFile()) return null;
+    const text = fs.readFileSync(file, 'utf8');
+    if (/^[ \t]*-[ \t]*["']?\/app\/(?:data|sources|uploads|apps|core):\/app\/(?:data|sources|uploads|apps|core)["']?[ \t]*$/m.test(text)) {
+      return null;
+    }
+    return { dir, file, managed: true };
+  } catch {
+    return null;
+  }
+}
+
+export function dokComposeContext() {
+  const managed = managedDokCompose();
+  if (managed) return managed;
+  const file = composeFilesFor(DOK_COMPOSE_ROOT)[0] || path.join(DOK_COMPOSE_ROOT, 'docker-compose.yml');
+  return { dir: DOK_COMPOSE_ROOT, file, managed: false };
+}
+
+export function dokSocketOverridePath(ctx = dokComposeContext()) {
+  return ctx.managed
+    ? path.join(ctx.dir, 'docker-compose.socket-gid.yml')
+    : path.join(DOK_COMPOSE_ROOT, 'data', '.docker-socket-gid.yml');
+}
+
+export function dokComposeSupportFiles(ctx = dokComposeContext()) {
+  const files = [];
+  const override = path.join(ctx.dir, 'docker-compose.override.yml');
+  try { if (fs.statSync(override).isFile()) files.push(override); } catch {}
+  const socket = dokSocketOverridePath(ctx);
+  try { if (fs.statSync(socket).isFile()) files.push(socket); } catch {}
+  return files;
+}
+
 export function listCoreServices() {
   const names = [];
   try {

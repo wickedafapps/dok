@@ -20,7 +20,8 @@ import {
   selectedServiceIds, baseSettings, ensurePlanDirectories, listCoreServices, listApps,
   installationSummary, writeInstallationCompose, captureSnapshot, listSnapshots,
   listBackups, createBackup, restoreArchive, repairInstallation, systemInfo, dockerInfo,
-  maintenanceVersion, installationExists
+  maintenanceVersion, installationExists, dokComposeContext, dokComposeSupportFiles,
+  dokSocketOverridePath
 } from './lib.js';
 
 ensureDirs();
@@ -342,18 +343,75 @@ app.post('/api/registries/test', api(async (req, res) => {
   }
 }));
 
+async function composeServices(ctx) {
+  const out = await run('docker', ['compose', '-f', ctx.file, 'config', '--services'], {
+    cwd: ctx.dir,
+    timeout: 60000
+  });
+  return out.stdout.split(/\s+/).map(item => item.trim()).filter(Boolean);
+}
+
+async function composeImages(ctx) {
+  const out = await run('docker', ['compose', '-f', ctx.file, 'config', '--images'], {
+    cwd: ctx.dir,
+    timeout: 60000
+  });
+  return out.stdout.split(/\s+/).map(item => item.trim()).filter(Boolean);
+}
+
+function socketGid() {
+  for (const file of ['/var/run/docker.sock', process.env.DOCKER_SOCK]) {
+    if (!file) continue;
+    try { return String(fs.statSync(file).gid); } catch {}
+  }
+  return '';
+}
+
+async function ensureDokSocketOverride(ctx, log = () => {}) {
+  const target = dokSocketOverridePath(ctx);
+  const gid = socketGid();
+  if (!gid) return '';
+  try {
+    const services = await composeServices(ctx);
+    if (!services.length) return '';
+    const body = `# managed-by: wickedafdok-maintenance\nservices:\n  ${JSON.stringify(services[0])}:\n    group_add:\n      - ${JSON.stringify(gid)}\n`;
+    writePrivateFile(target, body);
+    return target;
+  } catch (e) {
+    log(`Could not refresh the Docker socket group override: ${e.message}`);
+    return '';
+  }
+}
+
+function dokComposeArgs(ctx) {
+  const args = ['compose', '-p', 'wickedafdok', '-f', ctx.file];
+  for (const file of dokComposeSupportFiles(ctx)) args.push('-f', file);
+  return args;
+}
+
+async function buildDokImage(ctx, log = () => {}) {
+  if (!fs.existsSync(path.join(DOK_ROOT, 'Dockerfile'))) {
+    if (ctx.managed) return null;
+    const result = await run('docker', [...dokComposeArgs(ctx), 'build'], { cwd: ctx.dir, timeout: 0 });
+    return result;
+  }
+  let image = DOK_IMAGE;
+  try {
+    image = (await composeImages(ctx))[0] || image;
+  } catch {}
+  log(`Building ${image} from ${DOK_ROOT}`);
+  return run('docker', ['build', '-t', image, DOK_ROOT], { cwd: DOK_ROOT, timeout: 0 });
+}
+
 async function launchDok({ build = true } = {}) {
-  const compose = path.join(DOK_COMPOSE_ROOT, 'docker-compose.yml');
-  if (!fs.existsSync(compose)) throw new Error(`Dok compose file was not found at ${compose}`);
-  const args = ['compose', '-p', 'wickedafdok', '-f', compose];
-  const override = path.join(DOK_COMPOSE_ROOT, 'docker-compose.override.yml');
-  if (fs.existsSync(override)) args.push('-f', override);
-  const socketOverride = path.join(DOK_COMPOSE_ROOT, 'data', '.docker-socket-gid.yml');
-  if (fs.existsSync(socketOverride)) args.push('-f', socketOverride);
-  args.push('up', '-d', '--remove-orphans');
-  if (build) args.push('--build');
-  const result = await run('docker', args, { cwd: DOK_COMPOSE_ROOT, timeout: 0 });
-  return result;
+  const ctx = dokComposeContext();
+  if (!fs.existsSync(ctx.file)) throw new Error(`Dok compose file was not found at ${ctx.file}`);
+  await ensureDokSocketOverride(ctx, message => logLine('WARN', message));
+  if (build) await buildDokImage(ctx, message => logLine('INFO', message));
+  logLine('INFO', `Launching Dok with the ${ctx.managed ? 'managed' : 'root'} compose ${ctx.file}`);
+  const args = dokComposeArgs(ctx);
+  args.push('up', '-d', '--force-recreate', '--remove-orphans');
+  return run('docker', args, { cwd: ctx.dir, timeout: 0 });
 }
 
 async function configureServices(plan, log) {
@@ -1031,16 +1089,17 @@ async function runUpdate({ repo = '', branch = '', force = false }) {
     }
     const commit = (await run('git', ['rev-parse', '--short', 'HEAD'], { cwd: DOK_ROOT }).catch(() => ({ stdout: '' }))).stdout.trim();
     job.phase = 'building';
+    const ctx = dokComposeContext();
+    if (!fs.existsSync(ctx.file)) throw new Error(`Dok compose file was not found at ${ctx.file}`);
+    log(`Using the ${ctx.managed ? 'managed' : 'root'} compose ${ctx.file}.`);
+    await ensureDokSocketOverride(ctx, message => log(message));
     log(`Building Dok image at ${commit || 'HEAD'}...`);
-    const composeArgs = ['compose', '-p', 'wickedafdok', '-f', path.join(DOK_COMPOSE_ROOT, 'docker-compose.yml')];
-    for (const name of ['docker-compose.override.yml', 'data/.docker-socket-gid.yml']) {
-      if (fs.existsSync(path.join(DOK_COMPOSE_ROOT, name))) composeArgs.push('-f', path.join(DOK_COMPOSE_ROOT, name));
-    }
-    const built = await run('docker', [...composeArgs, 'build'], { cwd: DOK_COMPOSE_ROOT, timeout: 0 });
-    log(tail(built.stdout || built.stderr, 12000));
+    const built = await buildDokImage(ctx, message => log(message));
+    if (built) log(tail(built.stdout || built.stderr, 12000));
+    const composeArgs = dokComposeArgs(ctx);
     job.phase = 'recreating';
-    log('Recreating Dok...');
-    await run('docker', [...composeArgs, 'up', '-d', '--remove-orphans'], { cwd: DOK_COMPOSE_ROOT, timeout: 0 });
+    log(`Recreating Dok from the ${ctx.managed ? 'managed' : 'root'} compose...`);
+    await run('docker', [...composeArgs, 'up', '-d', '--force-recreate', '--remove-orphans'], { cwd: ctx.dir, timeout: 0 });
     job.phase = 'waiting';
     await waitForDok(300000).catch(() => {});
     try { await dokApi('/api/installation/sync', { method: 'POST', body: { snapshot: true }, timeout: 120000 }); } catch {}
