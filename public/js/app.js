@@ -1334,6 +1334,18 @@ async function getCoreAppHints() {
   return coreAppHintsCache.promise;
 }
 
+function appCfgPrimaryContainerPort(service) {
+  const portsField = (service?.fields || []).find(field => field.key === 'ports');
+  for (const line of appCfgRawLines(portsField?.value)) {
+    const text = line.trim().replace(/\/(?:tcp|udp)$/i, '');
+    if (!text) continue;
+    const target = text.split(':').pop();
+    const match = String(target || '').match(/^(\d+)(?:-\d+)?$/);
+    if (match) return match[1];
+  }
+  return '';
+}
+
 function applyCoreServiceHintsToModel(model, hints) {
   const fields = Array.isArray(hints?.fields) ? hints.fields : [];
   if (!model || !fields.length) return false;
@@ -1360,6 +1372,8 @@ function applyCoreServiceHintsToModel(model, hints) {
       const primary = String(installDefaults?.primaryDomain || '').trim();
       if (appName && primary) value = `${appName}.${primary}`;
     }
+    if (!value && key === 'VIRTUAL_PORT') value = appCfgPrimaryContainerPort(service);
+    if (!value && key === 'LETSENCRYPT_EMAIL') value = String(installDefaults?.adminEmail || '').trim();
     lines.push(`${key}=${value}`);
     existing.add(key);
     changed = true;

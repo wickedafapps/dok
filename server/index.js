@@ -2102,6 +2102,108 @@ function normalizeComposeNetworks(composeText, networkNames = [], defaultNetwork
   };
 }
 
+function stripComposeProjectName(composeText) {
+  const lines = String(composeText || '').replace(/\r\n/g, '\n').split('\n');
+  let removed = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!/^name[ \t]*:/.test(line)) continue;
+    const rest = stripYamlComment(line.replace(/^name[ \t]*:/, '')).trim();
+    let end = i + 1;
+    if (!rest) {
+      while (end < lines.length) {
+        const child = lines[end];
+        if (!child.trim()) { end++; continue; }
+        if (lineIndent(child) === 0) break;
+        end++;
+      }
+    }
+    lines.splice(i, end - i);
+    removed = true;
+    i--;
+  }
+  if (!removed) return composeText;
+  while (lines.length && !lines[0].trim()) lines.shift();
+  return lines.join('\n');
+}
+
+function ensureManagedComposeHeader(composeText) {
+  const text = String(composeText || '').replace(/^\uFEFF/, '').replace(/\r\n/g, '\n');
+  if (!text.trim()) return text;
+  if (/^#\s*managed-by:\s*wickedafdok\b/m.test(text.split('\n')[0] || '')) return text;
+  return '# managed-by: wickedafdok\n' + text.replace(/^\n+/, '');
+}
+
+function ensureComposeServiceRestart(composeText) {
+  const lines = String(composeText || '').replace(/\r\n/g, '\n').split('\n');
+  let servicesLine = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^services[ \t]*:/.test(lines[i])) { servicesLine = i; break; }
+  }
+  if (servicesLine < 0) return composeText;
+  let end = lines.length;
+  for (let i = servicesLine + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim() || line.trim().startsWith('#')) continue;
+    if (lineIndent(line) === 0) { end = i; break; }
+  }
+  let serviceIndent = null;
+  for (let i = servicesLine + 1; i < end; i++) {
+    const line = lines[i];
+    if (!line.trim() || line.trim().startsWith('#')) continue;
+    serviceIndent = lineIndent(line);
+    break;
+  }
+  if (serviceIndent === null) return composeText;
+  const starts = [];
+  for (let i = servicesLine + 1; i < end; i++) {
+    const line = lines[i];
+    if (!line.trim() || line.trim().startsWith('#')) continue;
+    if (lineIndent(line) !== serviceIndent) continue;
+    if (!/^(?:"(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^:#]+?)[ \t]*:/.test(line)) continue;
+    starts.push(i);
+  }
+  let changed = false;
+  for (let s = starts.length - 1; s >= 0; s--) {
+    const start = starts[s];
+    const stop = s + 1 < starts.length ? starts[s + 1] : end;
+    let childIndent = null;
+    let hasRestart = false;
+    let hasRuntime = false;
+    for (let i = start + 1; i < stop; i++) {
+      const line = lines[i];
+      if (!line.trim() || line.trim().startsWith('#')) continue;
+      const indent = lineIndent(line);
+      if (childIndent === null) childIndent = indent;
+      if (indent !== childIndent) continue;
+      const prop = String(line).match(/^[ \t]*([A-Za-z0-9_.-]+)[ \t]*:/);
+      if (!prop) continue;
+      if (prop[1] === 'restart') hasRestart = true;
+      if (prop[1] === 'image' || prop[1] === 'build') hasRuntime = true;
+    }
+    if (hasRestart || !hasRuntime) continue;
+    const indent = ' '.repeat(childIndent === null ? serviceIndent + 2 : childIndent);
+    lines.splice(start + 1, 0, `${indent}restart: unless-stopped`);
+    changed = true;
+  }
+  return changed ? lines.join('\n') : composeText;
+}
+
+// Every creator path runs this so a saved app follows the same portable
+// standard as the app library contract: a Dok header, no top-level project
+// name (Dok passes -p), a restart policy, and resolvable networks.
+function standardizeAppCompose(composeText, { networkNames = null, defaultNetwork = 'wicked' } = {}) {
+  let text = String(composeText || '').replace(/\r\n/g, '\n');
+  if (!text.trim()) return text;
+  text = stripComposeProjectName(text);
+  text = ensureManagedComposeHeader(text);
+  text = ensureComposeServiceRestart(text);
+  if (Array.isArray(networkNames)) {
+    text = normalizeComposeNetworks(text, networkNames, defaultNetwork).text;
+  }
+  return text;
+}
+
 async function launchNetworkNames() {
   try {
     return await dockerNetworkNames();
@@ -2604,7 +2706,7 @@ function builderModelFromComposeConfig(config) {
     });
   }
 
-  const handled = new Set(['services', 'networks', 'volumes']);
+  const handled = new Set(['services', 'networks', 'volumes', 'name']);
   const other = Object.create(null);
   for (const [key, value] of Object.entries(config && typeof config === 'object' ? config : {})) {
     if (handled.has(key)) continue;
@@ -3094,6 +3196,7 @@ async function buildComposeFromBuilderModel(input, { projectDir = '', validate =
         });
       } else {
         for (const [key, value] of Object.entries(other)) {
+          if (key === 'name') continue;
           if (['services', 'networks', 'volumes'].includes(key)) {
             addBuilderFieldIssue(fieldIssues, {
               section: 'other', key: '__other__',
@@ -6626,7 +6729,7 @@ app.post('/api/launch/compose', async (req, res) => {
     const appDir = launchAppDirectory(proj);
     const networkNames = await launchNetworkNames();
     const normalized = normalizeComposeNetworks(yamlText, networkNames);
-    const launchCompose = normalized.text;
+    const launchCompose = standardizeAppCompose(normalized.text, { networkNames });
     fs.writeFileSync(path.join(appDir, 'docker-compose.yml'), launchCompose);
     const analysis = await analyzeCompose(launchCompose, {
       projectDir: appDir,
@@ -6711,7 +6814,7 @@ app.post('/api/launch/git', async (req, res) => {
     const { appDir, compose } = prepareAppFromDirectory(dir, proj);
     const networkNames = await launchNetworkNames();
     const normalized = normalizeComposeNetworks(compose || '', networkNames);
-    const launchCompose = normalized.text;
+    const launchCompose = standardizeAppCompose(normalized.text, { networkNames });
     if (launchCompose.trim()) fs.writeFileSync(path.join(appDir, 'docker-compose.yml'), launchCompose);
     const analysis = await analyzeCompose(launchCompose, {
       projectDir: appDir,
@@ -6860,7 +6963,7 @@ app.post('/api/launch/upload', upload.array('files', 200), async (req, res) => {
     const { appDir, compose } = prepareAppFromDirectory(dir, proj);
     const networkNames = await launchNetworkNames();
     const normalized = normalizeComposeNetworks(compose || '', networkNames);
-    const launchCompose = normalized.text;
+    const launchCompose = standardizeAppCompose(normalized.text, { networkNames });
     if (launchCompose.trim()) fs.writeFileSync(path.join(appDir, 'docker-compose.yml'), launchCompose);
     const analysis = await analyzeCompose(launchCompose, {
       projectDir: appDir,
@@ -6942,7 +7045,7 @@ app.post('/api/launch/source', async (req, res) => {
       fs.writeFileSync(path.join(appDir, 'docker-compose.yml'), compose);
     } else if (compose) {
       const normalized = normalizeComposeNetworks(compose, networkNames);
-      compose = normalized.text;
+      compose = standardizeAppCompose(normalized.text, { networkNames });
       replacedNetworks = normalized.replacedNetworks;
       fs.writeFileSync(path.join(appDir, 'docker-compose.yml'), compose);
     }
@@ -7307,8 +7410,9 @@ app.post('/api/launch/finalize', async (req, res) => {
     }
     if (!runMode) {
       // Keep hand-edited compose files launchable too: replace any external
-      // network that does not exist with the setup-managed default network.
-      finalCompose = normalizeComposeNetworks(finalCompose, networkNames).text;
+      // network that does not exist with the setup-managed default network and
+      // apply the shared app-compose standard before analysis and saving.
+      finalCompose = standardizeAppCompose(finalCompose, { networkNames });
     }
 
     let analysis = null;
@@ -8017,7 +8121,8 @@ function libraryManifestApp(entry, appDir) {
   if (!composePath) throw httpError(400, `${entry.name} has no compose file`);
   const files = libraryFiles(appDir);
   const composeRel = path.relative(appDir, composePath).replace(/\\/g, '/');
-  const sanitized = sanitizeComposeForLibrary(fs.readFileSync(composePath, 'utf-8'));
+  const standardized = standardizeAppCompose(fs.readFileSync(composePath, 'utf-8'));
+  const sanitized = sanitizeComposeForLibrary(standardized);
   return {
     name: projectName(entry.name, 'app'),
     description: String(entry.description || '').slice(0, 500),
@@ -8185,7 +8290,7 @@ async function importLibraryTree({ manifest, appsRoot, overwrite = false }) {
     if (!fs.existsSync(composePath) || !fs.statSync(composePath).isFile()) {
       throw httpError(400, `${name} is missing ${composeRel}`);
     }
-    const sanitized = sanitizeComposeForLibrary(fs.readFileSync(composePath, 'utf-8'));
+    const sanitized = sanitizeComposeForLibrary(standardizeAppCompose(fs.readFileSync(composePath, 'utf-8')));
     if (!sanitized.compose.trim()) throw httpError(400, `${name} has an empty compose file`);
     const target = path.join(appsDir, name);
     let occupied = false;
@@ -8402,7 +8507,8 @@ function composeHasVhostKey(text) {
 }
 
 function normalizeEditedAppCompose(entry, compose, { vhostTouched = false, addDefaultNetwork = true } = {}) {
-  let next = String(compose || '');
+  let next = stripComposeProjectName(String(compose || ''));
+  next = ensureManagedComposeHeader(next);
   if (addDefaultNetwork && !/^networks\s*:/m.test(next) && !/\bnetwork_mode\s*:/.test(next)) {
     next = next.replace(/\s*$/, '') +
       '\n\nnetworks:\n  default:\n    name: wicked\n    external: true\n';
