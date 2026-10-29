@@ -33,7 +33,7 @@ Reopen Maintenance from **Settings → Maintenance** for installs, updates, back
 ## Highlights
 
 - Manage containers, images, apps, compose stacks, and core services from one UI. The Containers tab splits protected **Core Services** from workloads and has an **Apps interface** button.
-- Use **Quick Deploy** for one-click app redeploys (duplicate container names are renamed safely) or **Alter State** to edit an app's compose file and save it as the new base configuration.
+- Create apps with **OC Assist** (default) or import a docker run command, compose file, git repository, or upload. Every app requires an app title and is saved to the library stopped. Use **Apps → Deploy** to review the compose, configure routing, ports, paths, and secrets, then save or save and deploy. Deploy is the only way to start or redeploy an app; duplicate container names are renamed safely after approval.
 - Customize the installation from **Settings → Dok Settings → Designer**: logo, name, tagline, CSS override, and direct editing of nginx-proxy error pages and configuration files.
 - Install, update, back up, repair, and recover the whole installation from the on-demand **Dok Maintenance** container. It keeps an exact installation record and snapshots in `maintenance-data/`, runs Admin OpenCode, and replaces the old Host Helper.
 - Open a browser terminal from the dashboard, or launch OpenCode in User mode without any setup. Admin OpenCode runs from Dok Maintenance, where the host checkout and repair tools live. OpenCode starts on demand and stops when you close the terminal.
@@ -44,9 +44,10 @@ Reopen Maintenance from **Settings → Maintenance** for installs, updates, back
 - Add Authelia forward auth to any app: launch the auth service, pick containers from the window that opens, and WickedAFDok recreates them with `ENABLE_AUTH=true` or patches their compose file. Authelia runs alongside Authentik, not instead of it.
 - Create full backups and exact installation snapshots in Dok Maintenance. The legacy Dok backup pane still supports single-app and custom scopes for compatibility. Snapshots restore the saved install without re-entering settings.
 - Store encrypted credentials for Docker Hub, GHCR, GitLab, Quay, and other registries in **Settings → Dok Settings**, and use them automatically for pulls and compose launches.
-- App creation shows a live progress bar and closes the configuration window when the app is created.
+- App creation shows a live progress bar and closes the configuration window when the app is saved. A creation-time test launch starts the app only to verify it and stops it again; nothing stays running until you deploy from Apps.
+- Apps created or imported into the library are complete and ready to launch, but must be configured in the compose editor before launch. The editor adds routing, auth, and certificate fields from the installed core services.
 - Persistent app data is never overwritten or deleted by app creation, library import, or app backup restore. Existing data is reused with a notice; fresh data requires a new app name or data location, or manual deletion first.
-- OC Assist follows `apps/AGENTS.md`, a generated app-library contract covering layout, compose, routing, secrets, and persistent-data rules.
+- OC Assist follows `apps/AGENTS.md`, a generated app-library contract covering layout, compose, routing, secrets, persistent-data rules, and the stopped/ready-to-configure library state.
 
 ## Dok Maintenance
 

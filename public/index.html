@@ -148,28 +148,31 @@
       <div class="section-header">
         <div>
           <h2>App Creation</h2>
-          <p class="muted">Add any app to WickedAFDok. All apps are managed by compose from their own directory.</p>
+          <p class="muted">Create apps with OC Assist, or import an existing command, compose file, repository, or upload. Every app is saved stopped so you can review and configure it before deploying.</p>
         </div>
+      </div>
+      <div id="appCreationWorkflowNotice" class="card">
+        <p class="muted">Apps are saved to the library stopped. A test launch starts the app only to verify it works and is stopped again. Open <strong>Apps → Deploy</strong> to configure routing, ports, paths, and secrets, then deploy it.</p>
       </div>
       <div id="appCreationNginxNotice" class="card hidden" style="border-color: rgba(255,180,0,0.5)">
         <p class="muted">The core nginx service has not been installed. Install it from Dok Maintenance so it can automatically direct your domains to your containers.</p>
         <div class="row"><button id="appCreationCreateNginx" class="btn btn-primary">Open Dok Maintenance</button></div>
       </div>
       <div class="subtabs">
-        <button class="subtab-btn active" data-subtab="run">Docker run</button>
+        <button class="subtab-btn active" data-subtab="assist">OC Assist</button>
+        <button class="subtab-btn" data-subtab="run">Docker run</button>
         <button class="subtab-btn" data-subtab="compose">Docker compose</button>
         <button class="subtab-btn" data-subtab="git">Git Clone</button>
         <button class="subtab-btn" data-subtab="upload">Local upload</button>
-        <button class="subtab-btn" data-subtab="assist">OC Assist</button>
       </div>
 
-      <div id="subtab-run" class="subtab-pane active">
+      <div id="subtab-run" class="subtab-pane">
         <div class="card">
           <h3>Paste a docker run command</h3>
           <p class="muted">WickedAFDok converts the command into a managed compose app. Use <code>-p</code>, <code>--name</code>, <code>-v</code>, and <code>-e</code> as usual.</p>
           <textarea id="runCmd" class="textarea code" placeholder="docker run -d -p 8080:80 --name myapp nginx:latest"></textarea>
           <div class="row">
-            <input id="runName" class="input" placeholder="App name (optional)">
+            <input id="runName" class="input" placeholder="App title (required)" required>
             <button id="runCreateBtn" class="btn btn-primary">Create App</button>
           </div>
           <pre id="runOutput" class="output hidden"></pre>
@@ -182,7 +185,7 @@
           <p class="muted">The compose file is stored in the app's own directory and always managed with <code>docker compose</code>.</p>
           <textarea id="composeYaml" class="textarea code tall" placeholder="services:&#10;  app:&#10;    image: nginx&#10;    ports:&#10;      - '8080:80'"></textarea>
           <div class="row">
-            <input id="composeName" class="input" placeholder="App name (optional)">
+            <input id="composeName" class="input" placeholder="App title (required)" required>
             <button id="composeCreateBtn" class="btn btn-primary">Create App</button>
           </div>
           <pre id="composeOutput" class="output hidden"></pre>
@@ -195,7 +198,7 @@
           <p class="muted">Any Git URL works. Repositories with a compose file or Dockerfile become apps; others are kept in Projects.</p>
           <div class="row">
             <input id="gitRepo" class="input flex" placeholder="https://github.com/user/repo.git">
-            <input id="gitName" class="input" placeholder="Project name (optional)">
+            <input id="gitName" class="input" placeholder="App title (required)" required>
             <input id="gitBranch" class="input" placeholder="Branch (optional)">
           </div>
           <div class="row">
@@ -211,7 +214,7 @@
           <h3>Upload local files</h3>
           <p class="muted">Upload a folder or individual files. Uploads with a compose file or Dockerfile become apps; others are kept in Projects.</p>
           <div class="row">
-            <input id="uploadName" class="input" placeholder="Project name">
+            <input id="uploadName" class="input" placeholder="App title (required)" required>
             <label class="file-label">Folder<input type="file" id="uploadFolder" webkitdirectory multiple></label>
             <label class="file-label">Files<input type="file" id="uploadFiles" multiple></label>
           </div>
@@ -223,16 +226,16 @@
         </div>
       </div>
 
-      <div id="subtab-assist" class="subtab-pane">
+      <div id="subtab-assist" class="subtab-pane active">
         <div class="card">
           <h3>OC Assist</h3>
-          <p class="muted">Describe what you want. OC Assist opens an OpenCode session with your instructions and pasted data, asks any follow-up questions in the chat, then builds and registers the app. The app appears in Apps when it is ready.</p>
+          <p class="muted">Describe what you want. OC Assist opens an OpenCode session with your instructions and pasted data, asks any follow-up questions in the chat, then builds and registers the app. It is saved stopped in Apps so you can configure and deploy it.</p>
           <label class="muted" for="assistPrompt">App instructions (required)</label>
           <textarea id="assistPrompt" class="textarea tall" placeholder="Build a self-hosted recipe manager with a web UI and persistent storage. Expose it at recipes.example.com."></textarea>
           <label class="muted" for="assistData">Paste docker run, compose, a repository link, or notes (optional)</label>
           <textarea id="assistData" class="textarea code tall" placeholder="https://github.com/user/repo&#10;or paste a compose file / docker run command"></textarea>
           <div class="row">
-            <input id="assistName" class="input" placeholder="App name (optional)">
+            <input id="assistName" class="input" placeholder="App title (required)" required>
             <label class="file-label">Files<input type="file" id="assistFiles" multiple></label>
             <label class="file-label">Folder<input type="file" id="assistFolder" webkitdirectory multiple></label>
             <button id="assistStartBtn" class="btn btn-primary">Create App with OC Assist</button>
@@ -260,7 +263,7 @@
         <div id="sourceBadges" class="badges"></div>
         <div class="launch-form">
           <div class="row">
-            <input id="sourceName" class="input" placeholder="App / container name">
+            <input id="sourceName" class="input" placeholder="App title (required)" required>
             <select id="sourceMode" class="input">
               <option value="auto">Auto detect</option>
               <option value="compose">docker compose</option>
@@ -300,7 +303,7 @@
       <div class="section-header">
         <div>
           <h2>Apps</h2>
-          <p class="muted">All apps managed by compose from their own directory.</p>
+          <p class="muted">Apps are saved to the library stopped. Open <strong>Deploy</strong> to configure the compose, then save or save and deploy.</p>
         </div>
         <div class="inline">
           <button id="libraryExportBtn" class="btn">Export library</button>
@@ -986,7 +989,7 @@
           <div class="row"><button id="appCreationCreateNginxModal" class="btn btn-primary">Open Dok Maintenance</button></div>
         </div>
         <div class="row">
-          <input id="appCfgName" class="input" placeholder="App name">
+          <input id="appCfgName" class="input" placeholder="App title (required)" required>
           <input id="appCfgNetwork" class="input" placeholder="Network" value="wicked" list="appNetworkList">
           <button id="appCfgCreateNetwork" class="btn" type="button">Create network</button>
           <datalist id="appNetworkList"></datalist>
@@ -1030,8 +1033,8 @@
           </div>
         </div>
         <div class="row app-config-footer">
-          <button id="appCfgComplete" class="btn btn-primary">Complete Creation</button>
-          <button id="appCfgCompleteRun" class="btn btn-primary">Complete Creation and Launch</button>
+          <button id="appCfgComplete" class="btn btn-primary">Save to library</button>
+          <button id="appCfgCompleteRun" class="btn btn-primary">Test launch (stops after test)</button>
           <span id="appCfgMsg" class="muted"></span>
           <div id="appCfgProgress" class="app-progress hidden">
             <div class="app-progress-track"><div id="appCfgProgressFill" class="app-progress-fill"></div></div>

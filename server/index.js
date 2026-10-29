@@ -6142,7 +6142,7 @@ function nextContainerRename(name, id, containers, reserved = new Set()) {
   return nextName;
 }
 
-// Builds the list of changes Quick Deploy would make to existing containers so
+// Builds the list of changes a deploy would make to existing containers so
 // the UI can ask for approval before the system renames another app's
 // container or recreates running instances.
 async function inspectComposeAmendments(project, compose) {
@@ -6220,7 +6220,7 @@ async function inspectComposeAmendments(project, compose) {
 
 // Compose refuses to start when a container_name already belongs to another
 // container. Rename the stale container instead of deleting it, which keeps
-// its data and makes Quick Deploy succeed after the user approves the change.
+// its data and makes the deploy succeed after the user approves the change.
 async function resolveProjectNameConflicts(project, compose, plan = null) {
   const amendment = plan || await inspectComposeAmendments(project, compose);
   if (amendment.blocked.length) {
@@ -6234,7 +6234,7 @@ async function resolveProjectNameConflicts(project, compose, plan = null) {
     try {
       await docker.getContainer(rename.containerId).rename({ name: rename.to });
       renamed.push({ service: rename.service, from: rename.from, to: rename.to });
-      appendServerLog('INFO', `Quick Deploy renamed conflicting container ${rename.from} to ${rename.to}`);
+      appendServerLog('INFO', `Deploy renamed conflicting container ${rename.from} to ${rename.to}`);
     } catch (e) {
       throw httpError(409, `Unable to resolve the container name conflict for "${rename.from}": ${e.message}`);
     }
@@ -6680,6 +6680,7 @@ app.post('/api/launch/run', async (req, res) => {
   try {
     const { command, name = null } = req.body || {};
     if (!command) return res.status(400).json({ error: 'command required' });
+    if (!String(name || '').trim()) return res.status(400).json({ error: 'App title is required' });
     const networkNames = await launchNetworkNames();
     const baseConv = runCommandToCompose(command, name || undefined);
     const plan = planRunNetworks(baseConv, networkNames);
@@ -6724,6 +6725,7 @@ app.post('/api/launch/compose', async (req, res) => {
     const { yaml, name } = req.body || {};
     const yamlText = String(yaml || '');
     if (!yamlText.trim()) return res.status(400).json({ error: 'yaml required' });
+    if (!String(name || '').trim()) return res.status(400).json({ error: 'App title is required' });
     const services = serviceNamesFromCompose(yamlText);
     const proj = projectName(name || services[0] || `app-${Date.now()}`, 'app');
     const appDir = launchAppDirectory(proj);
@@ -6764,6 +6766,7 @@ app.post('/api/launch/git', async (req, res) => {
   try {
     const { repo, name, branch = null } = req.body || {};
     if (!repo) return res.status(400).json({ error: 'repo required' });
+    if (!String(name || '').trim()) return res.status(400).json({ error: 'App title is required' });
     if (!/^(https?:\/\/|git:\/\/|ssh:\/\/|git@)[^\s]+$/.test(repo)) {
       return res.status(400).json({ error: 'Repo must be an http(s), git, ssh, or git@ URL' });
     }
@@ -6850,6 +6853,12 @@ app.post('/api/launch/upload', upload.array('files', 200), async (req, res) => {
   const movedFiles = [];
   try {
     const { name, paths: rawPaths } = req.body || {};
+    if (!String(name || '').trim()) {
+      for (const file of req.files || []) {
+        try { fs.rmSync(file.path, { force: true }); } catch {}
+      }
+      return res.status(400).json({ error: 'App title is required' });
+    }
     let paths = [];
     try {
       const parsed = rawPaths ? JSON.parse(rawPaths) : [];
@@ -7004,6 +7013,7 @@ app.post('/api/launch/source', async (req, res) => {
   try {
     const { path: relPath, mode = 'auto', name, ports, command, vhost, vhostPort } = req.body || {};
     if (!relPath) return res.status(400).json({ error: 'path required' });
+    if (!String(name || '').trim()) return res.status(400).json({ error: 'App title is required' });
     if (mode === 'run' && !String(command || '').trim()) {
       return res.status(400).json({ error: 'A docker run command is required for run mode' });
     }
@@ -7012,7 +7022,7 @@ app.post('/api/launch/source', async (req, res) => {
     if (dir === fs.realpathSync(sourcesDir)) {
       return res.status(400).json({ error: 'Choose a project folder, not the Projects root' });
     }
-    const project = projectName(name || path.basename(dir), 'app');
+    const project = projectName(name, 'app');
 
     const hasCompose = !!findComposeFile(dir);
     const hasDockerfile = fs.existsSync(path.join(dir, 'Dockerfile'));
@@ -7095,9 +7105,7 @@ app.post('/api/assist/start', upload.array('files', 100), async (req, res) => {
     const data = String(req.body?.data || '').trim();
     if (data.length > 200000) throw httpError(400, 'The pasted data is too long (max 200 KB)');
     const requestedName = String(req.body?.name || '').trim();
-    if (requestedName && !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(requestedName)) {
-      throw httpError(400, 'App names may only contain letters, numbers, dots, underscores, and hyphens');
-    }
+    if (!requestedName) throw httpError(400, 'App title is required');
     const info = await getOpencodeInfo();
     if (!info.installed) throw httpError(503, 'OpenCode is not installed in this container. Rebuild the WickedAFDok image and try again.');
     ensureAppAgentsFile();
@@ -7105,8 +7113,7 @@ app.post('/api/assist/start', upload.array('files', 100), async (req, res) => {
     // One-second resolution is not enough: two requests in the same second
     // would share an assist/upload directory and overwrite each other's brief.
     const unique = `${stamp}-${crypto.randomBytes(3).toString('hex')}`;
-    const defaultName = 'oc-app-' + unique;
-    const appName = projectName(requestedName || defaultName, 'app');
+    const appName = projectName(requestedName, 'app');
     if (assistStarts.has(appName)) throw httpError(409, 'OC Assist is already preparing that app name');
     assistStarts.add(appName);
     lockedName = appName;
@@ -7166,7 +7173,15 @@ app.post('/api/assist/start', upload.array('files', 100), async (req, res) => {
       '',
       '## App library contract',
       '',
-      'Follow ' + path.join(appsDir, 'AGENTS.md') + '. It defines the layout, compose, routing, persistent-data, secrets, and library-export rules for every app.',
+      'Follow ' + path.join(appsDir, 'AGENTS.md') + '. It defines the required layout, compose, routing, persistent-data, secrets, and library-export rules for every app.',
+      '',
+      '## Delivery rules',
+      '',
+      '- Use the required app title as the folder and compose project name.',
+      '- The app must be complete, validated, and saved to the library in a functional, ready-to-launch state, but stopped. Never leave it running.',
+      '- Include docker-compose.yml, a README, and .env.example when the app needs configuration. Keep user data under relative ./data paths and never reset it.',
+      '- Use the publish command without --test to save it. Use --test only to verify that the app starts; the server stops it again before returning.',
+      '- The user configures routing, ports, paths, and secrets in the Dok compose editor before the real deploy from Apps. Dok adds VIRTUAL_HOST, VIRTUAL_PORT, ENABLE_AUTH, and certificate fields from the installed core services, so keep the compose portable and free of installation-specific values unless the user supplied them.',
       '',
       '## Default admin account',
       '',
@@ -7207,15 +7222,16 @@ app.post('/api/assist/start', upload.array('files', 100), async (req, res) => {
       'App directory: ' + path.join(appsDir, appName),
       'Default network: ' + (defaultsCfg.defaultNetwork || 'wicked'),
       '',
-      'Read the app library contract before writing files. Build the app now. Create docker-compose.yml (and any needed files) in the app directory, then publish it with:',
-      'node ' + register + ' --name ' + appName + ' --dir ' + path.join(appsDir, appName) + ' --launch',
+      'Read the app library contract before writing files. Build the app now. Create docker-compose.yml (and any needed files) in the app directory so it is complete, validated, and ready to launch after the user supplies installation-specific settings. Then save it to the library with:',
+      'node ' + register + ' --name ' + appName + ' --dir ' + path.join(appsDir, appName),
+      'Publishing saves the app stopped. If you need to verify it starts, rerun the command with --test; the server stops the app again and reports the container states. Never leave the app running.',
       'If publishing fails, read the error, fix the compose, and retry once.',
       'If the user supplied a domain, set VIRTUAL_HOST/VIRTUAL_PORT in the compose or pass --vhost and --vhost-port to the publish command.',
       'Use --network only when the app must join a specific existing Docker network.',
       'If the publish response asks for amendment approval (needsAmendApproval), summarize the listed containers and changes to the user and wait for approval before rerunning with --confirm-amend.',
       'If publishing reports reuseData or dataNotice, tell the user the app connects to existing app data and that it was not reset. Never delete or overwrite that data.',
       'Ask the user only when you genuinely need a domain, port, credential, or host path.',
-      'When finished, tell the user the app is in the Apps tab.'
+      'When finished, tell the user the app is saved in the Apps tab and stopped. They must open Deploy to configure routing, ports, paths, and secrets, then deploy it.'
     ].join('\n');
     const session = await createTerminalSession({
       mode: 'user',
@@ -7246,11 +7262,11 @@ const finalizeLocks = new Map();
 
 app.post('/api/launch/finalize', async (req, res) => {
   const body = req.body || {};
-  const composeHint = String(body.compose || body.yaml || body.generatedCompose || '');
-  const lockName = projectName(
-    body.appName || body.name || body.launch?.name ||
-    (composeHint ? serviceNamesFromCompose(composeHint)[0] : '') || 'app'
-  );
+  const requestedTitle = String(body.appName || body.name || body.launch?.name || '').trim();
+  if (!requestedTitle) {
+    return res.status(400).json({ error: 'App title is required' });
+  }
+  const lockName = projectName(requestedTitle, 'app');
   if (finalizeLocks.has(lockName)) {
     return res.status(409).json({
       error: `${lockName} is already being created. Wait for the current request to finish instead of starting it again.`,
@@ -7266,12 +7282,17 @@ app.post('/api/launch/finalize', async (req, res) => {
   let registrySaved = false;
   try {
     const {
-      type = 'compose', appName, appDir: rawAppDir, path: sourcePath, command = '',
+      type = 'compose', appDir: rawAppDir, path: sourcePath, command = '',
       compose: composeYaml, network = '', ports = '', vhost = '', vhostPort = '',
-      mode = 'auto', sourceRel = '', launchNow = true, force = false, composeEdited = false,
+      mode = 'auto', sourceRel = '', force = false, composeEdited = false,
       networkChoices = {}, volumeChoices = {}, vhostTouched = false,
-      vhostService = '', createNetwork = false, overwrite = false, confirmAmend = false
+      vhostService = '', createNetwork = false, overwrite = false, confirmAmend = false,
+      testLaunch = false
     } = body;
+    // Creation never leaves an app running. A test launch is allowed so the
+    // user can confirm the app starts, but it is always stopped before the
+    // response so the app is saved to the library ready for configuration.
+    const shouldTest = testLaunch === true || body.launchNow === true;
     const composeBody = String(composeYaml || body.yaml || body.generatedCompose || '');
     const composeProvided = body.compose !== undefined || body.yaml !== undefined || body.generatedCompose !== undefined;
     const runMode = type === 'run' && !!command && (!composeBody || !composeEdited);
@@ -7279,9 +7300,7 @@ app.post('/api/launch/finalize', async (req, res) => {
       throw httpError(400, 'Compose file is empty');
     }
 
-    const servicesFromBody = composeBody ? serviceNamesFromCompose(composeBody) : [];
-    const fallbackName = sourcePath ? path.basename(sourcePath) : (servicesFromBody[0] || 'app');
-    const name = projectName(appName || fallbackName, 'app');
+    const name = projectName(requestedTitle, 'app');
     finalizedAppName = name;
     const targetDir = path.join(appsDir, name);
     if (isSymlink(targetDir)) throw httpError(400, 'Invalid app directory');
@@ -7633,7 +7652,7 @@ app.post('/api/launch/finalize', async (req, res) => {
     }
 
     let amendment = null;
-    if (launchNow !== false) {
+    if (shouldTest) {
       amendment = await inspectComposeAmendments(name, finalCompose);
       if (amendment.blocked.length) {
         const item = amendment.blocked[0];
@@ -7689,11 +7708,16 @@ app.post('/api/launch/finalize', async (req, res) => {
       } catch {}
     }
 
-    let result = { stdout: 'Created (not launched)', stderr: '' };
+    let result = { stdout: 'Saved to library', stderr: '' };
     let launchError = '';
     let launchPending = false;
     let renamed = [];
-    if (launchNow !== false) {
+    let tested = false;
+    let testHealthy = false;
+    let testStopped = false;
+    let testStopError = '';
+    let testContainers = [];
+    if (shouldTest) {
       renamed = await resolveProjectNameConflicts(name, finalCompose, amendment);
       const args = ['compose', '-f', composePath, '-p', name];
       if (fs.existsSync(overridePath)) args.push('-f', overridePath);
@@ -7703,7 +7727,7 @@ app.post('/api/launch/finalize', async (req, res) => {
       } catch (e) {
         // A first start often reports failure while the project containers are
         // still being created (image build, dependency startup). If they exist,
-        // report a pending launch so the UI does not call it a failure.
+        // report a pending launch so the user knows the test did not complete.
         const containers = await docker.listContainers({ all: true }).catch(() => []);
         const projectContainers = containers.filter(c =>
           c.Labels?.['com.docker.compose.project'] === name &&
@@ -7716,14 +7740,45 @@ app.post('/api/launch/finalize', async (req, res) => {
           result = { stdout: e.stdout || '', stderr: e.stderr || '' };
         }
       }
+      tested = true;
+      const waitMs = Math.max(500, Number(process.env.WICKEDAFDOK_TEST_WAIT_MS) || 4000);
+      await new Promise(resolve => setTimeout(resolve, waitMs));
+      const containers = await docker.listContainers({ all: true }).catch(() => []);
+      testContainers = containers
+        .filter(c => c.Labels?.['com.docker.compose.project'] === name)
+        .map(c => ({
+          name: String((c.Names || [])[0] || c.Id || '').replace(/^\//, '') || 'container',
+          state: c.State || 'unknown',
+          status: c.Status || ''
+        }));
+      testHealthy = testContainers.some(c => c.state === 'running') &&
+        !testContainers.some(c => c.state === 'restarting');
+      // Leave the app saved and stopped so the user can configure it in the
+      // compose editor before the real deploy.
+      const stopArgs = ['compose', '-f', composePath, '-p', name];
+      if (fs.existsSync(overridePath)) stopArgs.push('-f', overridePath);
+      stopArgs.push('stop');
+      try {
+        await run('docker', stopArgs, { cwd: targetDir });
+        testStopped = true;
+      } catch (e) {
+        testStopError = e.message;
+      }
+      launchPending = false;
     }
 
     res.json({
       ok: true, appDir: targetDir, appName: name, appDataPath, ...result,
       issues: [...new Set([...validationIssues, ...combinedIssues])], launchError,
       launchPending, renamed, amended: amendment?.requiresApproval ? amendment.changes : [],
-      reuseData: dataReuse, dataNotice,
-      message: launchPending ? `${name} is still starting.` : ''
+      reuseData: dataReuse, dataNotice, tested,
+      testHealthy, testContainers, testStopped, testStopError,
+      stopped: shouldTest ? testStopped : true,
+      message: tested
+        ? (testStopped
+          ? `${name} test launch finished and the app was stopped. Configure and deploy it from Apps.`
+          : `${name} test launch finished, but Dok could not stop it. Stop it from Apps before configuring it.`)
+        : `${name} was saved to the library. Configure and deploy it from Apps.`
     });
   } catch (e) {
     res.status(e.status || 500).json({
@@ -8489,6 +8544,8 @@ async function registryAction(req, res, action) {
   }
 }
 
+// Legacy one-click deploy retained for the Maintenance proxy and older
+// clients. Dok's Apps tab always deploys through the compose editor.
 app.post('/api/registry/:id/deploy', (req, res) => registryAction(req, res, 'up'));
 app.post('/api/registry/:id/:action(start|stop|restart)', (req, res) => registryAction(req, res, req.params.action));
 
@@ -8498,10 +8555,10 @@ function appEntryForRequest(req) {
   return entry;
 }
 
-// Shared by Alter State (compose editor). The saved compose becomes the app's
-// new base configuration, so subsequent Quick Deploys use exactly what the
-// user sees. The generated override is removed to avoid stale volume, network,
-// or environment values winning over the edited base file.
+// Shared by the Deploy compose editor. The saved compose becomes the app's
+// new base configuration, so subsequent deploys use exactly what the user
+// sees. The generated override is removed to avoid stale volume, network, or
+// environment values winning over the edited base file.
 function composeHasVhostKey(text) {
   return /(^|\n)\s*(?:-\s*)?['"]?VIRTUAL_HOST['"]?\s*[:=]/m.test(String(text || ''));
 }
@@ -8539,7 +8596,7 @@ app.get('/api/apps/:id/compose', async (req, res) => {
     if (!composeFile) return res.status(404).json({ error: 'This app has no compose file' });
     let compose = fs.readFileSync(composeFile, 'utf-8');
     // The generated override may hold the routing env for compose-created apps.
-    // Surface it in the editable base compose so Alter State shows the effective
+    // Surface it in the editable base compose so Deploy shows the effective
     // domain and a deliberate clear can be detected by the frontend.
     compose = normalizeEditedAppCompose(entry, compose, { addDefaultNetwork: false });
     let analysis = null;
@@ -8591,7 +8648,7 @@ app.post('/api/apps/:id/compose', async (req, res) => {
     const overridePath = path.join(appDir, 'docker-compose.wickedafdok.yml');
     try { fs.unlinkSync(overridePath); } catch {}
     // Keep the Dok ownership labels even after the routing override was
-    // removed by an Alter State save.
+    // removed by a Deploy save.
     try {
       const services = serviceNamesFromCompose(compose);
       if (services.length) {
@@ -11811,23 +11868,41 @@ app.post('/api/core/opencode/stop', (req, res) => {
 // certificate variables for installed core services are present automatically.
 app.get('/api/core/app-hints', async (req, res) => {
   try {
+    const settings = readSettings();
     const containers = await docker.listContainers({ all: true }).catch(() => []);
     const nameOf = container => String((container.Names || [])[0] || '').replace(/^\//, '');
-    const isRunning = (project, names) => containers.some(container => {
+    const isRunning = (project, names, service = '') => containers.some(container => {
       const labels = container.Labels || {};
-      if (labels['com.docker.compose.project'] === project) return true;
-      return names.includes(nameOf(container));
+      const projectMatch = labels['com.docker.compose.project'] === project;
+      if (service) {
+        return (projectMatch && labels['com.docker.compose.service'] === service) ||
+          names.includes(nameOf(container));
+      }
+      return projectMatch || names.includes(nameOf(container));
     });
-    const nginxProxy = isRunning('nginx-proxy', ['nginx-proxy']);
-    const acmeCompanion = isRunning('nginx-proxy', ['acme-companion']);
-    const authelia = isRunning('authelia', ['authelia']);
-    const authentik = isRunning('authentik', ['authentik-server']);
-    const mailpit = isRunning('mailpit', ['mailpit']);
-    const stalwart = isRunning('stalwart', ['stalwart']);
+    // The installer writes managed composes for every selected core service.
+    // Hints must survive a stopped service so a freshly installed stack still
+    // configures the compose editor before anything is started.
+    const installed = (project, names, enabled = false) => enabled ||
+      fs.existsSync(path.join(coreServiceDir(project), 'docker-compose.yml')) ||
+      isRunning(project, names);
+    const nginxProxy = installed('nginx-proxy', ['nginx-proxy'], settings.services?.nginxProxy?.enabled === true);
+    const acmeCompanion = nginxProxy && (settings.services?.nginxProxy?.acme?.enabled === true ||
+      isRunning('nginx-proxy', ['acme-companion'], 'acme-companion'));
+    const authelia = installed('authelia', ['authelia'], settings.services?.authelia?.enabled === true);
+    const authentik = installed('auth', ['authentik-server'],
+      settings.services?.authentik?.enabled === true || settings.services?.auth?.enabled === true);
+    const mailpit = installed('mailpit', ['mailpit'], settings.services?.mailpit?.enabled === true);
+    const stalwart = installed('stalwart', ['stalwart'], settings.services?.stalwart?.enabled === true);
+    const defaults = defaultsDefaults(settings.defaults || {});
+    const appName = String(req.query.app || '').trim();
+    const suggestedHost = appName && defaults.primaryDomain
+      ? `${projectName(appName, 'app')}.${defaults.primaryDomain}`
+      : '';
     const fields = [];
     if (nginxProxy) {
       fields.push(
-        { key: 'VIRTUAL_HOST', value: '', label: 'Public hostname', help: 'Hostname nginx-proxy serves for this app.' },
+        { key: 'VIRTUAL_HOST', value: suggestedHost, label: 'Public hostname', help: 'Hostname nginx-proxy serves for this app.' },
         { key: 'VIRTUAL_PORT', value: '', label: 'Container port', help: 'Container port nginx-proxy forwards to. Required when the image exposes more than one port.' }
       );
     }
@@ -11836,12 +11911,13 @@ app.get('/api/core/app-hints', async (req, res) => {
     }
     if (acmeCompanion) {
       fields.push(
-        { key: 'LETSENCRYPT_HOST', value: '', label: 'Certificate hostname', help: 'Hostname acme-companion requests a certificate for. Usually the same as VIRTUAL_HOST.' },
-        { key: 'LETSENCRYPT_EMAIL', value: '', label: 'Certificate email', help: 'Contact email used for Let\'s Encrypt registration and expiry notices.' }
+        { key: 'LETSENCRYPT_HOST', value: suggestedHost, label: 'Certificate hostname', help: 'Hostname acme-companion requests a certificate for. Usually the same as VIRTUAL_HOST.' },
+        { key: 'LETSENCRYPT_EMAIL', value: defaults.adminEmail || '', label: 'Certificate email', help: 'Contact email used for Let\'s Encrypt registration and expiry notices.' }
       );
     }
     res.json({
       services: { nginxProxy, acmeCompanion, authelia, authentik, mailpit, stalwart },
+      primaryDomain: defaults.primaryDomain || '',
       fields
     });
   } catch (e) {

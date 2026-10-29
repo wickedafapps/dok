@@ -19,9 +19,9 @@
         <h4>Main workflow</h4>
         <ol>
           <li>Create or connect a core <strong>nginx-proxy</strong> in Settings so hostnames route to containers.</li>
-          <li>Deploy apps from <strong>App Creation</strong> using a docker run command, compose file, git repository, upload, or OC Assist.</li>
-          <li>Configure each app in the compose builder, then save or save and launch.</li>
-          <li>Use <strong>Apps</strong> for lifecycle actions, Alter State, Quick Deploy, and library export/import.</li>
+          <li>Create apps with <strong>OC Assist</strong>, or import a docker run command, compose file, git repository, or upload from <strong>App Creation</strong>.</li>
+          <li>Every app is saved stopped. Open <strong>Apps → Deploy</strong> to configure routing, ports, paths, and secrets before deploying it.</li>
+          <li>Use <strong>Apps</strong> for Deploy, Stop, Remove, and library export/import.</li>
           <li>Protect access with <strong>Authelia</strong> or publish through <strong>Cloudflare Tunnel</strong> if needed.</li>
           <li>Take regular backups from <strong>Settings → Maintenance</strong>.</li>
         </ol>
@@ -71,17 +71,17 @@
     'app-creation': {
       title: 'App Creation',
       html: `
-        <p>App Creation is the primary way to add an application to Dok. Every option ends in the same compose configuration modal, and every saved app lives in <code>apps/&lt;name&gt;/</code> with its own compose project.</p>
+        <p>App Creation is the primary way to add an application to Dok. Every option asks for a required <strong>app title</strong>, ends in the same compose configuration modal, and saves the app under <code>apps/&lt;name&gt;/</code> with its own compose project.</p>
         <h4>Creation methods</h4>
         <ul>
+          <li><strong>OC Assist</strong> (default) describes the app in natural language and lets OpenCode build and register it.</li>
           <li><strong>Docker run</strong> converts a pasted command into a compose file.</li>
           <li><strong>Docker Compose</strong> accepts a compose file you paste.</li>
           <li><strong>Git Clone</strong> clones any git repository and looks for compose or Dockerfile files.</li>
           <li><strong>Local upload</strong> uploads files or a folder from your computer.</li>
-          <li><strong>OC Assist</strong> describes the app in natural language and lets OpenCode build and deploy it.</li>
         </ul>
         <p>If a git clone or upload has no compose file or Dockerfile, Dok stores it under Projects instead of creating an app. You can deploy it later from that project.</p>
-        <p>Before finalising, Dok validates the compose file, resolves networks and bind mounts, checks published ports, and asks for any missing choices. Creation can finish with <strong>Complete Creation</strong> (save only) or <strong>Complete Creation and Launch</strong> (save and start).</p>
+        <p>Before finalising, Dok validates the compose file, resolves networks and bind mounts, checks published ports, and asks for any missing choices. <strong>Save to library</strong> saves the app stopped. <strong>Test launch (stops after test)</strong> starts it briefly, reports the container states, and stops it again. Nothing stays running until you deploy from Apps.</p>
       `
     },
     'app-creation-run': {
@@ -114,7 +114,7 @@
     'app-creation-git': {
       title: 'Create from Git',
       html: `
-        <p>Enter any git URL and optionally a branch and app name. Private HTTPS repositories use matching git connections saved under Dok Settings; SSH URLs use the container user&rsquo;s keys.</p>
+        <p>Enter any git URL, the required app title, and optionally a branch. Private HTTPS repositories use matching git connections saved under Dok Settings; SSH URLs use the container user&rsquo;s keys.</p>
         <ul>
           <li>If the repository contains <code>docker-compose.yml</code>, <code>compose.yaml</code>, or a <code>Dockerfile</code>, Dok copies it into <code>apps/&lt;name&gt;</code>.</li>
           <li>Dockerfile-only projects receive a generated compose file that builds the image.</li>
@@ -137,17 +137,17 @@
     'app-creation-assist': {
       title: 'OC Assist',
       html: `
-        <p><strong>OC Assist</strong> creates an app from a written brief. Enter a required prompt describing the app, optionally add pasted data such as a docker run command, compose file, or repository URL, upload supporting files, and optionally choose the app name and folder.</p>
+        <p><strong>OC Assist</strong> creates an app from a written brief. Enter a required app title and prompt describing the app, optionally add pasted data such as a docker run command, compose file, or repository URL, and upload supporting files.</p>
         <p>When you select <strong>Create app with OC Assist</strong>, Dok writes a private brief and the uploaded files under <code>sources/oc-assist-&lt;stamp&gt;/</code>, then immediately opens the OpenCode chat in <strong>User mode</strong> with the dedicated <code>assist</code> agent. There is no shell or mode picker: the chat is the only thing shown. The brief and all creator fields are passed automatically; you only need to answer questions if OpenCode needs more information.</p>
         <p>If OpenCode fails during startup, Dok shows the captured terminal error instead of opening an empty chat. Inside the terminal, <strong>Escape</strong> is sent to OpenCode (for its own dialogs); use the terminal&rsquo;s close button to end the session.</p>
         <h4>What the assistant is allowed to do</h4>
         <ul>
           <li>Read and edit files only inside <code>apps/</code>, the OC Assist source folder, and its own brief folder.</li>
           <li>Run app-related shell commands such as <code>git clone</code>, file inspection, and the registration helper. Docker and system administration commands stay blocked.</li>
-          <li>Register the finished app through <code>server/assist-register.mjs</code> and optionally launch it.</li>
+          <li>Register the finished app through <code>server/assist-register.mjs</code>. Registration saves it stopped; the assistant may run a temporary test launch that Dok stops again.</li>
           <li>It cannot manage Docker system resources, packages, or the Dok source code.</li>
         </ul>
-        <p>The assistant uses the same registration path as manual creation. If the app would replace or rename existing containers, the same amendment approval appears before anything changes.</p>
+        <p>The app is saved stopped in Apps. Open <strong>Apps → Deploy</strong> to configure routing, ports, paths, and secrets before deploying. The assistant uses the same registration path as manual creation, so amendment approval still applies if a container name would change.</p>
       `
     },
     'app-config-modal': {
@@ -164,30 +164,29 @@
           <li>Required values, duplicate names, duplicate published ports, invalid ports, and invalid JSON are highlighted in red.</li>
           <li>Every change regenerates the compose preview and is validated by the server.</li>
         </ul>
-        <p><strong>VIRTUAL_HOST</strong> and <strong>VIRTUAL_PORT</strong> quick fields stay in sync with the service environment. When nginx-proxy is running, a missing virtual host or port is highlighted.</p>
+        <p><strong>VIRTUAL_HOST</strong> and <strong>VIRTUAL_PORT</strong> quick fields stay in sync with the service environment. When nginx-proxy, Authelia, or acme-companion is installed (running or stopped), the builder adds the matching environment fields automatically: routing host and container port, optional <code>ENABLE_AUTH=true</code>, and certificate host and email. Suggested hostnames use <code>&lt;app&gt;.&lt;primary domain&gt;</code> from Dok Settings.</p>
         <h4>Manual editing</h4>
         <p><strong>Manually edit compose file</strong> shows a warning and switches to raw text editing. Manual mode bypasses the builder guard but still uses compose validation. Use <strong>Validate compose</strong> before finishing.</p>
         <h4>Missing resources</h4>
         <p>Missing input networks must be mapped to an existing network or explicitly created. Missing bind paths must be chosen or created; protected system paths cannot be newly created, though existing safe paths such as <code>/var/run/docker.sock</code> remain selectable.</p>
         <h4>Finalise</h4>
-        <p><strong>Complete Creation</strong> saves the app to the library without starting it. <strong>Complete Creation and Launch</strong> saves and starts it. If the target app directory already exists, Dok asks for overwrite confirmation. Progress is shown in stages: prepare, build, validate, save, and launch.</p>
+        <p><strong>Save to library</strong> saves the app stopped. <strong>Test launch (stops after test)</strong> starts it briefly, reports each container&rsquo;s state, and stops the app again so it remains ready for configuration. If the target app directory already exists, Dok asks for overwrite confirmation. Progress is shown in stages: prepare, build, validate, save, and test.</p>
         <p>Persistent app data is never overwritten or deleted. If the new app targets an existing data directory, Dok tells you that it will connect to the existing data. Overwriting app files preserves <code>data/</code> and existing <code>.env</code> files. For fresh data, use a new app name or data location, or delete the existing data manually first.</p>
       `
     },
     apps: {
       title: 'Apps',
       html: `
-        <p>Apps lists every app in the Dok library. Each app is a compose project stored under <code>apps/&lt;name&gt;/</code>.</p>
+        <p>Apps lists every app in the Dok library. Each app is a compose project stored under <code>apps/&lt;name&gt;/</code>. Apps are saved stopped until you deploy them.</p>
         <ul>
-          <li><strong>Quick Deploy</strong> runs compose up for the app and resolves duplicate container-name conflicts after your approval.</li>
-          <li><strong>Alter State</strong> opens the visual compose builder for the app&rsquo;s base compose, so you can change settings before redeploying.</li>
-          <li><strong>Start / Stop / Restart</strong> controls the compose project.</li>
+          <li><strong>Deploy</strong> opens the visual compose builder for the app. Review routing, ports, paths, and secrets, then use <strong>Save configuration</strong> or <strong>Save and deploy</strong>. This is the only way to start or redeploy an app.</li>
+          <li><strong>Stop</strong> stops the compose project without changing its configuration.</li>
           <li><strong>Remove</strong> removes the app from the registry. Files stay on disk unless you remove them separately.</li>
-          <li><strong>Configure &amp; Deploy</strong> appears for imported library apps that still need installation-specific settings.</li>
+          <li><strong>Configure &amp; Deploy</strong> is the same Deploy action, labelled for imported library apps that still need installation-specific settings.</li>
           <li><strong>Export library</strong> creates a portable archive of selected apps. <strong>Import library</strong> adds apps from another Dok installation.</li>
         </ul>
         <p>Badges show <strong>needs setup</strong> for imported apps and <strong>library</strong> for apps that came from an exported library.</p>
-        <p>Alter State opens the same builder used during creation. To edit raw YAML instead, use <strong>Manually edit compose file</strong> inside the builder. Saving updates the base compose; saving and deploying applies it immediately.</p>
+        <p>To edit raw YAML instead of the builder fields, use <strong>Manually edit compose file</strong> inside the builder. Saving updates the base compose; saving and deploying applies it immediately. If a container name would be renamed, Dok asks for approval first.</p>
       `
     },
     'app-library': {
@@ -222,7 +221,7 @@
     amendments: {
       title: 'Amendment approval',
       html: `
-        <p>When Quick Deploy, finalize, Alter State deploy, start, or OC Assist would rename a container that already belongs to another app instance, Dok pauses and shows an <strong>Approve amendments</strong> dialog first.</p>
+        <p>When a deploy, test launch, or OC Assist registration would rename a container that already belongs to another app instance, Dok pauses and shows an <strong>Approve amendments</strong> dialog first.</p>
         <p>The dialog lists every affected app instance and the exact rename or replacement, for example renaming a stale <code>web</code> container to <code>web-previous-a1b2c3</code>. Nothing is renamed or launched until you approve. Normal recreation of this app&rsquo;s own containers does not need approval.</p>
         <ul>
           <li><strong>Approve and continue</strong> applies the listed renames and continues the original action.</li>
@@ -250,7 +249,7 @@
         <p>The Dashboard <strong>Terminal</strong> button opens an interactive shell in the Dok container. Shell sessions exist only while running and stop when the terminal is closed, the session exits, or the server shuts down.</p>
         <p>The shell starts in <code>/app</code> and runs as the Dok container user. It is not permission-restricted.</p>
         <h4>OC Assist</h4>
-        <p>OC Assist is the only OpenCode chat launched from Dok. Start it from <strong>App Creation → OC Assist</strong>; Dok opens the chat directly, without shell or mode options. The assistant runs in User mode with permission to edit apps and register or launch them.</p>
+        <p>OC Assist is the only OpenCode chat launched from Dok. Start it from <strong>App Creation → OC Assist</strong>; Dok opens the chat directly, without shell or mode options. The assistant runs in User mode with permission to edit apps and register them. It saves each app stopped so you can configure and deploy it from Apps.</p>
         <p>Admin OpenCode is available only inside the Dok Maintenance container. Provider settings for OC Assist can be saved under Settings → Core Services → OpenCode.</p>
       `
     },
@@ -469,7 +468,7 @@
         <p>Hover or focus the <strong>?</strong> beside any field for its specific explanation. Common fields are summarised here.</p>
         <h4>App identity</h4>
         <ul>
-          <li><strong>App name</strong> becomes the folder <code>apps/&lt;name&gt;</code> and the compose project name. Use lowercase letters, numbers, dashes, and underscores.</li>
+          <li><strong>App title</strong> is required and becomes the folder <code>apps/&lt;name&gt;</code> and the compose project name after sanitising. Use lowercase letters, numbers, dashes, and underscores for the cleanest folder name.</li>
           <li><strong>Container name</strong> is optional. Leaving it blank lets Compose generate a project-scoped name, which is safer for duplicate prevention.</li>
           <li><strong>Image</strong> is required unless the service has a build context.</li>
           <li><strong>Restart policy</strong> controls what Docker does after a crash or host reboot. <code>unless-stopped</code> is a common choice for apps.</li>
@@ -551,7 +550,7 @@
 
   const FIELD_LABEL = {
     appCfgCompose: 'Compose file',
-    appCfgName: 'App name',
+    appCfgName: 'App title',
     appCfgNetwork: 'Network',
     editContent: 'File content',
     editPath: 'File path',
@@ -564,7 +563,7 @@
     libraryRepoUrl: 'Repository URL',
     libraryRepoBranch: 'Branch or tag',
     libraryRepoPath: 'Library folder',
-    libraryRepoName: 'App name',
+    libraryRepoName: 'App title',
     importBackupFile: 'Backup archive'
   };
 
@@ -573,22 +572,22 @@
     imageSearch: 'Filter the image list by repository, tag, or image ID.',
     pullImageInput: 'Full image reference to pull, for example nginx:alpine or ghcr.io/org/app:tag.',
     runImage: 'Image to run in the quick-run helper.',
-    runName: 'Optional name for the new container.',
-    appCfgName: 'App name. It becomes the apps/<name> folder and the compose project name.',
+    runName: 'Required app title for the new app. It becomes the apps/<name> folder and the compose project name.',
+    appCfgName: 'Required app title. It becomes the apps/<name> folder and the compose project name.',
     appCfgCompose: 'Raw compose file. Editing here switches the modal to manual mode.',
     appCfgNetwork: 'Default network used by the compose preview when no service network is selected.',
     runCmd: 'Complete docker run command to convert into an app compose file.',
-    composeName: 'App name for the pasted compose project.',
+    composeName: 'Required app title for the pasted compose project.',
     composeYaml: 'Complete docker-compose.yml or compose.yaml content.',
     gitRepo: 'Git clone URL. HTTPS, SSH, and any hosted git server are supported.',
     gitBranch: 'Optional branch, tag, or commit to check out. Leave blank for the remote default.',
-    gitName: 'App name for the cloned project.',
-    uploadName: 'App name for the uploaded files.',
+    gitName: 'Required app title for the cloned project.',
+    uploadName: 'Required app title for the uploaded files.',
     uploadFolder: 'Files or a folder selected from this computer.',
     uploadFiles: 'Individual files selected from this computer.',
     assistPrompt: 'Required description of the app you want OC Assist to create.',
     assistData: 'Optional pasted docker run command, compose file, repository URL, or other reference material.',
-    assistName: 'Optional app name. If blank, OpenCode proposes one from your description.',
+    assistName: 'Required app title. OC Assist uses it for the app folder, compose project, and saved library entry.',
     assistFolder: 'Optional existing folder to use as the app source.',
     assistFiles: 'Optional files to give OC Assist as supporting material.',
     libraryExportName: 'Optional filename prefix for the exported library archive.',
@@ -714,7 +713,7 @@
     logsAuto: 'Automatically refresh the server log.',
     editPath: 'File path inside the project. Parent traversal is blocked.',
     editContent: 'Editable text content of the selected source file.',
-    sourceName: 'Project or source name.',
+    sourceName: 'Required app title for the project being deployed.',
     sourceMode: 'How the source is processed: docker run, compose, or deploy.',
     sourceCommand: 'Docker run command used to create the source.',
     sourcePorts: 'Comma-separated ports for the source deployment.',

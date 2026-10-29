@@ -1,6 +1,13 @@
 # OC Assist App Library Contract
 
-This file is managed by Dok. Every app created by OC Assist and every app added to the Dok App Library must follow these rules.
+This file is managed by Dok. Every app created by OC Assist and every app added to the Dok App Library must follow these rules. The goal is a consistent, portable, functional app that is ready to launch after the user supplies installation-specific configuration in Dok's compose editor.
+
+## Required outcome
+
+- The app title is required. Use it for the app folder and compose project.
+- Save the app to the library in a complete, validated, ready-to-launch state, but stopped. Never leave containers running.
+- The user configures routing, ports, paths, and secrets in Dok's compose editor before the real deploy from Apps. Do not claim the app is running or reachable.
+- A test launch is allowed only to verify the app starts. Dok stops it again before reporting the result.
 
 ## Required layout
 
@@ -85,12 +92,14 @@ Apps must be portable between Dok installations.
 
 ## Publish and verify
 
-1. Create the app files under `apps/<app-name>/`.
-2. Validate the compose file and resolve missing networks, paths, ports, and required environment values.
-3. Publish with the command in the OC Assist brief. Use `--launch` only when the user wants the app started immediately.
-4. If publishing reports existing app data, explain that the app will reuse it; do not attempt to reset it.
-5. If publishing asks for amendment approval, summarize every affected container and ask before approving.
-6. Report the app name, how it is reached, required configuration, and whether it is running.
+1. Create the app files under `apps/<app-name>/` using the required app title.
+2. Validate the compose file and resolve missing networks, paths, ports, and required environment values. Make the app functional and ready to launch once the user supplies installation-specific settings.
+3. Publish with the command in the OC Assist brief. Publishing saves the app to the library **stopped**.
+4. `--test` is optional. It starts the app briefly so you can verify it, then the server stops it again and returns the container states. Never leave an app running.
+5. The user applies routing, ports, paths, and secrets in the Dok compose editor and deploys from the Apps tab. Do not claim the app is deployed or reachable yet.
+6. If publishing reports existing app data, explain that the app will reuse it; do not attempt to reset it.
+7. If publishing asks for amendment approval, summarize every affected container and ask before approving.
+8. Report the app title, the files and compose that were created, the required configuration, and that the user must open Apps → Deploy to configure and deploy it.
 
 ## Pre-publish checklist
 

@@ -1317,21 +1317,26 @@ async function loadAppCfgBuilder(compose) {
 }
 
 
-let coreAppHintsCache = { at: 0, data: null, promise: null };
-async function getCoreAppHints() {
-  if (coreAppHintsCache.data && Date.now() - coreAppHintsCache.at < 30000) return coreAppHintsCache.data;
-  if (!coreAppHintsCache.promise) {
-    coreAppHintsCache.promise = api('/api/core/app-hints')
-      .then(data => {
-        coreAppHintsCache = { at: Date.now(), data, promise: null };
-        return data;
-      })
-      .catch(() => {
-        coreAppHintsCache = { at: 0, data: { services: {}, fields: [] }, promise: null };
-        return coreAppHintsCache.data;
-      });
-  }
-  return coreAppHintsCache.promise;
+const coreAppHintsCache = new Map();
+async function getCoreAppHints(appName = '') {
+  const requestedApp = String(appName || '').trim();
+  const key = requestedApp || '__default__';
+  const cached = coreAppHintsCache.get(key);
+  if (cached?.data && Date.now() - cached.at < 30000) return cached.data;
+  if (cached?.promise) return cached.promise;
+  const query = requestedApp ? `?app=${encodeURIComponent(requestedApp)}` : '';
+  const promise = api('/api/core/app-hints' + query)
+    .then(data => {
+      coreAppHintsCache.set(key, { at: Date.now(), data, promise: null });
+      return data;
+    })
+    .catch(() => {
+      const data = { services: {}, fields: [] };
+      coreAppHintsCache.set(key, { at: 0, data, promise: null });
+      return data;
+    });
+  coreAppHintsCache.set(key, { at: 0, data: null, promise });
+  return promise;
 }
 
 function appCfgPrimaryContainerPort(service) {
@@ -1369,11 +1374,12 @@ function applyCoreServiceHintsToModel(model, hints) {
     let value = hint.value === undefined || hint.value === null ? '' : String(hint.value);
     if (!value && (key === 'VIRTUAL_HOST' || key === 'LETSENCRYPT_HOST')) {
       const appName = String(pendingAppConfig?.appName || '').trim();
-      const primary = String(installDefaults?.primaryDomain || '').trim();
-      if (appName && primary) value = `${appName}.${primary}`;
+      const primary = String(hints?.primaryDomain || installDefaults?.primaryDomain || '').trim();
+      if (appName && primary) value = `${slugifyAppName(appName)}.${primary}`;
     }
     if (!value && key === 'VIRTUAL_PORT') value = appCfgPrimaryContainerPort(service);
     if (!value && key === 'LETSENCRYPT_EMAIL') value = String(installDefaults?.adminEmail || '').trim();
+    if (!value) continue;
     lines.push(`${key}=${value}`);
     existing.add(key);
     changed = true;
@@ -1384,7 +1390,8 @@ function applyCoreServiceHintsToModel(model, hints) {
 
 async function applyCoreServiceHints(model) {
   try {
-    const hints = await getCoreAppHints();
+    const appName = String(pendingAppConfig?.appName || '').trim();
+    const hints = await getCoreAppHints(appName);
     return applyCoreServiceHintsToModel(model, hints);
   } catch {
     return false;
@@ -1809,7 +1816,7 @@ function updateAppCfgRequired() {
   const name = qs('#appCfgName');
   if (!name) return;
   name.classList.toggle('invalid', !name.value.trim());
-  if (!name.value.trim()) name.title = 'App name is required';
+  if (!name.value.trim()) name.title = 'App title is required';
   else name.removeAttribute('title');
 }
 
@@ -1857,10 +1864,10 @@ function openAppConfig(data) {
   const editing = !!data.editAppId;
   if (qs('#appCfgName')) qs('#appCfgName').disabled = editing;
   qs('#appConfigTitle').textContent = editing
-    ? (data.needsConfiguration ? `Configure imported app: ${data.appName || 'app'}` : `Alter state: ${data.appName || 'app'}`)
+    ? (data.needsConfiguration ? `Configure imported app: ${data.appName || 'app'}` : `Deploy: ${data.appName || 'app'}`)
     : `Configure ${data.appName || 'app'}`;
-  if (qs('#appCfgComplete')) qs('#appCfgComplete').textContent = editing ? 'Save base config' : 'Complete Creation';
-  if (qs('#appCfgCompleteRun')) qs('#appCfgCompleteRun').textContent = editing ? 'Save and deploy' : 'Complete Creation and Launch';
+  if (qs('#appCfgComplete')) qs('#appCfgComplete').textContent = editing ? 'Save configuration' : 'Save to library';
+  if (qs('#appCfgCompleteRun')) qs('#appCfgCompleteRun').textContent = editing ? 'Save and deploy' : 'Test launch (stops after test)';
   hideAppCfgProgress();
   qs('#appConfigModal').classList.remove('hidden');
   renderAppCfgNetworkNotice();
@@ -1912,7 +1919,7 @@ function stopAppCfgProgressTimer() {
 }
 
 // Moves quickly at first, then eases towards 90% so the bar keeps moving while
-// the server validates, writes the app, and starts the container.
+// the server validates, writes the app, and optionally runs a test launch.
 function startAppCfgProgress(label = 'Preparing…') {
   stopAppCfgProgressTimer();
   appCfgProgressValue = 4;
@@ -1925,7 +1932,7 @@ function startAppCfgProgress(label = 'Preparing…') {
   }, 220);
 }
 
-function finishAppCfgProgress(label = 'Created') {
+function finishAppCfgProgress(label = 'Saved') {
   stopAppCfgProgressTimer();
   appCfgProgressValue = 100;
   appCfgProgressLabel = label;
@@ -1944,7 +1951,7 @@ function slugifyAppName(value) {
 
 async function recentlyCreatedApp(name) {
   // A proxy timeout or dropped connection can hide a successful finalize. The
-  // registry is written before the launch step, so use a fresh entry as proof
+  // registry is written before the test/deploy step, so use a fresh entry as proof
   // that the app exists instead of leaving the modal open for a retry.
   try {
     const list = await api('/api/registry');
@@ -1957,20 +1964,20 @@ async function recentlyCreatedApp(name) {
   return null;
 }
 
-async function doAppComplete(launchNow = false, force = false, overwrite = false, confirmAmend = false) {
+async function doAppComplete(deployNow = false, force = false, overwrite = false, confirmAmend = false) {
   if (!pendingAppConfig || appCfgCompleting) return;
   appCfgCompleting = true;
   const data = pendingAppConfig;
   const editing = !!data.editAppId;
-  const btn = launchNow ? qs('#appCfgCompleteRun') : qs('#appCfgComplete');
-  const otherBtn = launchNow ? qs('#appCfgComplete') : qs('#appCfgCompleteRun');
+  const btn = deployNow ? qs('#appCfgCompleteRun') : qs('#appCfgComplete');
+  const otherBtn = deployNow ? qs('#appCfgComplete') : qs('#appCfgCompleteRun');
   const labels = editing
-    ? { save: 'Save base config', deploy: 'Save and deploy' }
-    : { save: 'Complete Creation', deploy: 'Complete Creation and Launch' };
+    ? { save: 'Save configuration', deploy: 'Save and deploy' }
+    : { save: 'Save to library', deploy: 'Test launch (stops after test)' };
   const msg = qs('#appCfgMsg');
   const release = () => {
     appCfgCompleting = false;
-    setLoading(btn, false, launchNow ? labels.deploy : labels.save);
+    setLoading(btn, false, deployNow ? labels.deploy : labels.save);
     if (otherBtn) otherBtn.disabled = false;
   };
   const fail = () => {
@@ -1978,6 +1985,14 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
     release();
   };
   startAppCfgProgress('Preparing…');
+  if (!editing && !qs('#appCfgName').value.trim()) {
+    updateAppCfgRequired();
+    msg.textContent = 'App title is required.';
+    toast('App title is required', true);
+    qs('#appCfgName').focus();
+    fail();
+    return;
+  }
   if (appCfgBuilderModel && !appCfgBuilderManual) {
     const built = await flushAppCfgBuilderBuild();
     if (built && built.ok === false) {
@@ -2000,7 +2015,7 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
       try {
         const check = await api('/api/compose/validate', jsonBody({ compose, appDir: data.appDir }));
         if (!check.ok) {
-          showComposeIssues(check.issues, () => doAppComplete(launchNow, true));
+          showComposeIssues(check.issues, () => doAppComplete(deployNow, true));
           fail();
           return;
         }
@@ -2010,28 +2025,28 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
         return;
       }
     }
-    setAppCfgProgress(62, launchNow ? 'Saving and deploying…' : 'Saving base configuration…');
+    setAppCfgProgress(62, deployNow ? 'Saving and deploying…' : 'Saving base configuration…');
     const editQuick = appCfgBuilderManual ? { vhost: '' } : appCfgBuilderQuickValues();
     const editInitialVhost = String(data.initialVhost ?? data.vhost ?? '').trim();
-    setLoading(btn, true, launchNow ? 'Deploying…' : 'Saving…');
+    setLoading(btn, true, deployNow ? 'Deploying…' : 'Saving…');
     if (otherBtn) otherBtn.disabled = true;
     msg.textContent = '';
     try {
       const res = await api(`/api/apps/${encodeURIComponent(data.editAppId)}/compose`, jsonBody({
         compose,
-        deploy: launchNow,
+        deploy: deployNow,
         force,
         confirmAmend,
         vhostTouched: editQuick.vhost !== editInitialVhost
       }));
-      finishAppCfgProgress(launchNow ? (res.pending ? 'Starting' : 'Deployed') : 'Saved');
+      finishAppCfgProgress(deployNow ? (res.pending ? 'Starting' : 'Deployed') : 'Saved');
       await new Promise(resolve => setTimeout(resolve, 600));
       qs('#appConfigModal').classList.add('hidden');
       hideAppCfgProgress();
       pendingAppConfig = null;
       pendingSaveAction = null;
       if (res.pending) toast(res.message || `${data.appName} is still starting`);
-      else if (launchNow) toast(`${data.appName} deployed`);
+      else if (deployNow) toast(`${data.appName} deployed`);
       else toast(`${data.appName} base configuration saved`);
       if (Array.isArray(res.issues) && res.issues.length) console.log(res.issues.join('\n'));
       refreshAll();
@@ -2042,7 +2057,7 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
         msg.textContent = e.message;
         showAmendApproval(
           e.data.amendments,
-          () => doAppComplete(launchNow, force, overwrite, true),
+          () => doAppComplete(deployNow, force, overwrite, true),
           `${data.appName} would amend existing containers. Review the other instances and changes below before approving.`
         );
       } else if (e.data?.saved) {
@@ -2055,7 +2070,7 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
         return;
       } else if (e.data && Array.isArray(e.data.issues) && e.data.issues.length) {
         msg.textContent = e.message;
-        showComposeIssues(e.data.issues, () => doAppComplete(launchNow, true));
+        showComposeIssues(e.data.issues, () => doAppComplete(deployNow, true));
       } else {
         msg.textContent = e.message;
         toast(e.message, true);
@@ -2094,7 +2109,7 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
     volumeChoices: data.volumeChoices || {},
     vhostTouched: vhost !== initialVhost,
     vhostService: data.vhostService || '',
-    launchNow,
+    testLaunch: deployNow,
     force,
     overwrite,
     confirmAmend
@@ -2105,7 +2120,7 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
     try {
       const check = await api('/api/compose/validate', jsonBody({ compose, appDir: data.appDir }));
       if (!check.ok) {
-        showComposeIssues(check.issues, () => doAppComplete(launchNow, true));
+        showComposeIssues(check.issues, () => doAppComplete(deployNow, true));
         fail();
         return;
       }
@@ -2117,22 +2132,35 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
   }
   setAppCfgProgress(48, 'Saving app…');
 
-  setLoading(btn, true, launchNow ? 'Launching…' : 'Creating…');
+  setLoading(btn, true, deployNow ? 'Testing…' : 'Saving…');
   if (otherBtn) otherBtn.disabled = true;
   msg.textContent = '';
-  setAppCfgProgress(62, launchNow ? 'Creating and launching…' : 'Creating app…');
+  setAppCfgProgress(62, deployNow ? 'Saving and test launching…' : 'Saving to library…');
   try {
     const res = await api('/api/launch/finalize', jsonBody(payload));
-    finishAppCfgProgress(res.launchError ? 'Created (launch failed)' : res.launchPending ? 'Starting…' : launchNow ? 'Running' : 'Created');
+    finishAppCfgProgress(res.launchError ? 'Saved (test failed)' : res.tested ? 'Tested and stopped' : 'Saved');
     await new Promise(resolve => setTimeout(resolve, 700));
     qs('#appConfigModal').classList.add('hidden');
     hideAppCfgProgress();
     pendingAppConfig = null;
     pendingSaveAction = null;
-    if (res.launchError) toast(`${payload.appName} created, but launch failed: ${res.launchError}${res.dataNotice ? ` ${res.dataNotice}` : ''}`, true, 12000);
-    else if (res.launchPending) toast(`${res.message || `${payload.appName} is still starting`}${res.dataNotice ? ` ${res.dataNotice}` : ''}`, false, 12000);
-    else if (launchNow) toast(`${payload.appName} is running${res.dataNotice ? `. ${res.dataNotice}` : ''}`, false, res.dataNotice ? 12000 : undefined);
-    else toast(`${payload.appName} created${res.dataNotice ? `. ${res.dataNotice}` : ''}`, false, res.dataNotice ? 12000 : undefined);
+    const dataNotice = res.dataNotice ? ` ${res.dataNotice}` : '';
+    if (res.testStopError) {
+      toast(`${payload.appName} was saved, but the test launch could not be stopped: ${res.testStopError}. Stop it from Apps before configuring it.${dataNotice}`, true, 15000);
+    } else if (res.launchError) {
+      toast(`${payload.appName} was saved, but the test launch failed: ${res.launchError}${dataNotice}`, true, 12000);
+    } else if (res.launchPending) {
+      toast(`${res.message || `${payload.appName} test launch did not finish`}${dataNotice}`, true, 12000);
+    } else if (res.tested) {
+      const states = (res.testContainers || []).map(item => `${item.name}: ${item.state}`).join(', ');
+      if (res.testHealthy) {
+        toast(`${payload.appName} test launch succeeded and the app was stopped. Open Apps → Deploy to configure and deploy it.${dataNotice}`, false, 12000);
+      } else {
+        toast(`${payload.appName} was saved, but the test launch did not stay running${states ? ` (${states})` : ''}. Open Apps → Deploy to review and fix it.${dataNotice}`, true, 15000);
+      }
+    } else {
+      toast(`${payload.appName} was saved to the library. Open Apps → Deploy to configure and deploy it.${dataNotice}`, false, res.dataNotice ? 12000 : undefined);
+    }
     if (res.stdout) console.log(res.stdout, res.stderr || '');
     refreshAll();
     loadApps();
@@ -2140,16 +2168,16 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
     hideAppCfgProgress();
     if (e.data?.created) {
       // The registry entry is the source of truth: the app was saved even if
-      // the launch step timed out or the connection dropped. Close instead of
+      // the test/deploy step timed out or the connection dropped. Close instead of
       // prompting the user to install the same app again.
-      finishAppCfgProgress('Created');
+      finishAppCfgProgress('Saved');
       await new Promise(resolve => setTimeout(resolve, 500));
       qs('#appConfigModal').classList.add('hidden');
       hideAppCfgProgress();
       pendingAppConfig = null;
       pendingSaveAction = null;
       msg.textContent = '';
-      toast(`${e.data.appName || payload.appName} was created. Check the Apps tab before retrying.`, false, 8000);
+      toast(`${e.data.appName || payload.appName} was saved. Check the Apps tab before retrying.`, false, 8000);
       refreshAll();
       loadApps();
       return;
@@ -2159,14 +2187,14 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
       // HTML error page). Check the registry before asking the user to retry.
       const existing = await recentlyCreatedApp(payload.appName);
       if (existing) {
-        finishAppCfgProgress('Created');
+        finishAppCfgProgress('Saved');
         await new Promise(resolve => setTimeout(resolve, 500));
         qs('#appConfigModal').classList.add('hidden');
         hideAppCfgProgress();
         pendingAppConfig = null;
         pendingSaveAction = null;
         msg.textContent = '';
-        toast(`${existing.name} was created. Check the Apps tab before retrying.`, false, 8000);
+        toast(`${existing.name} was saved. Check the Apps tab before retrying.`, false, 8000);
         refreshAll();
         loadApps();
         return;
@@ -2181,13 +2209,13 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
       msg.textContent = e.message;
       showAmendApproval(
         e.data.amendments,
-        () => doAppComplete(launchNow, force, overwrite, true),
+        () => doAppComplete(deployNow, force, overwrite, true),
         `${payload.appName} would amend existing containers. Review the other instances and changes below before approving.`
       );
       return;
     }
     if (e.status === 409 && e.data?.needsOverwrite) {
-      appCfgOverwritePending = { launchNow, force };
+      appCfgOverwritePending = { deployNow, force };
       qs('#appOverwriteName').textContent = e.data.appName || payload.appName;
       const dataEl = qs('#appOverwriteData');
       const existingData = Array.isArray(e.data.existingData) ? e.data.existingData : [];
@@ -2217,7 +2245,7 @@ async function doAppComplete(launchNow = false, force = false, overwrite = false
       toast(e.message, true);
     } else if (e.data && Array.isArray(e.data.issues) && e.data.issues.length) {
       msg.textContent = e.message;
-      showComposeIssues(e.data.issues, () => doAppComplete(launchNow, true));
+      showComposeIssues(e.data.issues, () => doAppComplete(deployNow, true));
     } else {
       msg.textContent = e.message;
       toast(e.message, true);
@@ -2238,13 +2266,18 @@ if (qs('#appOverwriteConfirm')) {
     const pending = appCfgOverwritePending;
     appCfgOverwritePending = null;
     qs('#appOverwriteModal').classList.add('hidden');
-    if (pending) doAppComplete(pending.launchNow, pending.force, true);
+    if (pending) doAppComplete(pending.deployNow, pending.force, true);
   });
 }
 
 qs('#runCreateBtn').addEventListener('click', async () => {
   const command = qs('#runCmd').value.trim();
   if (!command) return toast('Paste a docker run command first', true);
+  if (!qs('#runName').value.trim()) {
+    toast('App title is required', true);
+    qs('#runName').focus();
+    return;
+  }
   const btn = qs('#runCreateBtn');
   setLoading(btn, true, 'Preparing…');
   try {
@@ -2263,6 +2296,11 @@ qs('#composeCreateBtn').addEventListener('click', async () => {
   const yaml = qs('#composeYaml').value.trim();
   if (!yaml) return toast('Paste a compose file first', true);
   if (!/services\s*:/m.test(yaml)) return toast('That does not look like a compose file (missing services:)', true);
+  if (!qs('#composeName').value.trim()) {
+    toast('App title is required', true);
+    qs('#composeName').focus();
+    return;
+  }
   const btn = qs('#composeCreateBtn');
   setLoading(btn, true, 'Preparing…');
   try {
@@ -2281,6 +2319,11 @@ qs('#composeCreateBtn').addEventListener('click', async () => {
 qs('#gitCloneBtn').addEventListener('click', async () => {
   const repo = qs('#gitRepo').value.trim();
   if (!repo) return toast('Enter a repository URL', true);
+  if (!qs('#gitName').value.trim()) {
+    toast('App title is required', true);
+    qs('#gitName').focus();
+    return;
+  }
   const btn = qs('#gitCloneBtn');
   setLoading(btn, true, 'Cloning…');
   const out = qs('#gitOutput');
@@ -2330,6 +2373,11 @@ qs('#uploadBtn').addEventListener('click', async () => {
     ...Array.from(filesInput.files || [])
   ];
   if (!files.length) return toast('Select a folder or files to upload', true);
+  if (!qs('#uploadName').value.trim()) {
+    toast('App title is required', true);
+    qs('#uploadName').focus();
+    return;
+  }
   const btn = qs('#uploadBtn');
   setLoading(btn, true, 'Uploading…');
   const out = qs('#uploadOutput');
@@ -2474,6 +2522,11 @@ qs('#sourceMode').addEventListener('change', (e) => {
 
 qs('#sourceDeployBtn').addEventListener('click', async () => {
   if (!state.sourceRel || state.sourceRel === '.') return toast('Open a project folder first', true);
+  if (!qs('#sourceName').value.trim()) {
+    toast('App title is required', true);
+    qs('#sourceName').focus();
+    return;
+  }
   const btn = qs('#sourceDeployBtn');
   const out = qs('#sourceOutput');
   setLoading(btn, true, 'Preparing…');
@@ -2622,14 +2675,11 @@ async function loadRegistry() {
             <div>
               <div class="item-title">${escapeHtml(entry.name)} ${badge(typeLabels[entry.type] || entry.type, 'type')} ${entry.needsConfig ? badge('needs setup', 'type') : (entry.library ? badge('library', 'type') : '')}</div>
               <div class="item-sub mono">${escapeHtml(detail)}</div>
-              <div class="item-sub">${meta ? escapeHtml(meta) + ' · ' : ''}${entry.needsConfig ? 'Configure before launching · ' : ''}Saved ${entry.created ? new Date(entry.created).toLocaleString() : 'unknown'}</div>
+              <div class="item-sub">${meta ? escapeHtml(meta) + ' · ' : ''}${entry.needsConfig ? 'Configure before deploying · ' : ''}Saved ${entry.created ? new Date(entry.created).toLocaleString() : 'unknown'}</div>
             </div>
             <div class="item-actions">
-              <button class="btn btn-primary" data-act="${entry.needsConfig ? 'configure' : 'deploy'}">${entry.needsConfig ? 'Configure & Deploy' : 'Quick Deploy'}</button>
-              <button class="btn" data-act="alter">Alter State</button>
-              ${entry.needsConfig ? '' : '<button class="btn" data-act="start">Start</button>'}
+              <button class="btn btn-primary" data-act="deploy">${entry.needsConfig ? 'Configure & Deploy' : 'Deploy'}</button>
               <button class="btn" data-act="stop">Stop</button>
-              ${entry.needsConfig ? '' : '<button class="btn" data-act="restart">Restart</button>'}
               ${entry.sourcePath && !String(entry.sourcePath).startsWith('/') ? '<button class="btn" data-act="browse">Browse</button>' : ''}
               <button class="btn btn-danger" data-act="delete">Remove</button>
             </div>
@@ -2658,7 +2708,7 @@ async function loadRegistry() {
             openTab('sources');
             return;
           }
-          if (act === 'alter' || act === 'configure') {
+          if (act === 'deploy') {
             setLoading(btn, true, 'Loading…');
             try {
               const res = await api(`/api/apps/${encodeURIComponent(entry.id)}/compose`);
@@ -2689,38 +2739,17 @@ async function loadRegistry() {
             return;
           }
 
-          const url = act === 'deploy'
-            ? `/api/registry/${encodeURIComponent(entry.id)}/deploy`
-            : `/api/registry/${encodeURIComponent(entry.id)}/${act}`;
-          const label = act === 'deploy' ? 'Deploying…' : `${act[0].toUpperCase()}${act.slice(1)}…`;
-          const runAction = async (confirmAmend = false) => {
-            setLoading(btn, true, confirmAmend ? 'Applying approved changes…' : label);
-            try {
-              const res = await api(url, jsonBody({ confirmAmend }));
-              if (res.pending) toast(res.message || `${entry.name} is still starting`);
-              else if (Array.isArray(res.amended) && res.amended.length) {
-                toast(`${entry.name} deployed. ${res.amended.join(' ')}`, false, 8000);
-              } else if (res.renamed && res.renamed.length) {
-                const names = res.renamed.map(item => item.to).join(', ');
-                toast(`${entry.name} deployed. Renamed conflicting container${res.renamed.length === 1 ? '' : 's'} to ${names}.`);
-              } else toast(act === 'deploy' ? `${entry.name} deployed` : `${entry.name}: ${act} requested`);
-              loadApps();
-              refreshAll();
-            } catch (e) {
-              if (e.data?.needsAmendApproval) {
-                showAmendApproval(
-                  e.data.amendments,
-                  () => runAction(true),
-                  `${entry.name} would amend existing containers. Review the other instances and changes below before approving.`
-                );
-              } else {
-                toast(e.message, true);
-              }
-            } finally {
-              setLoading(btn, false);
-            }
-          };
-          runAction(false);
+          setLoading(btn, true, `${act[0].toUpperCase()}${act.slice(1)}…`);
+          try {
+            await api(`/api/registry/${encodeURIComponent(entry.id)}/${act}`, jsonBody({}));
+            toast(`${entry.name}: ${act} requested`);
+            loadApps();
+            refreshAll();
+          } catch (e) {
+            toast(e.message, true);
+          } finally {
+            setLoading(btn, false);
+          }
         });
       });
     });
@@ -4485,6 +4514,11 @@ if (qs('#assistStartBtn')) {
       qs('#assistPrompt')?.focus();
       return;
     }
+    if (!qs('#assistName')?.value.trim()) {
+      toast('App title is required', true);
+      qs('#assistName')?.focus();
+      return;
+    }
     const files = [
       ...Array.from(qs('#assistFiles')?.files || []),
       ...Array.from(qs('#assistFolder')?.files || [])
@@ -4510,7 +4544,7 @@ if (qs('#assistStartBtn')) {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || res.statusText || 'OC Assist failed to start');
       startedSession = data.session;
-      if (output) output.textContent = `OpenCode is ready for ${data.appName}. Chat in the terminal; the app will be registered in Apps when it is ready.`;
+      if (output) output.textContent = `OpenCode is ready for ${data.appName}. Chat in the terminal; the app is saved stopped in Apps when it is ready so you can configure and deploy it.`;
       toast(`OC Assist started for ${data.appName}`, false, 6000);
       await openExistingTerminal(data.session);
     } catch (e) {

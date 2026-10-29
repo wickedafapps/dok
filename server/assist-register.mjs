@@ -15,7 +15,7 @@ const option = (name, fallback = '') => {
 
 const name = String(option('--name') || '').trim();
 if (!name || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) {
-  console.error('Usage: node /app/server/assist-register.mjs --name <app> [--dir /app/apps/<app>] [--compose <file>] [--launch] [--confirm-amend] [--vhost <host>] [--vhost-port <port>] [--network <name>]');
+  console.error('Usage: node /app/server/assist-register.mjs --name <app> [--dir /app/apps/<app>] [--compose <file>] [--test] [--confirm-amend] [--vhost <host>] [--vhost-port <port>] [--network <name>]');
   process.exit(2);
 }
 
@@ -36,7 +36,9 @@ const payload = {
   appName: name,
   appDir: dir,
   compose,
-  launchNow: flag('--launch') && !flag('--no-launch'),
+  // Apps are saved to the library stopped. --test performs a temporary launch
+  // so the app can be checked, and the server stops it again before returning.
+  testLaunch: flag('--test') || (flag('--launch') && !flag('--no-launch')),
   overwrite: true,
   force: flag('--force'),
   confirmAmend: flag('--confirm-amend'),
