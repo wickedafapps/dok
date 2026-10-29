@@ -832,6 +832,15 @@ footer {
   scrollbar-color: #2c3b44 #05080a;
 }
 
+.terminal-notice {
+  padding: 14px;
+  color: var(--warn, #ffbd2e);
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
 .terminal-footer {
   display: flex;
   justify-content: space-between;

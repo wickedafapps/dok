@@ -47,7 +47,7 @@ const payload = {
   vhostTouched: !!option('--vhost')
 };
 
-const port = process.env.PORT || '8080';
+const port = process.env.WICKEDAFDOK_PORT || process.env.PORT || '8080';
 const response = await fetch(`http://127.0.0.1:${port}/api/launch/finalize`, {
   method: 'POST',
   headers: { 'content-type': 'application/json' },

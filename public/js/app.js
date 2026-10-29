@@ -4080,8 +4080,24 @@ let terminalSessionApp = '';
 let terminalResizeObserver = null;
 let terminalConnectToken = 0;
 let terminalOpenToken = 0;
+let terminalReconnectTimer = null;
+let terminalReconnectAttempt = 0;
+let terminalHeartbeatTimer = null;
+const TERMINAL_MAX_RECONNECT = 10;
+
+function clearTerminalConnectionTimers() {
+  if (terminalReconnectTimer) {
+    clearTimeout(terminalReconnectTimer);
+    terminalReconnectTimer = null;
+  }
+  if (terminalHeartbeatTimer) {
+    clearInterval(terminalHeartbeatTimer);
+    terminalHeartbeatTimer = null;
+  }
+}
 
 function resetTerminalView() {
+  clearTerminalConnectionTimers();
   if (terminalSocket) {
     try { terminalSocket.close(); } catch {}
     terminalSocket = null;
@@ -4095,10 +4111,32 @@ function resetTerminalView() {
   if (container) container.innerHTML = '';
 }
 
-function ensureTerminal() {
-  if (terminal) return;
+function terminalNotice(message) {
+  if (terminal) {
+    try {
+      terminal.writeln('');
+      terminal.writeln('\x1b[33m' + String(message).replace(/[\r\n]+/g, ' ') + '\x1b[0m');
+    } catch {}
+    return;
+  }
   const container = qs('#terminalContainer');
-  if (!container || !window.Terminal) return;
+  if (container) {
+    const note = document.createElement('div');
+    note.className = 'terminal-notice';
+    note.textContent = message;
+    container.appendChild(note);
+  }
+}
+
+function ensureTerminal() {
+  if (terminal) return true;
+  const container = qs('#terminalContainer');
+  if (!container || !window.Terminal) {
+    if (container) {
+      container.innerHTML = '<div class="terminal-notice">The terminal component failed to load. Reload the page and try again.</div>';
+    }
+    return false;
+  }
   terminal = new window.Terminal({
     cursorBlink: true,
     cursorStyle: 'block',
@@ -4151,6 +4189,7 @@ function ensureTerminal() {
     }
   }
   setTimeout(fitTerminal, 30);
+  return true;
 }
 
 function sendTerminalMessage(message) {
@@ -4173,18 +4212,90 @@ function setTerminalStatus(text) {
   if (el) el.textContent = text;
 }
 
-function connectTerminal() {
+function startTerminalHeartbeat(ws, token) {
+  if (terminalHeartbeatTimer) clearInterval(terminalHeartbeatTimer);
+  terminalHeartbeatTimer = setInterval(() => {
+    if (token !== terminalConnectToken || !ws || ws.readyState !== WebSocket.OPEN) return;
+    try { ws.send(JSON.stringify({ type: 'ping', at: Date.now() })); } catch {}
+  }, 25000);
+}
+
+function handleLostTerminalSession(sessionId) {
+  if (sessionId !== terminalSessionId) return;
+  clearTerminalConnectionTimers();
+  terminalSessionId = null;
+  terminalSessionApp = '';
+  terminalConnectToken += 1;
+  if (terminalSocket) {
+    try { terminalSocket.close(); } catch {}
+    terminalSocket = null;
+  }
+  setTerminalStatus('Session ended');
+  terminalNotice('This OpenCode session is no longer running. Close this window and start OC Assist again from the App Creation tab.');
+  toast('The OC Assist session ended. Start OC Assist again to continue.', true, 8000);
+  loadCoreOpencode();
+}
+
+async function scheduleTerminalReconnect(sessionId) {
+  if (!sessionId || sessionId !== terminalSessionId) return;
+  if (terminalReconnectAttempt >= TERMINAL_MAX_RECONNECT) {
+    setTerminalStatus('Disconnected');
+    terminalNotice('The terminal connection was lost. Close this window and start again.');
+    return;
+  }
+  const attempt = terminalReconnectAttempt++;
+  const delay = Math.min(1000 * (2 ** Math.min(attempt, 4)), 15000);
+  setTerminalStatus(`Disconnected — reconnecting in ${Math.ceil(delay / 1000)}s…`);
+  if (terminalReconnectTimer) clearTimeout(terminalReconnectTimer);
+  terminalReconnectTimer = setTimeout(async () => {
+    terminalReconnectTimer = null;
+    if (sessionId !== terminalSessionId) return;
+    let exists = true;
+    try {
+      const res = await fetch('/api/terminal', { cache: 'no-store' });
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        if (Array.isArray(data.sessions)) {
+          exists = data.sessions.some(session => session && session.id === sessionId);
+        }
+      }
+    } catch {
+      // Server still unreachable; retry the socket below.
+    }
+    if (sessionId !== terminalSessionId) return;
+    if (!exists) {
+      handleLostTerminalSession(sessionId);
+      return;
+    }
+    connectTerminal({ reconnect: true });
+  }, delay);
+}
+
+function connectTerminal({ reconnect = false } = {}) {
   if (!terminalSessionId) return;
+  if (terminalReconnectTimer) {
+    clearTimeout(terminalReconnectTimer);
+    terminalReconnectTimer = null;
+  }
+  const sessionId = terminalSessionId;
   const token = ++terminalConnectToken;
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const url = `${proto}//${location.host}/api/terminal/ws?id=${encodeURIComponent(terminalSessionId)}`;
-  const ws = new WebSocket(url);
+  const url = `${proto}//${location.host}/api/terminal/ws?id=${encodeURIComponent(sessionId)}`;
+  let ws;
+  try {
+    ws = new WebSocket(url);
+  } catch {
+    scheduleTerminalReconnect(sessionId);
+    return;
+  }
   terminalSocket = ws;
-  setTerminalStatus('Connecting…');
+  setTerminalStatus(reconnect ? 'Reconnecting…' : 'Connecting…');
 
   ws.onopen = () => {
-    if (token !== terminalConnectToken) return;
+    if (token !== terminalConnectToken || terminalSessionId !== sessionId) return;
+    terminalReconnectAttempt = 0;
     setTerminalStatus('Connected');
+    startTerminalHeartbeat(ws, token);
     fitTerminal();
     if (terminal) terminal.focus();
   };
@@ -4208,7 +4319,10 @@ function connectTerminal() {
           : `Shell · ${session.cwd || ''} · pid ${session.pid || '—'}`;
       }
       setTerminalStatus('Connected');
+    } else if (message.type === 'ping') {
+      try { ws.send(JSON.stringify({ type: 'pong', at: Date.now() })); } catch {}
     } else if (message.type === 'exit') {
+      clearTerminalConnectionTimers();
       setTerminalStatus(`Exited (${message.code})`);
       toast(`Terminal session ended${message.code === 0 ? '' : ` with code ${message.code}`}`, message.code !== 0);
       loadCoreOpencode();
@@ -4217,14 +4331,19 @@ function connectTerminal() {
 
   ws.onclose = () => {
     if (token !== terminalConnectToken) return;
-    const status = qs('#terminalStatus')?.textContent || '';
-    if (!status.startsWith('Exited')) setTerminalStatus('Disconnected');
+    if (terminalHeartbeatTimer) {
+      clearInterval(terminalHeartbeatTimer);
+      terminalHeartbeatTimer = null;
+    }
     if (terminalSocket === ws) terminalSocket = null;
+    const status = qs('#terminalStatus')?.textContent || '';
+    if (status.startsWith('Exited')) return;
+    if (!terminalSessionId || terminalSessionId !== sessionId) return;
+    scheduleTerminalReconnect(sessionId);
   };
 
   ws.onerror = () => {
-    if (token !== terminalConnectToken) return;
-    setTerminalStatus('Connection error');
+    // onclose always follows and owns the reconnect state.
   };
 }
 
@@ -4233,6 +4352,7 @@ async function stopCurrentTerminalSession({ quiet = false, exceptId = '' } = {})
   terminalSessionId = null;
   terminalSessionApp = '';
   terminalConnectToken += 1;
+  clearTerminalConnectionTimers();
   if (terminalSocket) {
     try { terminalSocket.close(); } catch {}
     terminalSocket = null;
@@ -4254,6 +4374,7 @@ function closeTerminalSession() {
   terminalSessionId = null;
   terminalSessionApp = '';
   terminalConnectToken += 1;
+  clearTerminalConnectionTimers();
   if (terminalSocket) {
     try { terminalSocket.close(); } catch {}
     terminalSocket = null;
@@ -4279,7 +4400,12 @@ async function openTerminal({ mode = 'admin', app = 'shell' } = {}) {
   await stopCurrentTerminalSession({ quiet: true });
   if (openToken !== terminalOpenToken || modal.classList.contains('hidden')) return;
   resetTerminalView();
-  ensureTerminal();
+  terminalReconnectAttempt = 0;
+  if (!ensureTerminal()) {
+    setTerminalStatus('Terminal unavailable');
+    toast('The terminal component failed to load. Reload the page and try again.', true, 8000);
+    return;
+  }
   setTimeout(fitTerminal, 50);
 
   try {
@@ -4317,7 +4443,13 @@ async function openExistingTerminal(session) {
   await stopCurrentTerminalSession({ quiet: true, exceptId: session.id });
   if (openToken !== terminalOpenToken || modal.classList.contains('hidden')) return;
   resetTerminalView();
-  ensureTerminal();
+  terminalReconnectAttempt = 0;
+  if (!ensureTerminal()) {
+    setTerminalStatus('Terminal unavailable');
+    toast('The terminal component failed to load. The OC Assist session was stopped.', true, 8000);
+    fetch(`/api/terminal/sessions/${encodeURIComponent(session.id)}/stop`, { method: 'POST' }).catch(() => {});
+    return;
+  }
   terminalSessionId = session.id;
   terminalSessionApp = app;
   if (qs('#terminalSessionLabel')) {
@@ -4358,16 +4490,22 @@ if (qs('#assistStartBtn')) {
       output.textContent = 'Starting OpenCode…';
       output.classList.remove('hidden');
     }
+    let startedSession = null;
     try {
       const res = await fetch('/api/assist/start', { method: 'POST', body: form });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || res.statusText || 'OC Assist failed to start');
+      startedSession = data.session;
       if (output) output.textContent = `OpenCode is ready for ${data.appName}. Chat in the terminal; the app will be registered in Apps when it is ready.`;
       toast(`OC Assist started for ${data.appName}`, false, 6000);
       await openExistingTerminal(data.session);
     } catch (e) {
       if (output) output.textContent = e.message;
       toast(e.message, true);
+      // Do not leave a running OpenCode TUI behind if the chat could not open.
+      if (startedSession?.id) {
+        fetch(`/api/terminal/sessions/${encodeURIComponent(startedSession.id)}/stop`, { method: 'POST' }).catch(() => {});
+      }
     } finally {
       setLoading(btn, false, 'Create App with OC Assist');
     }
@@ -4418,6 +4556,7 @@ if (qs('#opencodeStopBtn')) {
         terminalSessionId = null;
         terminalSessionApp = '';
         terminalConnectToken += 1;
+        clearTerminalConnectionTimers();
         if (terminalSocket) { try { terminalSocket.close(); } catch {} terminalSocket = null; }
         setTerminalStatus('Stopped');
       }

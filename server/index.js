@@ -10935,6 +10935,12 @@ app.post('/api/core/host-helper/run', async (req, res) => {
 const OPENCODE_MAX_SESSIONS = 8;
 const TERMINAL_BUFFER_LIMIT = 2 * 1024 * 1024;
 const TERMINAL_IDLE_MS = 30 * 60 * 1000;
+// A terminal is only useful while a browser is attached. Without this grace
+// window, an OC Assist session whose WebSocket never connected (blocked proxy,
+// closed tab, reversed host header) would keep the OpenCode TUI alive forever,
+// slowly exhausting the container's memory until Docker restarts Dok.
+const TERMINAL_DETACHED_MS = 3 * 60 * 1000;
+const TERMINAL_HEARTBEAT_MS = 25 * 1000;
 const TERMINAL_MODES = {
   admin: {
     label: 'Admin',
@@ -11323,6 +11329,13 @@ function terminalEnv(mode, app, settings = {}) {
   for (const key of Object.keys(env)) {
     if (/^OPENCODE($|_)/.test(key)) delete env[key];
   }
+  // Never let a child dev server inherit Dok's listen port. App scaffolding
+  // commands that honour PORT would otherwise bind 8080 inside this container
+  // and can leave the UI unreachable. Assist helpers get the real port through
+  // WICKEDAFDOK_PORT instead.
+  env.WICKEDAFDOK_PORT = String(process.env.PORT || 8080);
+  delete env.PORT;
+  delete env.HOST;
 
   if (app === 'opencode') {
     const modeDir = path.join(opencodeDir, mode);
@@ -11346,14 +11359,36 @@ function terminalEnv(mode, app, settings = {}) {
   return env;
 }
 
-function scheduleTerminalCleanup(session) {
-  clearTimeout(session.cleanupTimer);
+function scheduleTerminalCleanup(session, delay = 30000) {
+  if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
   session.cleanupTimer = setTimeout(() => {
+    session.cleanupTimer = null;
     if (!terminalSessions.has(session.id)) return;
-    if (session.clients.size) return;
-    if (Date.now() - session.lastActivity < TERMINAL_IDLE_MS) return;
-    stopTerminalSession(session.id);
-  }, 60000);
+    const now = Date.now();
+    if (session.clients.size) {
+      // Output from a running agent counts as activity, so a long build is not
+      // mistaken for an idle session. Only stop an interactive session that has
+      // truly been silent for the full idle window.
+      if (now - (session.lastActivity || now) >= TERMINAL_IDLE_MS) {
+        appendServerLog('INFO', `terminal session ${session.id} reached the idle limit; stopping`);
+        stopTerminalSession(session.id);
+        return;
+      }
+      scheduleTerminalCleanup(session, 60000);
+      return;
+    }
+    // No client attached: stop after a short grace period. The grace lets a
+    // browser reconnect after a reload or a brief network drop without killing
+    // the running OpenCode session.
+    const detachedFor = now - (session.lastClientAt || session.createdAtMs || now);
+    const grace = session.app === 'opencode' ? TERMINAL_DETACHED_MS : TERMINAL_IDLE_MS;
+    if (detachedFor >= grace) {
+      appendServerLog('INFO', `terminal session ${session.id} had no client for ${Math.round(detachedFor / 1000)}s; stopping`);
+      stopTerminalSession(session.id);
+      return;
+    }
+    scheduleTerminalCleanup(session, Math.min(60000, Math.max(5000, grace - detachedFor + 1000)));
+  }, delay);
   if (session.cleanupTimer.unref) session.cleanupTimer.unref();
 }
 
@@ -11419,7 +11454,17 @@ async function createTerminalSession({ mode = 'admin', app = 'shell', agent = ''
       'Admin OpenCode runs only inside the Dok Maintenance container. Start Maintenance from Settings → Maintenance, then launch OpenCode there.');
   }
   if (terminalSessions.size >= OPENCODE_MAX_SESSIONS) {
-    throw httpError(429, `Too many terminal sessions are open (max ${OPENCODE_MAX_SESSIONS}). Stop one first.`);
+    // Prefer reclaiming an abandoned, clientless session over refusing to start
+    // a new one. This is what accumulates after a failed chat attach.
+    const abandoned = Array.from(terminalSessions.values())
+      .filter(session => !session.clients.size)
+      .sort((a, b) => (a.lastClientAt || 0) - (b.lastClientAt || 0))[0];
+    if (abandoned) {
+      appendServerLog('INFO', `evicting abandoned terminal session ${abandoned.id} to make room`);
+      stopTerminalSession(abandoned.id);
+    } else {
+      throw httpError(429, `Too many terminal sessions are open (max ${OPENCODE_MAX_SESSIONS}). Stop one first.`);
+    }
   }
 
   const settings = readSettings();
@@ -11456,7 +11501,9 @@ async function createTerminalSession({ mode = 'admin', app = 'shell', agent = ''
     cwd,
     version,
     createdAt: new Date().toISOString(),
+    createdAtMs: Date.now(),
     lastActivity: Date.now(),
+    lastClientAt: Date.now(),
     buffer: [],
     bufferBytes: 0,
     clients: new Set(),
@@ -12368,46 +12415,68 @@ ensureAppAgentsFile();
 
 const server = http.createServer(app);
 const terminalWss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
+terminalWss.on('error', (err) => {
+  appendServerLog('ERROR', `terminal websocket server error: ${err?.message || err}`);
+});
 
 server.on('upgrade', (req, socket, head) => {
-  let url;
   try {
-    url = new URL(req.url || '/', 'http://localhost');
-  } catch {
-    socket.destroy();
-    return;
-  }
-  if (url.pathname !== '/api/terminal/ws') {
-    socket.destroy();
-    return;
-  }
-  const origin = req.headers.origin;
-  if (origin) {
+    let url;
     try {
-      const originUrl = new URL(origin);
-      const forwarded = String(req.headers['x-forwarded-host'] || '').split(',')[0].trim();
-      const host = forwarded || String(req.headers.host || '').trim();
-      if (host && originUrl.host !== host) {
+      url = new URL(req.url || '/', 'http://localhost');
+    } catch {
+      socket.destroy();
+      return;
+    }
+    if (url.pathname !== '/api/terminal/ws') {
+      socket.destroy();
+      return;
+    }
+    // Accept the origin when any host header the proxy may have forwarded
+    // matches it. Some proxies rewrite `Host` to the backend address, which used
+    // to make every chat attach fail with 403 while OpenCode kept running.
+    const origin = req.headers.origin;
+    if (origin) {
+      try {
+        const originUrl = new URL(origin);
+        const hosts = [
+          req.headers['x-forwarded-host'],
+          req.headers['x-original-host'],
+          req.headers.host
+        ]
+          .flatMap(value => String(value || '').split(','))
+          .map(value => value.trim().toLowerCase())
+          .filter(Boolean);
+        const originHost = originUrl.host.toLowerCase();
+        const originHostname = originUrl.hostname.toLowerCase();
+        const allowed = hosts.some(host =>
+          host === originHost ||
+          host.split(':')[0] === originHostname);
+        if (hosts.length && !allowed) {
+          socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+      } catch {
         socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
         socket.destroy();
         return;
       }
-    } catch {
-      socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+    }
+    const id = url.searchParams.get('id') || '';
+    const session = terminalSessions.get(id);
+    if (!session) {
+      socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
       socket.destroy();
       return;
     }
+    terminalWss.handleUpgrade(req, socket, head, (ws) => {
+      terminalWss.emit('connection', ws, req, session);
+    });
+  } catch (err) {
+    appendServerLog('ERROR', `terminal websocket upgrade failed: ${err?.message || err}`);
+    try { socket.destroy(); } catch {}
   }
-  const id = url.searchParams.get('id') || '';
-  const session = terminalSessions.get(id);
-  if (!session) {
-    socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
-    socket.destroy();
-    return;
-  }
-  terminalWss.handleUpgrade(req, socket, head, (ws) => {
-    terminalWss.emit('connection', ws, req, session);
-  });
 });
 
 terminalWss.on('connection', (ws, req, session) => {
@@ -12416,6 +12485,8 @@ terminalWss.on('connection', (ws, req, session) => {
     return;
   }
   session.lastActivity = Date.now();
+  session.lastClientAt = Date.now();
+  ws.isAlive = true;
 
   try {
     ws.send(JSON.stringify({
@@ -12429,8 +12500,11 @@ terminalWss.on('connection', (ws, req, session) => {
 
   session.clients.add(ws);
 
+  ws.on('pong', () => { ws.isAlive = true; });
+
   ws.on('message', (raw, isBinary) => {
     session.lastActivity = Date.now();
+    session.lastClientAt = Date.now();
     if (isBinary) {
       if (!session.exited) {
         try { session.pty.write(raw.toString('utf8')); } catch {}
@@ -12460,13 +12534,38 @@ terminalWss.on('connection', (ws, req, session) => {
   ws.on('close', () => {
     session.clients.delete(ws);
     session.lastActivity = Date.now();
+    session.lastClientAt = Date.now();
     scheduleTerminalCleanup(session);
   });
 
   ws.on('error', () => {
     session.clients.delete(ws);
+    session.lastClientAt = Date.now();
   });
 });
+
+// Keep the socket alive through reverse proxies and reap clients that vanished
+// without a close frame. Protocol-level pings are answered by every browser
+// even when the page is running an older app.js.
+const terminalHeartbeatTimer = setInterval(() => {
+  for (const session of Array.from(terminalSessions.values())) {
+    for (const ws of Array.from(session.clients)) {
+      if (ws.readyState !== ws.OPEN) {
+        session.clients.delete(ws);
+        continue;
+      }
+      if (ws.isAlive === false) {
+        try { ws.terminate(); } catch {}
+        session.clients.delete(ws);
+        continue;
+      }
+      ws.isAlive = false;
+      try { ws.ping(); } catch {}
+    }
+    if (!session.clients.size) scheduleTerminalCleanup(session, 1000);
+  }
+}, TERMINAL_HEARTBEAT_MS);
+if (terminalHeartbeatTimer.unref) terminalHeartbeatTimer.unref();
 
 // Encrypt legacy plaintext secrets on first start and keep settings normalized.
 try {
@@ -12493,6 +12592,32 @@ try {
 } catch (e) {
   appendServerLog('WARN', `nginx error page preparation failed: ${e.message}`);
 }
+
+// A stray rejection from a background task (Docker, a PTY, or a websocket) must
+// not take the whole UI offline. Log it so it is actionable instead of letting
+// Node's default exit behaviour restart the container.
+process.on('unhandledRejection', (reason) => {
+  const message = reason instanceof Error ? (reason.stack || reason.message) : String(reason);
+  appendServerLog('ERROR', `Unhandled promise rejection: ${message}`);
+  console.error('Unhandled promise rejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+  const message = err?.stack || err?.message || String(err);
+  appendServerLog('ERROR', `Uncaught exception: ${message}`);
+  console.error('Uncaught exception:', err);
+});
+
+server.on('clientError', (err, socket) => {
+  try { socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); } catch {}
+});
+server.on('error', (err) => {
+  appendServerLog('ERROR', `HTTP server error: ${err?.message || err}`);
+  console.error('HTTP server error:', err);
+  // If another process grabbed the listen port, staying alive would leave the UI
+  // permanently unreachable. Exit so Docker's restart policy recreates the
+  // container cleanly instead.
+  if (err?.code === 'EADDRINUSE') process.exit(1);
+});
 
 const port = process.env.PORT || 8080;
 server.listen(port, () => {
