@@ -5,19 +5,25 @@ import crypto from 'crypto';
 import os from 'os';
 import { execFile } from 'child_process';
 
+// DOK_ROOT is the persistent data root. Before the installer relocates it, it
+// is the checkout; afterwards it is <data location>/Dok. DOK_SOURCE_ROOT is
+// always the code checkout and is kept separate so a relocated data root never
+// hides the source tree.
 export const DOK_ROOT = path.resolve(process.env.DOK_ROOT || '/dok');
+export const DOK_SOURCE_ROOT = path.resolve(process.env.DOK_SOURCE_ROOT || process.env.DOK_ROOT || '/dok-source');
 export const HOST_ROOT = path.resolve(process.env.HOST_ROOT || '/host');
 export const MAINT_DATA = path.resolve(process.env.MAINTENANCE_DATA || '/maintenance-data');
 export const MAINT_DATA_HOST = String(process.env.MAINTENANCE_DATA_HOST_PATH || '').trim() || MAINT_DATA;
 export const DOK_CONTAINER = String(process.env.DOK_CONTAINER || 'wickedafdok').trim();
 export const DOK_PORT = Number(process.env.DOK_PORT) || 8080;
 export const DOK_IMAGE = String(process.env.DOK_IMAGE || 'wickedafdok:latest').trim();
-export const DOK_HOST_PATH = String(process.env.DOK_HOST_PATH || DOK_ROOT).trim();
+export const DOK_HOST_PATH = String(process.env.DOK_HOST_PATH || DOK_SOURCE_ROOT).trim();
+export const DOK_STORAGE_HOST = String(process.env.DOK_STORAGE_HOST_PATH || '').trim();
 export const DOK_COMPOSE_ROOT = (() => {
   try {
-    if (path.isAbsolute(DOK_HOST_PATH) && fs.existsSync(path.join(DOK_HOST_PATH, 'docker-compose.yml'))) return DOK_HOST_PATH;
+    if (path.isAbsolute(DOK_SOURCE_ROOT) && fs.existsSync(path.join(DOK_SOURCE_ROOT, 'docker-compose.yml'))) return DOK_SOURCE_ROOT;
   } catch {}
-  return DOK_ROOT;
+  return DOK_SOURCE_ROOT;
 })();
 export const MAINTENANCE_URL = String(process.env.MAINTENANCE_URL || 'http://wickedafdok-maintenance:8090').trim();
 export const DEFAULT_NETWORK = 'wicked';
@@ -44,7 +50,7 @@ export const tokenPath = process.env.MAINTENANCE_TOKEN_FILE || path.join(dataDir
 // maintenance records. Conflicts are copied into a timestamped folder under
 // the new store rather than overwritten.
 function migrateLegacyMaintenanceData() {
-  const legacy = path.join(DOK_ROOT, 'maintenance-data');
+  const legacy = path.join(DOK_SOURCE_ROOT, 'maintenance-data');
   if (path.resolve(legacy) === path.resolve(MAINT_DATA)) return;
   let stat;
   try { stat = fs.lstatSync(legacy); } catch { return; }
@@ -113,7 +119,8 @@ export function writePrivateFile(file, content, { mode = 0o600 } = {}) {
 
 function chownIfDokFile(file) {
   const target = path.resolve(String(file || ''));
-  if (target !== DOK_ROOT && !target.startsWith(DOK_ROOT + path.sep)) return;
+  const inside = root => target === root || target.startsWith(root + path.sep);
+  if (!inside(DOK_ROOT) && !inside(DOK_SOURCE_ROOT)) return;
   try { chownDokPath(target); } catch {}
 }
 
@@ -122,7 +129,7 @@ function chownIfDokFile(file) {
 // so trust exactly the directory each git command operates in.
 function gitArgsWithSafeDirectory(args, cwd) {
   const dirs = new Set();
-  for (const candidate of [cwd, path.resolve(cwd || DOK_ROOT)]) {
+  for (const candidate of [cwd, path.resolve(cwd || DOK_SOURCE_ROOT)]) {
     if (!candidate) continue;
     const resolved = path.resolve(String(candidate));
     dirs.add(resolved);
@@ -275,8 +282,8 @@ export function mapSettingsSecrets(settings, transform) {
   return settings;
 }
 
-export function readSettings() {
-  const raw = readJson(path.join(dataDir, 'settings.json'), {}) || {};
+export function readSettings(root = dataDir) {
+  const raw = readJson(path.join(root, 'settings.json'), {}) || {};
   return mapSettingsSecrets(JSON.parse(JSON.stringify(raw)), value => {
     if (!isStoredSecret(value)) return value;
     try { return decryptSecret(value); } catch { return ''; }
@@ -293,8 +300,8 @@ export function writeSettings(settings) {
   return settings;
 }
 
-export function readRegistries() {
-  const data = readJson(path.join(dataDir, 'registries.json'), { connections: [] }) || {};
+export function readRegistries(root = dataDir) {
+  const data = readJson(path.join(root, 'registries.json'), { connections: [] }) || {};
   if (!Array.isArray(data.connections)) data.connections = [];
   return data;
 }
@@ -303,8 +310,8 @@ export function writeRegistries(data) {
   return writeJson(path.join(dataDir, 'registries.json'), data || { connections: [] });
 }
 
-export function readRegistry() {
-  const data = readJson(path.join(dataDir, 'registry.json'), []);
+export function readRegistry(root = dataDir) {
+  const data = readJson(path.join(root, 'registry.json'), []);
   return Array.isArray(data) ? data : [];
 }
 
@@ -347,12 +354,12 @@ export function installationState() {
   return state;
 }
 
-export function refreshInstallationState() {
-  const state = readJson(dokInstallationStatePath, null);
+export function refreshInstallationState(root = dataDir) {
+  const state = readJson(path.join(root, 'installation-state.json'), null);
   if (!state || typeof state !== 'object') return null;
   writeJson(installationStatePath, state);
   const current = readInstallation() || {};
-  const restored = readJson(dokInstallationPath, null);
+  const restored = readJson(path.join(root, 'installation.json'), null);
   const restoredRecord = restored && typeof restored === 'object' ? restored : {};
   const pick = (key) => restoredRecord[key] ?? current[key];
   saveInstallation({
@@ -812,10 +819,17 @@ export function validateInstallPlan(plan) {
   if (plan.acmeEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(plan.acmeEmail)) issues.push('Let\'s Encrypt email is invalid.');
   if (plan.mailFrom && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(plan.mailFrom)) issues.push('Notification sender address is invalid.');
   if (plan.smtpFrom && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(plan.smtpFrom)) issues.push('SMTP sender address is invalid.');
-  if (defaults.dataLocation) {
+  if (!defaults.dataLocation) {
+    issues.push('A data location is required. Dok stores all persistent data under a Dok directory in that location.');
+  } else {
     if (!path.isAbsolute(defaults.dataLocation)) issues.push('Data location must be an absolute host path.');
     if (/[\r\n:\0]/.test(defaults.dataLocation)) issues.push('Data location contains unsupported characters.');
     if (defaults.dataLocation === '/') issues.push('Choose a dedicated data location, not the filesystem root.');
+    const storage = dokStorageRoot(defaults.dataLocation);
+    const checkout = path.resolve(DOK_HOST_PATH);
+    if (storage === checkout || storage.startsWith(`${checkout}${path.sep}`)) {
+      issues.push('Data location cannot place the Dok data directory inside the Dok checkout.');
+    }
   }
   if (defaults.dataMode && !/^0?[0-7]{3,4}$/.test(defaults.dataMode)) issues.push('Data directory mode must be octal, for example 0775.');
   if (defaults.adminEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(defaults.adminEmail)) issues.push('Admin email is invalid.');
@@ -921,13 +935,117 @@ export function writeRegistriesFromPlan(plan) {
   return connections;
 }
 
-function hostVisiblePath(target) {
+export function hostVisiblePath(target) {
   const resolved = path.resolve(String(target || ''));
   const inside = root => resolved === root || resolved.startsWith(root + path.sep);
-  if (inside(DOK_ROOT) || inside(MAINT_DATA) || inside(HOST_ROOT)) return resolved;
+  if (inside(DOK_ROOT) || inside(DOK_SOURCE_ROOT) || inside(MAINT_DATA) || inside(HOST_ROOT)) return resolved;
   // A data location is a host path. The Maintenance container sees the host
   // root at /host, so create it there instead of inside its own filesystem.
   return path.join(HOST_ROOT, resolved.replace(/^\/+/, ''));
+}
+
+// The installer keeps every Dok-owned persistent directory under a single
+// "Dok" folder inside the user's data location. App runtime data stays at
+// <data location>/apps/<app>/data; Dok's own state lives here.
+export function dokStorageRoot(dataLocation) {
+  const location = String(dataLocation || '').trim();
+  if (!path.isAbsolute(location)) return '';
+  return path.join(path.resolve(location), 'Dok');
+}
+
+function writeEnvFile(file, values) {
+  let existing = '';
+  try { existing = fs.readFileSync(file, 'utf-8'); } catch {}
+  const wanted = new Map(Object.entries(values).map(([key, value]) => [key, String(value)]));
+  const seen = new Set();
+  const lines = [];
+  for (const line of existing.split(/\r?\n/)) {
+    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=/);
+    if (match && wanted.has(match[1])) {
+      lines.push(`${match[1]}=${wanted.get(match[1])}`);
+      seen.add(match[1]);
+    } else if (line || lines.length) {
+      lines.push(line);
+    }
+  }
+  for (const [key, value] of wanted) {
+    if (!seen.has(key)) lines.push(`${key}=${value}`);
+  }
+  const text = `${lines.join('\n').replace(/\n+$/, '')}\n`;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  writePrivateFile(file, text, { mode: 0o600 });
+}
+
+function copyTree(source, target) {
+  if (!fs.existsSync(source)) return;
+  const resolvedSource = path.resolve(source);
+  const resolvedTarget = path.resolve(target);
+  if (resolvedSource === resolvedTarget) return;
+  fs.mkdirSync(resolvedTarget, { recursive: true });
+  fs.cpSync(resolvedSource, resolvedTarget, {
+    recursive: true,
+    force: true,
+    errorOnExist: false,
+    filter: entry => {
+      const name = path.basename(entry);
+      if (name === 'node_modules' || name === '.git') return false;
+      if (name.startsWith('.preview-')) return false;
+      try {
+        const stat = fs.lstatSync(entry);
+        if (stat.isSocket() || stat.isFIFO() || stat.isBlockDevice() || stat.isCharacterDevice()) return false;
+      } catch {}
+      return true;
+    }
+  });
+}
+
+// Copy the live checkout data into the selected storage root, write the
+// compose environment, and drop the generated managed compose so the root
+// compose (which now points at the storage root) is used on the next launch.
+export async function relocateDokStorage(plan, log = () => {}) {
+  const defaults = plan.defaults || {};
+  const hostRoot = dokStorageRoot(defaults.dataLocation);
+  if (!hostRoot) throw new Error('A persistent data location is required before Dok can store its data.');
+  const containerRoot = hostVisiblePath(hostRoot);
+  const mode = parseInt(String(defaults.dataMode || '0775').replace(/^0o/i, ''), 8);
+  for (const name of ['data', 'apps', 'core', 'sources', 'uploads', 'maintenance']) {
+    const dir = path.join(containerRoot, name);
+    fs.mkdirSync(dir, { recursive: true });
+    try { if (Number.isInteger(mode)) fs.chmodSync(dir, mode); } catch {}
+    chownDokPath(dir);
+  }
+  for (const name of ['data', 'apps', 'core', 'sources', 'uploads']) {
+    const source = path.join(DOK_ROOT, name);
+    const target = path.join(containerRoot, name);
+    copyTree(source, target);
+    chownTree(target);
+    log(`Migrated ${name} to ${hostRoot}`);
+  }
+  const maintTarget = path.join(containerRoot, 'maintenance');
+  if (path.resolve(MAINT_DATA) !== path.resolve(maintTarget)) {
+    copyTree(MAINT_DATA, maintTarget);
+    chownTree(maintTarget);
+    log(`Migrated maintenance data to ${path.join(hostRoot, 'maintenance')}`);
+  }
+  writeEnvFile(path.join(DOK_COMPOSE_ROOT, '.env'), {
+    DOK_STORAGE_ROOT: hostRoot,
+    MAINTENANCE_DATA_PATH: path.join(hostRoot, 'maintenance')
+  });
+  for (const dir of [path.join(containerRoot, 'data', 'wickedafdok'), path.join(DOK_ROOT, 'data', 'wickedafdok')]) {
+    for (const name of ['docker-compose.yml', 'docker-compose.socket-gid.yml', 'installation-compose.yml']) {
+      try { fs.rmSync(path.join(dir, name), { force: true }); } catch {}
+    }
+  }
+  return { hostRoot, containerRoot };
+}
+
+export function mirrorMaintenanceData(hostRoot) {
+  const containerRoot = hostVisiblePath(hostRoot);
+  const target = path.join(containerRoot, 'maintenance');
+  if (path.resolve(MAINT_DATA) === path.resolve(target)) return target;
+  copyTree(MAINT_DATA, target);
+  chownTree(target);
+  return target;
 }
 
 export async function ensurePlanDirectories(plan) {
@@ -936,6 +1054,11 @@ export async function ensurePlanDirectories(plan) {
   if (defaults.dataLocation) {
     targets.push(defaults.dataLocation);
     targets.push(path.join(defaults.dataLocation, 'apps'));
+    const storage = dokStorageRoot(defaults.dataLocation);
+    targets.push(storage);
+    for (const name of ['data', 'apps', 'core', 'sources', 'uploads', 'maintenance']) {
+      targets.push(path.join(storage, name));
+    }
   }
   const mode = parseInt(String(defaults.dataMode || '0775').replace(/^0o/i, ''), 8);
   for (const target of targets) {
@@ -962,7 +1085,7 @@ export function composeFilesFor(dir) {
 }
 
 export function managedDokCompose() {
-  const dir = path.join(DOK_COMPOSE_ROOT, 'data', 'wickedafdok');
+  const dir = path.join(DOK_ROOT, 'data', 'wickedafdok');
   const file = path.join(dir, 'docker-compose.yml');
   try {
     if (!fs.statSync(file).isFile()) return null;
@@ -986,7 +1109,7 @@ export function dokComposeContext() {
 export function dokSocketOverridePath(ctx = dokComposeContext()) {
   return ctx.managed
     ? path.join(ctx.dir, 'docker-compose.socket-gid.yml')
-    : path.join(DOK_COMPOSE_ROOT, 'data', '.docker-socket-gid.yml');
+    : path.join(DOK_SOURCE_ROOT, 'data', '.docker-socket-gid.yml');
 }
 
 export function dokComposeSupportFiles(ctx = dokComposeContext()) {
@@ -998,20 +1121,20 @@ export function dokComposeSupportFiles(ctx = dokComposeContext()) {
   return files;
 }
 
-export function listCoreServices() {
+export function listCoreServices(root = coreDir) {
   const names = [];
   try {
-    for (const entry of fs.readdirSync(coreDir, { withFileTypes: true })) {
+    for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
       if (entry.name === 'host-helper') continue;
-      if (composeFilesFor(path.join(coreDir, entry.name)).length) names.push(entry.name);
+      if (composeFilesFor(path.join(root, entry.name)).length) names.push(entry.name);
     }
   } catch {}
   return names.sort();
 }
 
-export function listApps() {
-  return readRegistry().map(entry => ({
+export function listApps(root = dataDir) {
+  return readRegistry(root).map(entry => ({
     id: entry.id || '',
     name: entry.name || projectName(entry.appDir || entry.path || '', 'app'),
     appDir: entry.appDir || entry.path || '',
@@ -1022,12 +1145,12 @@ export function listApps() {
   }));
 }
 
-export function installationSummary() {
-  const settings = readSettings();
+export function installationSummary({ dataRoot = dataDir, coreRoot = coreDir } = {}) {
+  const settings = readSettings(dataRoot);
   return {
-    apps: listApps().length,
-    coreServices: listCoreServices(),
-    registryConnections: readRegistries().connections.length,
+    apps: listApps(dataRoot).length,
+    coreServices: listCoreServices(coreRoot),
+    registryConnections: readRegistries(dataRoot).connections.length,
     primaryDomain: settings.defaults?.primaryDomain || '',
     dokDomain: settings.defaults?.dokDomain || settings.services?.nginxProxy?.domain || '',
     dokHttpPort: Number(settings.services?.nginxProxy?.httpPort) || 80,
@@ -1036,22 +1159,27 @@ export function installationSummary() {
   };
 }
 
-export function writeInstallationCompose() {
-  const target = path.join(dataDir, 'wickedafdok', 'installation-compose.yml');
+export function writeInstallationCompose({ dataRoot = dataDir, sourceRoot = DOK_SOURCE_ROOT } = {}) {
+  const target = path.join(dataRoot, 'wickedafdok', 'installation-compose.yml');
   fs.mkdirSync(path.dirname(target), { recursive: true });
-  const includes = ['../../docker-compose.yml'];
-  if (fs.existsSync(path.join(DOK_ROOT, 'docker-compose.override.yml'))) includes.push('../../docker-compose.override.yml');
-  if (fs.existsSync(path.join(dataDir, '.docker-socket-gid.yml'))) includes.push('../../data/.docker-socket-gid.yml');
+  // Absolute container paths keep the file valid after the data root moves
+  // away from the checkout and Maintenance mounts the source separately.
+  const includes = [path.join(sourceRoot, 'docker-compose.yml')];
+  const override = path.join(sourceRoot, 'docker-compose.override.yml');
+  if (fs.existsSync(override)) includes.push(override);
+  const socketOverride = path.join(dataRoot, '.docker-socket-gid.yml');
+  if (fs.existsSync(socketOverride)) includes.push(socketOverride);
   // Core services are separate compose projects. Including them here lets the
   // Maintenance container recreate the exact installed stack in one command.
   // The managed self-compose (data/wickedafdok/docker-compose.yml) is not
   // included: it defines the same wickedafdok service as the root compose and
   // would conflict with it.
-  const coreIncludes = listCoreServices().map(name => `../../core/${name}/docker-compose.yml`);
+  const coreIncludes = listCoreServices(path.join(dataRoot, '..', 'core'))
+    .map(name => path.join(dataRoot, '..', 'core', name, 'docker-compose.yml'));
   const body = `# managed-by: wickedafdok-maintenance
 # Canonical installation stack: Dok plus every installed core service.
-# Use this file for an exact reinstall from the checkout:
-#   docker compose -f data/wickedafdok/installation-compose.yml up -d --build
+# Use this file from inside the Maintenance container for an exact reinstall:
+#   docker compose -f ${target} up -d --build
 name: wickedafdok-installation
 include:
 ${[...new Set([...includes, ...coreIncludes])].map(item => `  - ${item}`).join('\n')}
@@ -1061,17 +1189,17 @@ ${[...new Set([...includes, ...coreIncludes])].map(item => `  - ${item}`).join('
   return target;
 }
 
-export async function captureSnapshot({ reason = 'manual', label = '' } = {}) {
+export async function captureSnapshot({ reason = 'manual', label = '', root = DOK_ROOT } = {}) {
   ensureDirs();
   const id = `${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)}-${randomSecret(3)}`;
   const archive = path.join(snapshotsDir, `${id}.tar.gz`);
-  const targets = ['data', 'apps', 'core', 'sources'].filter(name => fs.existsSync(path.join(DOK_ROOT, name)));
+  const targets = ['data', 'apps', 'core', 'sources'].filter(name => fs.existsSync(path.join(root, name)));
   if (!targets.length) throw new Error('The Dok installation directory is empty');
   const args = ['-czf', archive,
     '--exclude=data/backups', '--exclude=data/tmp', '--exclude=data/logs',
     '--exclude=data/docker-config', '--exclude=data/host-helper/agent.sock', '--exclude=data/.maintenance-token',
     '--exclude=apps/.preview-*', '--exclude=node_modules', '--exclude=.git', ...targets];
-  await run('tar', args, { cwd: DOK_ROOT });
+  await run('tar', args, { cwd: root });
   try { fs.chmodSync(archive, 0o600); } catch {}
   const meta = {
     id,
@@ -1082,7 +1210,7 @@ export async function captureSnapshot({ reason = 'manual', label = '' } = {}) {
     created: new Date().toISOString(),
     size: fs.statSync(archive).size,
     archive,
-    summary: installationSummary()
+    summary: installationSummary({ dataRoot: path.join(root, 'data'), coreRoot: path.join(root, 'core') })
   };
   writeJson(path.join(snapshotsDir, `${id}.json`), meta);
   pruneSnapshots(30);
@@ -1365,7 +1493,7 @@ export async function dockerInfo() {
 }
 
 export function maintenanceVersion() {
-  const pkg = readJson(path.join(DOK_ROOT, 'package.json'), {}) || readJson('/app/package.json', {}) || {};
+  const pkg = readJson(path.join(DOK_SOURCE_ROOT, 'package.json'), {}) || readJson('/app/package.json', {}) || {};
   return pkg.version || '1.0.0';
 }
 
@@ -1568,7 +1696,7 @@ export function buildInstallerPrompt({ plan = {}, settings = {}, results = [], d
     ...taskLines.map((line, index) => `${index + 1}. ${line}`),
     '',
     '## Working rules',
-    '- Read /dok/AGENTS.md before changing Dok source or managed compose files.',
+    `- Read ${path.join(DOK_SOURCE_ROOT, 'AGENTS.md')} before changing Dok source or managed compose files.`,
     '- Prefer the Dok API at http://wickedafdok:8080 for settings, domains, auth sync, and service actions. Verify the result with Docker and HTTP afterward.',
     '- Make reversible changes. Do not delete app data, volumes, snapshots, or backups. Do not reset healthy services just to apply cosmetic settings.',
     '- If a required certificate, DNS record, tunnel route, or third-party credential is missing and cannot be created safely, report the exact remaining manual step instead of inventing a workaround.',

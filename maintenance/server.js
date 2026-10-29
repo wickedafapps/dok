@@ -7,7 +7,8 @@ import multer from 'multer';
 import pty from 'node-pty';
 import { WebSocketServer } from 'ws';
 import {
-  DOK_ROOT, DOK_COMPOSE_ROOT, HOST_ROOT, MAINT_DATA, MAINT_DATA_HOST, DOK_CONTAINER, DOK_PORT, DOK_IMAGE, DOK_HOST_PATH,
+  DOK_ROOT, DOK_SOURCE_ROOT, DOK_COMPOSE_ROOT, DOK_STORAGE_HOST, HOST_ROOT, MAINT_DATA, MAINT_DATA_HOST,
+  DOK_CONTAINER, DOK_PORT, DOK_IMAGE, DOK_HOST_PATH,
   MAINTENANCE_URL, DEFAULT_NETWORK, dataDir, appsDir, coreDir, sourcesDir, uploadsDir,
   backupsDir, snapshotsDir, logsDir, opencodeDir, installationPath, installationStatePath, tokenPath,
   ensureDirs, readJson, writeJson, writePrivateFile, run, tail, randomSecret, yamlScalar,
@@ -21,7 +22,7 @@ import {
   installationSummary, writeInstallationCompose, captureSnapshot, listSnapshots,
   listBackups, createBackup, restoreArchive, repairInstallation, systemInfo, dockerInfo,
   maintenanceVersion, installationExists, dokComposeContext, dokComposeSupportFiles,
-  dokSocketOverridePath
+  dokSocketOverridePath, relocateDokStorage, mirrorMaintenanceData, hostVisiblePath, dokStorageRoot
 } from './lib.js';
 
 ensureDirs();
@@ -36,9 +37,25 @@ const SESSION_LIMIT = 6;
 const SESSION_BUFFER_LIMIT = 2 * 1024 * 1024;
 const SESSION_IDLE_MS = 30 * 60 * 1000;
 const sessions = new Map();
-let installJob = null;
+const installJobPath = path.join(MAINT_DATA, 'install-job.json');
+let installJob = readJson(installJobPath, null);
 let updateJob = null;
 let logCache = [];
+
+function persistInstallJob() {
+  if (!installJob) return;
+  try { writeJson(installJobPath, installJob); } catch {}
+}
+
+// A previous process may have stopped mid-install (for example when the
+// Maintenance container was recreated). Do not leave the UI blocked forever.
+if (installJob?.running) {
+  installJob.running = false;
+  installJob.phase = 'error';
+  installJob.error = installJob.error || 'The previous installation was interrupted. Review the log and run it again.';
+  installJob.finished = installJob.finished || new Date().toISOString();
+  persistInstallJob();
+}
 
 const app = express();
 const upload = multer({ dest: path.join(MAINT_DATA, 'tmp'), limits: { fileSize: 1024 * 1024 * 1024, files: 5 } });
@@ -56,12 +73,12 @@ app.use((req, res, next) => {
   }
   next();
 });
-app.use(express.static(path.join(DOK_ROOT, 'public', 'maintenance'), { etag: false, maxAge: 0 }));
+app.use(express.static(path.join(DOK_SOURCE_ROOT, 'public', 'maintenance'), { etag: false, maxAge: 0 }));
 app.use(express.static('/app/public/maintenance', { etag: false, maxAge: 0 }));
 app.use('/vendor/xterm', express.static('/app/node_modules/@xterm/xterm'));
 app.use('/vendor/xterm-fit', express.static('/app/node_modules/@xterm/addon-fit'));
-app.use('/vendor/xterm', express.static(path.join(DOK_ROOT, 'node_modules/@xterm/xterm')));
-app.use('/vendor/xterm-fit', express.static(path.join(DOK_ROOT, 'node_modules/@xterm/addon-fit')));
+app.use('/vendor/xterm', express.static(path.join(DOK_SOURCE_ROOT, 'node_modules/@xterm/xterm')));
+app.use('/vendor/xterm-fit', express.static(path.join(DOK_SOURCE_ROOT, 'node_modules/@xterm/addon-fit')));
 
 function logLine(level, message) {
   const line = `${new Date().toISOString()} [${level}] ${String(message).replace(/\r?\n/g, '\n    ')}`;
@@ -153,8 +170,9 @@ app.get('/api/system', api(async (req, res) => {
       core: listCoreServices(),
       apps: listApps(),
       tokenRequired: MAINTENANCE_REQUIRE_TOKEN,
-      root: DOK_ROOT,
+      root: DOK_SOURCE_ROOT,
       dataRoot: MAINT_DATA_HOST,
+      storageRoot: DOK_STORAGE_HOST || DOK_ROOT,
       hostPath: DOK_HOST_PATH,
       maintenanceUrl: MAINTENANCE_URL
     },
@@ -390,7 +408,7 @@ function dokComposeArgs(ctx) {
 }
 
 async function buildDokImage(ctx, log = () => {}) {
-  if (!fs.existsSync(path.join(DOK_ROOT, 'Dockerfile'))) {
+  if (!fs.existsSync(path.join(DOK_SOURCE_ROOT, 'Dockerfile'))) {
     if (ctx.managed) return null;
     const result = await run('docker', [...dokComposeArgs(ctx), 'build'], { cwd: ctx.dir, timeout: 0 });
     return result;
@@ -399,8 +417,8 @@ async function buildDokImage(ctx, log = () => {}) {
   try {
     image = (await composeImages(ctx))[0] || image;
   } catch {}
-  log(`Building ${image} from ${DOK_ROOT}`);
-  return run('docker', ['build', '-t', image, DOK_ROOT], { cwd: DOK_ROOT, timeout: 0 });
+  log(`Building ${image} from ${DOK_SOURCE_ROOT}`);
+  return run('docker', ['build', '-t', image, DOK_SOURCE_ROOT], { cwd: DOK_SOURCE_ROOT, timeout: 0 });
 }
 
 async function launchDok({ build = true } = {}) {
@@ -621,7 +639,7 @@ async function runInstall(plan) {
     job.log.push(`${new Date().toISOString()} ${message}`);
     logLine('INFO', message);
   };
-  const phase = (value) => { job.phase = value; log(`Phase: ${value}`); };
+  const phase = (value) => { job.phase = value; log(`Phase: ${value}`); persistInstallJob(); };
   try {
     const issues = validateInstallPlan(plan);
     if (issues.length) throw new Error(issues.join(' '));
@@ -641,7 +659,12 @@ async function runInstall(plan) {
       ...fresh,
       ...existing,
       services: { ...fresh.services, ...(existing.services || {}) },
-      defaults: { ...fresh.defaults, ...existing.defaults, ...plan.defaults },
+      defaults: {
+        ...fresh.defaults,
+        ...existing.defaults,
+        ...plan.defaults,
+        storageRoot: dokStorageRoot(plan.defaults.dataLocation)
+      },
       designer: { ...fresh.designer, ...(existing.designer || {}) },
       installation: {
         id: installationId,
@@ -687,14 +710,20 @@ async function runInstall(plan) {
     });
     log(`Installation record ${saved.id} created.`);
 
-    phase('launch-dok');
+    phase('prepare-storage');
     const status = await dokStatus().catch(() => ({ exists: false, running: false }));
-    if (!status.running) {
-      const out = await launchDok({ build: true });
-      log((out.stdout || '').trim().slice(-4000) || 'Dok image built and container started.');
-    } else {
-      log('Dok is already running; using the existing container.');
+    if (status.running) {
+      await docker(['stop', DOK_CONTAINER], { timeout: 120000 }).catch(() => {});
+      log('Stopped the existing Dok container before moving its persistent data.');
     }
+    const storage = await relocateDokStorage(plan, log);
+    const storageData = path.join(storage.containerRoot, 'data');
+    const storageCore = path.join(storage.containerRoot, 'core');
+    log(`Dok persistent data root: ${storage.hostRoot}`);
+
+    phase('launch-dok');
+    const out = await launchDok({ build: true });
+    log((out.stdout || '').trim().slice(-4000) || 'Dok image built and container started.');
 
     phase('wait-for-dok');
     await waitForDok(300000);
@@ -709,8 +738,8 @@ async function runInstall(plan) {
     }
 
     phase('record-snapshot');
-    try { writeInstallationCompose(); } catch (e) { log(`Installation compose warning: ${e.message}`); }
-    try { refreshInstallationState(); } catch {}
+    try { writeInstallationCompose({ dataRoot: storageData }); } catch (e) { log(`Installation compose warning: ${e.message}`); }
+    try { refreshInstallationState(storageData); } catch {}
     const installationPlan = {
       type: plan.type,
       defaults: { ...plan.defaults, adminPassword: plan.defaults.adminPassword ? '(stored in encrypted settings)' : '' },
@@ -721,7 +750,7 @@ async function runInstall(plan) {
       registries: plan.registries.map(item => ({ kind: item.kind, provider: item.provider, name: item.name, host: item.host, username: item.username }))
     };
     const completedAt = new Date().toISOString();
-    const finalSettings = readSettings();
+    const finalSettings = readSettings(storageData);
     const proxyResult = serviceResults.find(item => item.name === 'nginx-proxy' && item.ok);
     const dokHttpPort = Number(proxyResult?.httpPort || finalSettings.services?.nginxProxy?.httpPort) || 80;
     const proxyFailed = plan.services?.proxy === 'nginx-proxy' && !proxyResult;
@@ -761,30 +790,32 @@ async function runInstall(plan) {
     }
     // Write the completed record before the snapshot so restoring the initial
     // snapshot keeps the install plan, service results, and completion time.
-    saveInstallation({
+    const preparedRecord = saveInstallation({
       type: plan.type,
       plan: installationPlan,
-      summary: installationSummary(),
+      summary: installationSummary({ dataRoot: storageData, coreRoot: storageCore }),
       completedAt,
       dok: dokRecord,
       services: serviceResults,
       opencodePrompt
     });
-    const snapshot = await captureSnapshot({ reason: 'install', label: 'Initial installation snapshot' }).catch(e => {
+    try { writeJson(path.join(storageData, 'installation.json'), preparedRecord); } catch {}
+    const snapshot = await captureSnapshot({ reason: 'install', label: 'Initial installation snapshot', root: storage.containerRoot }).catch(e => {
       log(`Snapshot warning: ${e.message}`);
       return null;
     });
     if (snapshot) log(`Installation snapshot ${snapshot.id} captured.`);
-    saveInstallation({
+    const completedRecord = saveInstallation({
       type: plan.type,
       plan: installationPlan,
-      summary: installationSummary(),
+      summary: installationSummary({ dataRoot: storageData, coreRoot: storageCore }),
       completedAt,
       dok: dokRecord,
       services: serviceResults,
       opencodePrompt,
       ...(snapshot ? { reinstall: { snapshot: snapshot.id, at: new Date().toISOString() } } : {})
     });
+    try { writeJson(path.join(storageData, 'installation.json'), completedRecord); } catch {}
 
     phase('done');
     const failures = serviceResults.filter(item => !item.ok);
@@ -808,13 +839,40 @@ async function runInstall(plan) {
     };
     job.running = false;
     job.finished = new Date().toISOString();
+    persistInstallJob();
+    try {
+      mirrorMaintenanceData(storage.hostRoot);
+      writeJson(path.join(hostVisiblePath(storage.hostRoot), 'maintenance', 'install-job.json'), installJob);
+      log('Maintenance data mirrored to the persistent data root.');
+    } catch (e) {
+      log(`Maintenance data mirror warning: ${e.message}`);
+    }
     log(job.result.message);
+    // Recreate Maintenance through Dok so the caller survives long enough to
+    // hand the new container the relocated data and token mounts.
+    try {
+      await dokApi('/api/maintenance/start', { method: 'POST', body: { recreate: true }, timeout: 60000 });
+    } catch (e) {
+      log(`Maintenance restart warning: ${e.message}`);
+    }
   } catch (e) {
     job.error = e.message;
     job.phase = 'error';
     job.running = false;
     job.finished = new Date().toISOString();
+    persistInstallJob();
     log(`Installation failed: ${e.message}`);
+    // Relocation copies instead of moving, so the checkout data is still
+    // intact. Bring Dok back up when the failure left it stopped.
+    try {
+      const status = await dokStatus().catch(() => null);
+      if (status && !status.running) {
+        await launchDok({ build: false });
+        log('Restarted Dok after the failed installation.');
+      }
+    } catch (restartError) {
+      log(`Could not restart Dok after the failure: ${restartError.message}`);
+    }
   }
 }
 
@@ -832,6 +890,7 @@ app.post('/api/install/run', api(async (req, res) => {
     result: null,
     error: ''
   };
+  persistInstallJob();
   runInstall(plan);
   res.json({ ok: true, started: true, job: jobSnapshot(installJob) });
 }));
@@ -1051,16 +1110,16 @@ async function runUpdate({ repo = '', branch = '', force = false }) {
     job.running = true;
     job.phase = 'checking';
     if (repo && /^(https?:\/\/|git:\/\/|ssh:\/\/|git@)[^\s]+$/.test(repo)) {
-      await run('git', ['remote', 'set-url', 'origin', repo], { cwd: DOK_ROOT }).catch(async () => {
-        await run('git', ['remote', 'add', 'origin', repo], { cwd: DOK_ROOT });
+      await run('git', ['remote', 'set-url', 'origin', repo], { cwd: DOK_SOURCE_ROOT }).catch(async () => {
+        await run('git', ['remote', 'add', 'origin', repo], { cwd: DOK_SOURCE_ROOT });
       });
     }
     let resolvedBranch = branch;
     if (!resolvedBranch) {
-      try { resolvedBranch = (await run('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: DOK_ROOT })).stdout.trim(); } catch {}
+      try { resolvedBranch = (await run('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: DOK_SOURCE_ROOT })).stdout.trim(); } catch {}
     }
     if (!resolvedBranch || resolvedBranch === 'HEAD') resolvedBranch = 'main';
-    const dirty = (await run('git', ['status', '--porcelain'], { cwd: DOK_ROOT }).catch(() => ({ stdout: '' }))).stdout.trim();
+    const dirty = (await run('git', ['status', '--porcelain'], { cwd: DOK_SOURCE_ROOT }).catch(() => ({ stdout: '' }))).stdout.trim();
     if (dirty && !force) {
       const err = new Error('The checkout has local changes. Re-run with force to discard them, or commit them first.');
       err.status = 409;
@@ -1070,13 +1129,13 @@ async function runUpdate({ repo = '', branch = '', force = false }) {
     log(`Fetching ${resolvedBranch}...`);
     job.phase = 'fetching';
     try {
-      await run('git', ['fetch', 'origin', resolvedBranch], { cwd: DOK_ROOT });
+      await run('git', ['fetch', 'origin', resolvedBranch], { cwd: DOK_SOURCE_ROOT });
     } catch {
-      await run('git', ['fetch', '--all', '--prune'], { cwd: DOK_ROOT });
+      await run('git', ['fetch', '--all', '--prune'], { cwd: DOK_SOURCE_ROOT });
     }
     job.phase = 'checkout';
     try {
-      const out = await run('git', ['merge', '--ff-only', `origin/${resolvedBranch}`], { cwd: DOK_ROOT });
+      const out = await run('git', ['merge', '--ff-only', `origin/${resolvedBranch}`], { cwd: DOK_SOURCE_ROOT });
       log(out.stdout.trim() || 'Already up to date.');
     } catch (e) {
       if (!force) {
@@ -1084,10 +1143,10 @@ async function runUpdate({ repo = '', branch = '', force = false }) {
         err.status = 409;
         throw err;
       }
-      await run('git', ['reset', '--hard', `origin/${resolvedBranch}`], { cwd: DOK_ROOT });
+      await run('git', ['reset', '--hard', `origin/${resolvedBranch}`], { cwd: DOK_SOURCE_ROOT });
       log('Checkout reset to origin.');
     }
-    const commit = (await run('git', ['rev-parse', '--short', 'HEAD'], { cwd: DOK_ROOT }).catch(() => ({ stdout: '' }))).stdout.trim();
+    const commit = (await run('git', ['rev-parse', '--short', 'HEAD'], { cwd: DOK_SOURCE_ROOT }).catch(() => ({ stdout: '' }))).stdout.trim();
     job.phase = 'building';
     const ctx = dokComposeContext();
     if (!fs.existsSync(ctx.file)) throw new Error(`Dok compose file was not found at ${ctx.file}`);
@@ -1107,17 +1166,27 @@ async function runUpdate({ repo = '', branch = '', force = false }) {
     // after this request finishes so its next start uses the new image.
     try {
       const generated = path.join(dataDir, 'wickedafdok', 'maintenance', 'docker-compose.yml');
-      const composeFile = fs.existsSync(generated) ? generated : path.join(DOK_ROOT, 'maintenance', 'docker-compose.yml');
+      const useGenerated = fs.existsSync(generated);
+      const composeFile = useGenerated ? generated : path.join(DOK_SOURCE_ROOT, 'maintenance', 'docker-compose.yml');
       if (fs.existsSync(composeFile)) {
         const socket = process.env.DOCKER_SOCK || '/var/run/docker.sock';
         const owner = dokOwner();
-        const composePathInHelper = `/dok${composeFile.slice(DOK_ROOT.length)}`;
+        const mounts = ['-v', `${socket}:/var/run/docker.sock`];
+        let composePathInHelper;
+        if (useGenerated) {
+          mounts.push('-v', `${DOK_ROOT}:/dok`);
+          composePathInHelper = `/dok/${path.relative(DOK_ROOT, composeFile).split(path.sep).join('/')}`;
+        } else {
+          mounts.push('-v', `${DOK_SOURCE_ROOT}:/dok-source`, '-v', `${DOK_ROOT}:/dok`);
+          composePathInHelper = `/dok-source/${path.relative(DOK_SOURCE_ROOT, composeFile).split(path.sep).join('/')}`;
+        }
         const script = `sleep 3; docker compose -p wickedafdok-maintenance -f ${composePathInHelper} up -d --remove-orphans --force-recreate`;
         await run('docker', [
           'run', '--rm', '-d', '--name', 'wickedafdok-maintenance-refresh',
-          '-v', `${socket}:/var/run/docker.sock`,
-          '-v', `${DOK_ROOT}:/dok`,
-          '-e', `DOK_PATH=${DOK_HOST_PATH}`,
+          ...mounts,
+          '-e', `DOK_SOURCE_PATH=${DOK_HOST_PATH}`,
+          '-e', `DOK_STORAGE_ROOT=${DOK_STORAGE_HOST || DOK_ROOT}`,
+          '-e', `MAINTENANCE_DATA_PATH=${MAINT_DATA_HOST}`,
           '-e', 'HOST_PATH=/',
           '-e', `DOCKER_SOCK=${socket}`,
           '-e', `PUID=${owner.uid}`,
@@ -1150,11 +1219,11 @@ app.get('/api/updates', api(async (req, res) => {
   let commit = '';
   let subject = '';
   let dirty = false;
-  try { repo = (await run('git', ['remote', 'get-url', 'origin'], { cwd: DOK_ROOT })).stdout.trim(); } catch {}
-  try { branch = (await run('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: DOK_ROOT })).stdout.trim(); } catch {}
-  try { commit = (await run('git', ['rev-parse', '--short', 'HEAD'], { cwd: DOK_ROOT })).stdout.trim(); } catch {}
-  try { subject = (await run('git', ['log', '-1', '--pretty=%s'], { cwd: DOK_ROOT })).stdout.trim(); } catch {}
-  try { dirty = !!(await run('git', ['status', '--porcelain'], { cwd: DOK_ROOT })).stdout.trim(); } catch {}
+  try { repo = (await run('git', ['remote', 'get-url', 'origin'], { cwd: DOK_SOURCE_ROOT })).stdout.trim(); } catch {}
+  try { branch = (await run('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: DOK_SOURCE_ROOT })).stdout.trim(); } catch {}
+  try { commit = (await run('git', ['rev-parse', '--short', 'HEAD'], { cwd: DOK_SOURCE_ROOT })).stdout.trim(); } catch {}
+  try { subject = (await run('git', ['log', '-1', '--pretty=%s'], { cwd: DOK_SOURCE_ROOT })).stdout.trim(); } catch {}
+  try { dirty = !!(await run('git', ['status', '--porcelain'], { cwd: DOK_SOURCE_ROOT })).stdout.trim(); } catch {}
   res.json({ ok: true, repo, branch, commit, subject, dirty, job: updateSnapshot() });
 }));
 
@@ -1250,7 +1319,7 @@ async function opencodeInfo() {
   }
   let version = '';
   try {
-    const out = await run(binary, ['--version'], { cwd: DOK_ROOT, timeout: 15000 });
+    const out = await run(binary, ['--version'], { cwd: DOK_SOURCE_ROOT, timeout: 15000 });
     version = String(out.stdout || out.stderr || '').trim().split('\n')[0];
   } catch {}
   opencodeInfoCache.value = { installed: true, version, path: binary };
@@ -1371,7 +1440,7 @@ app.post('/api/terminal/sessions', api(async (req, res) => {
     if (prompt) args.push('--prompt', prompt.slice(0, 12000));
   }
   const id = `mtn_${crypto.randomBytes(10).toString('hex')}`;
-  const cwd = DOK_ROOT;
+  const cwd = DOK_SOURCE_ROOT;
   const session = {
     id,
     app: appName,
@@ -1598,7 +1667,7 @@ function startHelperSocket(log) {
 // ---------- SPA ----------
 app.get('*', (req, res, next) => {
   if (req.path.startsWith('/api/')) return next();
-  const candidates = [path.join('/app/public/maintenance/index.html'), path.join(DOK_ROOT, 'public', 'maintenance', 'index.html')];
+  const candidates = [path.join('/app/public/maintenance/index.html'), path.join(DOK_SOURCE_ROOT, 'public', 'maintenance', 'index.html')];
   const found = candidates.find(file => fs.existsSync(file));
   if (!found) return res.status(404).send('Maintenance UI not found');
   res.sendFile(found);

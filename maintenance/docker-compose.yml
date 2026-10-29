@@ -16,12 +16,17 @@ services:
       - "${MAINTENANCE_PORT:-8090}:8090"
     volumes:
       - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
-      # Host checkout (read/write): installation, updates, and repair target.
+      # Code checkout (read/write): installation, updates, and repair target.
       - type: bind
-        source: "${DOK_PATH:-..}"
-        target: "${DOK_PATH:-/dok}"
-      # Dedicated maintenance storage, deliberately outside the Dok checkout.
-      # setup.sh sets MAINTENANCE_DATA_PATH to an absolute host path.
+        source: "${DOK_SOURCE_PATH:-..}"
+        target: /dok-source
+      # Dok persistent data root. Before installation this points at the
+      # checkout for compatibility; afterwards it is <data location>/Dok.
+      - type: bind
+        source: "${DOK_STORAGE_ROOT:-..}"
+        target: /dok
+      # Dedicated maintenance storage, moved under the Dok data root by the
+      # installer. setup.sh sets MAINTENANCE_DATA_PATH to an absolute host path.
       - type: bind
         source: "${MAINTENANCE_DATA_PATH:?MAINTENANCE_DATA_PATH must be an absolute host path outside the Dok checkout}"
         target: /maintenance-data
@@ -32,11 +37,13 @@ services:
         bind:
           propagation: rslave
     environment:
-      - DOK_ROOT=${DOK_PATH:-/dok}
+      - DOK_ROOT=/dok
+      - DOK_SOURCE_ROOT=/dok-source
+      - DOK_STORAGE_HOST_PATH=${DOK_STORAGE_ROOT:-..}
       - MAINTENANCE_DATA=/maintenance-data
       - "MAINTENANCE_DATA_HOST_PATH=${MAINTENANCE_DATA_PATH:?MAINTENANCE_DATA_PATH must be set}"
       - HOST_ROOT=/host
-      - DOK_HOST_PATH=${DOK_PATH:-..}
+      - DOK_HOST_PATH=${DOK_SOURCE_PATH:-..}
       - DOK_CONTAINER=wickedafdok
       - DOK_PORT=8080
       - DOCKER_SOCK=${DOCKER_SOCK:-/var/run/docker.sock}
@@ -45,7 +52,7 @@ services:
       - MAINTENANCE_PORT=8090
       - MAINTENANCE_URL=${MAINTENANCE_URL:-http://localhost:8090}
       - MAINTENANCE_REQUIRE_TOKEN=${MAINTENANCE_REQUIRE_TOKEN:-1}
-      - MAINTENANCE_TOKEN_FILE=${DOK_PATH:-/dok}/data/.maintenance-token
+      - MAINTENANCE_TOKEN_FILE=/dok/data/.maintenance-token
       - OPENCODE_BIN=/usr/local/bin/opencode
     networks:
       - wicked

@@ -2,6 +2,11 @@
 set -eu
 
 DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ -f "$DIR/.env" ]; then
+  set -a
+  . "$DIR/.env"
+  set +a
+fi
 SOCK=${DOCKER_SOCK:-/var/run/docker.sock}
 PUID=${PUID:-${SUDO_UID:-}}
 PGID=${PGID:-${SUDO_GID:-}}
@@ -21,11 +26,12 @@ Options:
   --socket PATH   Docker socket path (default: /var/run/docker.sock)
   --maintenance-data PATH
                   Host store for Maintenance backups/snapshots (default:
+                  <storage root>/maintenance after installation, otherwise
                   <checkout>-maintenance-data beside the checkout)
   --root          Run the container as root (UID/GID 0)
   -h, --help      Show this help
 
-Environment: PUID, PGID, DOCKER_SOCK, MAINTENANCE_DATA_PATH, MAINTENANCE_PORT, SKIP_BUILD
+Environment: PUID, PGID, DOCKER_SOCK, DOK_STORAGE_ROOT, MAINTENANCE_DATA_PATH, MAINTENANCE_PORT, SKIP_BUILD
 EOF
 }
 
@@ -99,8 +105,18 @@ fi
 # re-cloning Dok must never put backups, snapshots, or installation records at
 # risk. --maintenance-data / MAINTENANCE_DATA_PATH can point anywhere else.
 DIR_REAL=$(cd -- "$DIR" && pwd -P)
+STORAGE_ROOT=${DOK_STORAGE_ROOT:-}
+case "$STORAGE_ROOT" in
+  '') STORAGE_ROOT=$DIR_REAL ;;
+  /*) STORAGE_ROOT=$(cd -- "$STORAGE_ROOT" 2>/dev/null && pwd -P || printf '%s' "$STORAGE_ROOT") ;;
+  *) echo "The Dok storage root must be an absolute host path: $STORAGE_ROOT" >&2; exit 2 ;;
+esac
 if [ -z "$MAINT_DATA" ]; then
-  MAINT_DATA="$(dirname "$DIR_REAL")/$(basename "$DIR_REAL")-maintenance-data"
+  if [ "$STORAGE_ROOT" != "$DIR_REAL" ]; then
+    MAINT_DATA="$STORAGE_ROOT/maintenance"
+  else
+    MAINT_DATA="$(dirname "$DIR_REAL")/$(basename "$DIR_REAL")-maintenance-data"
+  fi
 fi
 case "$MAINT_DATA" in
   /*) ;;
@@ -252,6 +268,12 @@ for d in data sources uploads apps core data/wickedafdok data/.home data/opencod
   mkdir -p "$DIR/$d"
 done
 mkdir -p "$MAINT_DATA"
+if [ "$STORAGE_ROOT" != "$DIR_REAL" ]; then
+  mkdir -p "$STORAGE_ROOT/data" "$STORAGE_ROOT/apps" "$STORAGE_ROOT/core" "$STORAGE_ROOT/sources" "$STORAGE_ROOT/uploads"
+  if [ "$PUID" -ne 0 ] || [ "$PGID" -ne 0 ]; then
+    chown -R -h "$PUID:$PGID" "$STORAGE_ROOT" 2>/dev/null || true
+  fi
+fi
 
 # Take ownership of the whole checkout so the container user can update code,
 # write runtime state, and manage compose files without root-owned leftovers.
@@ -347,6 +369,10 @@ EOF
 
 write_override "$DIR" || OVERRIDE_FAILED=1
 write_override "$DIR/data/wickedafdok" || OVERRIDE_FAILED=1
+if [ "$STORAGE_ROOT" != "$DIR_REAL" ]; then
+  mkdir -p "$STORAGE_ROOT/data/wickedafdok"
+  write_override "$STORAGE_ROOT/data/wickedafdok" || OVERRIDE_FAILED=1
+fi
 
 if docker network inspect wicked >/dev/null 2>&1; then
   echo "Docker network wicked already exists."
@@ -364,7 +390,8 @@ fi
 # container so the browser installer can create host directories, launch Dok,
 # and configure the selected core services.
 # ---------------------------------------------------------------------------
-TOKEN_FILE="$DIR/data/.maintenance-token"
+TOKEN_FILE="$STORAGE_ROOT/data/.maintenance-token"
+mkdir -p "$STORAGE_ROOT/data"
 if [ ! -s "$TOKEN_FILE" ]; then
   if command -v openssl >/dev/null 2>&1; then
     openssl rand -hex 24 > "$TOKEN_FILE"
@@ -396,7 +423,7 @@ fi
 if docker inspect wickedafdok-maintenance >/dev/null 2>&1; then
   docker rm -f wickedafdok-maintenance >/dev/null 2>&1 || true
 fi
-if ! DOK_PATH="$DIR" HOST_PATH=/ PUID="$PUID" PGID="$PGID" \
+if ! DOK_SOURCE_PATH="$DIR" DOK_STORAGE_ROOT="$STORAGE_ROOT" HOST_PATH=/ PUID="$PUID" PGID="$PGID" \
   DOCKER_SOCK="$SOCK" MAINTENANCE_PORT="$MAINTENANCE_PORT" \
   MAINTENANCE_DATA_PATH="$MAINT_DATA" \
   MAINTENANCE_URL="http://localhost:$MAINTENANCE_PORT" MAINTENANCE_REQUIRE_TOKEN=1 \

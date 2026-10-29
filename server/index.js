@@ -4318,6 +4318,7 @@ function defaultsDefaults(raw = {}) {
     primaryDomain: '',
     dokDomain: '',
     dataLocation: '',
+    storageRoot: '',
     dataMode: '0775',
     allowOutsideData: true,
     autoAppData: true,
@@ -5638,26 +5639,45 @@ function maintenanceHostPort() {
 
 async function maintenanceHostCheckout() {
   const info = await selfContainerInfo();
+  const sourceMount = (info?.Mounts || []).find(m => m.Destination === '/app/host-source' && m.Type === 'bind' && m.Source);
+  if (sourceMount?.Source) return path.normalize(sourceMount.Source);
   const dataMount = (info?.Mounts || []).find(m => m.Destination === '/app/data' && m.Type === 'bind' && m.Source);
   const checkout = dataMount ? path.dirname(dataMount.Source) : await selfMountSource('/app/host-source');
   if (!checkout || checkout === '/' || checkout === '.') return null;
   return checkout;
 }
 
-// Maintenance storage must survive a replaced checkout, so it lives beside
-// the cloned directory instead of inside it. setup.sh defaults to
-// <checkout>-maintenance-data and passes MAINTENANCE_DATA_PATH through the
-// compose override; deriving the same path here keeps UI-started containers
-// aligned when Dok was launched without that override.
-function maintenanceDataHostPath(checkout) {
-  const configured = String(process.env.MAINTENANCE_DATA_PATH || '').trim();
+function maintenanceStorageHostPath(checkout) {
+  const configured = String(process.env.DOK_STORAGE_ROOT || '').trim();
   if (configured && path.isAbsolute(configured)) return path.normalize(configured);
+  try {
+    const stored = String(defaultsDefaults(readSettings().defaults || {}).storageRoot || '').trim();
+    if (stored && path.isAbsolute(stored)) return path.normalize(stored);
+  } catch {}
   const resolved = path.resolve(String(checkout || ''));
-  return `${resolved.replace(/[/\\]+$/, '')}-maintenance-data`;
+  return resolved;
 }
 
-function maintenanceComposeText({ checkout, image, installationId: id, hostPort, uid, gid, socket }) {
+// After installation every Dok-owned directory lives under <data location>/Dok,
+// so Maintenance data belongs at <storage root>/maintenance. Before an install
+// the storage root is still the checkout; in that case setup.sh's sibling
+// <checkout>-maintenance-data store is kept. MAINTENANCE_DATA_PATH is only
+// authoritative while the storage root has not moved, otherwise a stale
+// override from setup.sh would keep writing outside the Dok directory.
+function maintenanceDataHostPath(checkout) {
+  const resolvedCheckout = path.resolve(String(checkout || ''));
+  const storage = maintenanceStorageHostPath(checkout);
+  if (storage && storage !== resolvedCheckout) {
+    return path.join(storage, 'maintenance');
+  }
+  const configured = String(process.env.MAINTENANCE_DATA_PATH || '').trim();
+  if (configured && path.isAbsolute(configured)) return path.normalize(configured);
+  return `${resolvedCheckout.replace(/[/\\]+$/, '')}-maintenance-data`;
+}
+
+function maintenanceComposeText({ checkout, storageRoot, image, installationId: id, hostPort, uid, gid, socket }) {
   const dataPath = maintenanceDataHostPath(checkout);
+  const storage = storageRoot || maintenanceStorageHostPath(checkout);
   const lines = [
     '# managed-by: wickedafdok',
     'name: wickedafdok-maintenance',
@@ -5674,8 +5694,10 @@ function maintenanceComposeText({ checkout, image, installationId: id, hostPort,
     `      - ${yamlScalar(`${hostPort}:8090`)}`,
     '    volumes:',
     `      - ${yamlScalar(`${socket}:/var/run/docker.sock`)}`,
-    `      - ${yamlScalar(`${checkout}:/dok`)}`,
-    ...(checkout === '/dok' ? [] : [`      - ${yamlScalar(`${checkout}:${checkout}`)}`]),
+    `      - ${yamlScalar(`${checkout}:/dok-source`)}`,
+    `      - ${yamlScalar(`${storage}:/dok`)}`,
+    ...(checkout === '/dok-source' ? [] : [`      - ${yamlScalar(`${checkout}:${checkout}`)}`]),
+    ...(storage === '/dok' ? [] : [`      - ${yamlScalar(`${storage}:${storage}`)}`]),
     `      - ${yamlScalar(`${dataPath}:/maintenance-data`)}`,
     '      - type: bind',
     '        source: /',
@@ -5684,6 +5706,8 @@ function maintenanceComposeText({ checkout, image, installationId: id, hostPort,
     '          propagation: rslave',
     '    environment:',
     '      - DOK_ROOT=/dok',
+    '      - DOK_SOURCE_ROOT=/dok-source',
+    `      - ${yamlScalar(`DOK_STORAGE_HOST_PATH=${storage}`)}`,
     '      - MAINTENANCE_DATA=/maintenance-data',
     `      - ${yamlScalar(`MAINTENANCE_DATA_HOST_PATH=${dataPath}`)}`,
     '      - HOST_ROOT=/host',
@@ -5773,19 +5797,21 @@ async function waitForMaintenanceHelper(timeoutMs = 45000) {
   return false;
 }
 
-async function ensureMaintenanceService({ wait = true } = {}) {
+async function ensureMaintenanceService({ wait = true, recreate = false } = {}) {
   const info = await maintenanceContainerInfo();
-  if (info?.State?.Running) {
+  if (info?.State?.Running && !recreate) {
     if (!wait || await waitForMaintenanceHelper(5000)) {
       return { started: false, running: true, already: true };
     }
     await docker.getContainer(maintenanceContainer).restart().catch(() => {});
-  } else if (info) {
-    await docker.getContainer(maintenanceContainer).start();
   } else {
+    // Recreate through the generated compose so mount changes (the relocated
+    // Dok data root and Maintenance store) take effect on an existing container.
     const context = await ensureMaintenanceCompose();
     await ensureNetwork('wicked');
-    await run('docker', ['compose', '-p', 'wickedafdok-maintenance', '-f', context.composePath, 'up', '-d', '--remove-orphans'], { cwd: root, timeout: 180000 });
+    const args = ['compose', '-p', 'wickedafdok-maintenance', '-f', context.composePath, 'up', '-d', '--remove-orphans'];
+    if (recreate) args.push('--force-recreate');
+    await run('docker', args, { cwd: root, timeout: 180000 });
   }
   const ready = wait ? await waitForMaintenanceHelper(60000) : true;
   return { started: true, running: true, ready };
@@ -12790,7 +12816,7 @@ app.get('/api/maintenance', async (req, res) => {
 
 app.post('/api/maintenance/start', async (req, res) => {
   try {
-    const result = await ensureMaintenanceService({ wait: true });
+    const result = await ensureMaintenanceService({ wait: true, recreate: req.body?.recreate === true });
     res.json({ ok: true, ...result, maintenance: await maintenanceStatus(req) });
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message });

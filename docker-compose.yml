@@ -10,16 +10,17 @@ services:
       - "8080:8080"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./data:/app/data
-      - ./sources:/app/sources
-      - ./uploads:/app/uploads
-      - ./apps:/app/apps
-      - ./core:/app/core
+      - ${DOK_STORAGE_ROOT:-.}/data:/app/data
+      - ${DOK_STORAGE_ROOT:-.}/sources:/app/sources
+      - ${DOK_STORAGE_ROOT:-.}/uploads:/app/uploads
+      - ${DOK_STORAGE_ROOT:-.}/apps:/app/apps
+      - ${DOK_STORAGE_ROOT:-.}/core:/app/core
       # Host checkout used by in-app Git updates. The updater pulls here and
       # rebuilds the image, so changes survive container recreation.
       - ./:/app/host-source
     environment:
       - PORT=8080
+      - DOK_STORAGE_ROOT=${DOK_STORAGE_ROOT:-}
     privileged: false
     user: root
     networks:
@@ -29,4 +30,3 @@ networks:
   wicked:
     external: true
     name: wicked
-

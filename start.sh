@@ -2,10 +2,21 @@
 set -eu
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "$DIR/.env" ]; then
+  set -a
+  . "$DIR/.env"
+  set +a
+fi
+STORAGE_ROOT=${DOK_STORAGE_ROOT:-$DIR}
+case "$STORAGE_ROOT" in
+  /*) ;;
+  *) echo "DOK_STORAGE_ROOT must be an absolute host path: $STORAGE_ROOT" >&2; exit 2 ;;
+esac
+export DOK_STORAGE_ROOT="$STORAGE_ROOT"
 COMPOSE="$DIR/docker-compose.yml"
-ALT="$DIR/data/wickedafdok/docker-compose.yml"
+ALT="$STORAGE_ROOT/data/wickedafdok/docker-compose.yml"
 SOCK=${DOCKER_SOCK:-/var/run/docker.sock}
-SOCK_OVERRIDE="$DIR/data/.docker-socket-gid.yml"
+SOCK_OVERRIDE="$STORAGE_ROOT/data/.docker-socket-gid.yml"
 
 if [ "$SOCK" != "/var/run/docker.sock" ] && [ -z "${DOCKER_HOST:-}" ]; then
   DOCKER_HOST="unix://$SOCK"
@@ -78,7 +89,7 @@ if [ -f "$ALT" ]; then
     echo "Ignoring managed compose with container-local bind paths: $ALT" >&2
   else
     echo "Using managed compose: $ALT"
-    cd "$DIR/data/wickedafdok"
+    cd "$STORAGE_ROOT/data/wickedafdok"
     rm -f docker-compose.socket-gid.yml
     # The managed compose only references the built image, so without this a
     # code update in the checkout would never reach the container. Match the

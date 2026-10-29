@@ -393,7 +393,7 @@
         <ul>
           <li><strong>Primary domain</strong> suggests core-service hostnames such as auth, sso, dns, and mail.</li>
           <li><strong>Dok domain</strong> sets the UI hostname and can fill a blank nginx domain.</li>
-          <li><strong>Data location</strong> is an absolute host path. <strong>Data mode</strong> sets the folder permissions (default 0775).</li>
+          <li><strong>Data location</strong> is an absolute host path for app data. During installation Dok also creates a <code>Dok</code> folder inside the configured location and keeps its own data, apps, core services, sources, uploads, and Maintenance data there. <strong>Data mode</strong> sets the folder permissions (default 0775).</li>
           <li><strong>Auto app data</strong> creates <code>&lt;dataLocation&gt;/apps/&lt;app&gt;/data</code> and maps missing relative bind mounts beneath it.</li>
           <li><strong>Allow outside data</strong> permits bind paths outside the data location. Leave it off unless you need host paths the Dok user can write.</li>
           <li><strong>Admin user/email/password</strong> seed Authelia, Authentik, and Technitium installs.</li>
@@ -497,7 +497,7 @@
         </ul>
         <h4>Data location</h4>
         <ul>
-          <li><strong>Data location</strong> must be an absolute host path.</li>
+          <li><strong>Data location</strong> must be an absolute host path and is required during installation. Dok stores its persistent data in <code>&lt;data location&gt;/Dok</code> and Maintenance data in <code>&lt;data location&gt;/Dok/maintenance</code>.</li>
           <li><strong>Data mode</strong> is an octal permission such as <code>0775</code>.</li>
           <li><strong>Auto app data</strong> maps missing relative mounts under the app data directory.</li>
         </ul>

@@ -428,7 +428,7 @@
 
   const DEFAULTS_FIELDS = [
     { key: 'dokDomain', label: 'Dok domain', placeholder: 'dok.example.com', help: 'Public address for the Dok UI when nginx-proxy is used.' },
-    { key: 'dataLocation', label: 'App data location (host path)', placeholder: '/srv/dok-data', help: 'Created on the host. Blank keeps Dok defaults.' },
+    { key: 'dataLocation', label: 'Persistent data location (host path)', placeholder: '/srv/dok', required: true, help: 'Required. Dok creates a "Dok" folder here and keeps its data, apps, core services, sources, uploads, and Maintenance data inside it. App data is stored under <location>/apps/<app>/data.' },
     { key: 'dataMode', label: 'Data directory mode', placeholder: '0775' },
     { key: 'adminUser', label: 'Admin username', placeholder: 'admin' },
     { key: 'adminEmail', label: 'Admin email', placeholder: 'admin@example.com' },
@@ -439,15 +439,16 @@
 
   function fieldInput(key, value, definition = {}, { checkbox = false } = {}) {
     const type = definition.type || 'text';
+    const label = `${definition.label || key}${definition.required ? ' *' : ''}`;
     const help = definition.help ? `<div class="help">${escapeHtml(definition.help)}</div>` : '';
     if (type === 'checkbox') {
-      return `<label class="check"><input type="checkbox" data-field="${escapeHtml(key)}" ${value ? 'checked' : ''}> ${escapeHtml(definition.label || key)}</label>${help}`;
+      return `<label class="check"><input type="checkbox" data-field="${escapeHtml(key)}" ${value ? 'checked' : ''}> ${escapeHtml(label)}</label>${help}`;
     }
     if (type === 'select') {
-      const options = (definition.options || []).map(([optionValue, label]) => `<option value="${escapeHtml(optionValue)}" ${String(value || '') === optionValue ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('');
-      return `<div class="field"><label>${escapeHtml(definition.label || key)}</label><select class="select" data-field="${escapeHtml(key)}">${options}</select>${help}</div>`;
+      const options = (definition.options || []).map(([optionValue, optionLabel]) => `<option value="${escapeHtml(optionValue)}" ${String(value || '') === optionValue ? 'selected' : ''}>${escapeHtml(optionLabel)}</option>`).join('');
+      return `<div class="field"><label>${escapeHtml(label)}</label><select class="select" data-field="${escapeHtml(key)}">${options}</select>${help}</div>`;
     }
-    return `<div class="field"><label>${escapeHtml(definition.label || key)}</label><input class="input" type="${escapeHtml(type)}" data-field="${escapeHtml(key)}" value="${escapeHtml(value ?? '')}" placeholder="${escapeHtml(definition.placeholder || '')}" ${checkbox ? '' : ''}>${help}</div>`;
+    return `<div class="field"><label>${escapeHtml(label)}</label><input class="input" type="${escapeHtml(type)}" data-field="${escapeHtml(key)}" value="${escapeHtml(value ?? '')}" placeholder="${escapeHtml(definition.placeholder || '')}" ${checkbox ? '' : ''}>${help}</div>`;
   }
 
   function renderLanding() {
@@ -736,7 +737,7 @@
     const fields = DEFAULTS_FIELDS.filter(field => field.key !== 'adminPasswordConfirm' || !!wizard.services.auth);
     return `
       <h3>Dok settings</h3>
-      <div class="sub small" style="margin-bottom:14px">These values populate Dok Settings → Default settings. Secrets are encrypted before they are written.${wizard.type === 'core' ? ' Required fields for the selected core services must be filled.' : ' You can skip this step and configure these later in Dok.'}</div>
+      <div class="sub small" style="margin-bottom:14px">These values populate Dok Settings → Default settings. The persistent data location is required; Dok creates a <span class="mono">Dok</span> folder inside it for all of its data, and Maintenance data is kept under <span class="mono">Dok/maintenance</span>. Secrets are encrypted before they are written.${wizard.type === 'core' ? ' Required fields for the selected core services must also be filled.' : ''}</div>
       <div class="grid two">
         <div>
           ${fields.slice(0, 4).map(field => fieldInput(field.key, wizard.fields[field.key], field)).join('')}
@@ -810,7 +811,7 @@
             <dt>Mail</dt><dd>${escapeHtml(wizard.fields.mailDomain || '-')}</dd>
             ${wizard.services.mail ? `<dt>Sender</dt><dd>${escapeHtml(wizard.fields.mailFrom || wizard.fields.smtpFrom || '-')}</dd>` : ''}
             ${wizard.services.proxy === 'nginx-proxy' ? `<dt>TLS</dt><dd>${escapeHtml(wizard.fields.acmeEmail ? `ACME${wizard.fields.acmeStaging ? ' staging' : ''}` : 'Manual certificates')}</dd>` : ''}
-            <dt>Data path</dt><dd>${escapeHtml(wizard.fields.dataLocation || 'Dok default')}</dd>
+            <dt>Data path</dt><dd>${escapeHtml(wizard.fields.dataLocation ? `${wizard.fields.dataLocation.replace(/\/+$/, '')}/Dok` : 'Not set')}</dd>
             <dt>Admin</dt><dd>${escapeHtml(wizard.fields.adminUser || 'admin')} ${wizard.fields.adminEmail ? `· ${escapeHtml(wizard.fields.adminEmail)}` : ''}</dd>
             <dt>Network</dt><dd>${escapeHtml(wizard.fields.defaultNetwork || 'wicked')}</dd>
           </div>
@@ -991,7 +992,8 @@
         if (wizard.services.mail === 'smtp' && (!wizard.fields.smtpHost || !wizard.fields.smtpFrom)) return 'SMTP host and sender address are required.';
         if (wizard.services.mail === 'smtp' && wizard.fields.smtpHost && !wizard.fields.smtpFrom) return 'A sender address is required for SMTP.';
       }
-      if (wizard.fields.dataLocation && !wizard.fields.dataLocation.startsWith('/')) return 'The data location must be an absolute host path.';
+      if (!wizard.fields.dataLocation) return 'Enter a persistent data location. Dok creates a "Dok" folder inside it.';
+      if (!wizard.fields.dataLocation.startsWith('/')) return 'The data location must be an absolute host path.';
       if (wizard.fields.dataMode && !/^0?[0-7]{3,4}$/.test(wizard.fields.dataMode)) return 'Data directory mode must be octal, for example 0775.';
       if (wizard.fields.adminEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(wizard.fields.adminEmail)) return 'Admin email is invalid.';
       for (const [key, label] of [['dokDomain', 'Dok domain'], ['authDomain', 'authentication domain'], ['dnsDomain', 'DNS domain'], ['mailDomain', 'mail domain']]) {
