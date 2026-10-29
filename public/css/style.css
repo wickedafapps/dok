@@ -504,6 +504,24 @@ select.input { cursor: pointer; }
 
 .output.hidden, .hidden { display: none !important; }
 
+.assist-sessions { margin-top: 14px; }
+.assist-sessions > p { margin: 0 0 8px; font-size: 12.5px; }
+.session-list { display: grid; gap: 8px; }
+.session-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #0a0f12;
+  font-size: 13px;
+}
+.session-item-meta { min-width: 0; }
+.session-item-title { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-item-sub { color: var(--sub); font-family: var(--mono); font-size: 11.5px; }
+
 .list { display: grid; gap: 10px; }
 
 .core-console-grid {

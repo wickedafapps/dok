@@ -252,6 +252,7 @@
         <p>The shell starts in <code>/app</code> and runs as the Dok container user. It is not permission-restricted.</p>
         <h4>OC Assist</h4>
         <p>OC Assist is the only OpenCode chat launched from Dok. Start it from <strong>App Creation → OC Assist</strong>; Dok opens the chat directly, without shell or mode options. The assistant runs in User mode with permission to edit apps and register them. It saves each app stopped so you can configure and deploy it from Apps.</p>
+        <p>Closing the chat window does not cancel the build. OC Assist keeps running in the background, and running sessions are listed under <strong>App Creation → OC Assist</strong> with an <strong>Open chat</strong> button so you can reattach after a reload or a failed connection. Use <strong>Stop</strong> in the terminal to end it deliberately.</p>
         <p>Admin OpenCode is available only inside the Dok Maintenance container. Provider settings for OC Assist can be saved under Settings → Core Services → OpenCode.</p>
       `
     },
@@ -523,6 +524,7 @@
         <ul>
           <li>Check the server log for PTY, shell, or OpenCode errors.</li>
           <li>The terminal switches to HTTP compatibility mode when a proxy blocks <code>/api/terminal/ws</code>. Forwarding WebSocket upgrades is still faster.</li>
+          <li>The terminal keeps retrying while the connection is interrupted. If the window was closed, reattach the still-running OC Assist session from <strong>App Creation → OC Assist</strong>.</li>
           <li>Rebuild the image if OpenCode is missing from an older deployment.</li>
         </ul>
         <h4>Imported app needs setup</h4>

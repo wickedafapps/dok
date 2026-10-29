@@ -155,7 +155,7 @@ The Terminal button and **Apps shell** button open a normal shell as the contain
 
 OpenCode is preconfigured, so launching it needs no input. Set a model and API key in Dok Maintenance's OpenCode card, or run `/connect` inside a session. Provider credentials and User-mode sessions are stored under `data/opencode`; Admin sessions and provider state used by Maintenance live under `<maintenance-data>/opencode`.
 
-Closing the terminal stops the session. OpenCode is intentionally not part of **Start all/Stop all**, because it is a launch-on-demand tool rather than a long-running service.
+Closing a shell terminal stops it. Closing an OC Assist chat leaves OpenCode running so the app build can finish; running sessions stay listed in **App Creation** with an **Open chat** button, and **Stop** on the terminal ends them. OpenCode is intentionally not part of **Start all/Stop all**, because it is a launch-on-demand tool rather than a long-running service.
 
 The terminal normally uses a WebSocket at `/api/terminal/ws`. If a preview or reverse proxy blocks the upgrade, Dok automatically switches that session to HTTP polling so the shell and OC Assist still work. Forwarding WebSocket upgrades is still recommended because it has lower latency and less overhead.
 

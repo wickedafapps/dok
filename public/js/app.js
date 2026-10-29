@@ -133,7 +133,7 @@ function openTab(name) {
   if (name === 'dashboard') { loadStats(); loadDashboardCoreServices(); }
   if (name === 'sources') loadSources(state.sourceRel);
   if (name === 'apps') loadApps();
-  if (name === 'appcreation') checkAppCreationNginxNotice();
+  if (name === 'appcreation') { checkAppCreationNginxNotice(); loadAssistSessions(); }
 }
 
 qsa('.tab-btn').forEach(btn => btn.addEventListener('click', () => {
@@ -4181,9 +4181,15 @@ let terminalHttpInputSending = false;
 let terminalHttpFallbackNoticeShown = false;
 let terminalHttpNoticePending = false;
 let terminalHttpTruncatedShown = false;
+let terminalHttpOutageNoticeShown = false;
+let terminalReadyTimer = null;
+let terminalStableTimer = null;
 const TERMINAL_MAX_RECONNECT = 10;
 const TERMINAL_WS_FALLBACK_ATTEMPTS = 2;
 const TERMINAL_HTTP_IDLE_MS = 350;
+const TERMINAL_CONNECT_TIMEOUT_MS = 8000;
+const TERMINAL_READY_TIMEOUT_MS = 8000;
+const TERMINAL_STABLE_MS = 10000;
 
 function clearTerminalConnectionTimers() {
   if (terminalReconnectTimer) {
@@ -4202,6 +4208,14 @@ function clearTerminalConnectionTimers() {
     clearTimeout(terminalHttpInputTimer);
     terminalHttpInputTimer = null;
   }
+  if (terminalReadyTimer) {
+    clearTimeout(terminalReadyTimer);
+    terminalReadyTimer = null;
+  }
+  if (terminalStableTimer) {
+    clearTimeout(terminalStableTimer);
+    terminalStableTimer = null;
+  }
 }
 
 function resetTerminalHttpState() {
@@ -4214,6 +4228,7 @@ function resetTerminalHttpState() {
   terminalHttpFallbackNoticeShown = false;
   terminalHttpNoticePending = false;
   terminalHttpTruncatedShown = false;
+  terminalHttpOutageNoticeShown = false;
 }
 
 function resetTerminalView() {
@@ -4423,13 +4438,14 @@ function handleLostTerminalSession(sessionId) {
     ? 'The OC Assist session ended. Start OC Assist again to continue.'
     : 'The terminal session ended. Open the terminal again to start a new session.', true, 8000);
   loadCoreOpencode();
+  loadAssistSessions();
 }
 
 async function scheduleTerminalReconnect(sessionId) {
   if (!sessionId || sessionId !== terminalSessionId) return;
   if (terminalReconnectAttempt >= TERMINAL_MAX_RECONNECT) {
-    setTerminalStatus('Disconnected');
-    terminalNotice('The terminal connection was lost. Close this window and start again.');
+    // The HTTP transport retries indefinitely, so never give up here either.
+    startTerminalHttp(sessionId, terminalConnectToken);
     return;
   }
   const attempt = terminalReconnectAttempt++;
@@ -4475,13 +4491,16 @@ function scheduleTerminalHttpPoll(sessionId, token, delay) {
 function failTerminalHttp(sessionId, token, message) {
   if (token !== terminalConnectToken || sessionId !== terminalSessionId || terminalTransport !== 'http') return;
   terminalHttpErrors += 1;
-  if (terminalHttpErrors >= TERMINAL_MAX_RECONNECT) {
-    setTerminalStatus('Disconnected');
-    terminalNotice(`${message} Close this window and start again.`);
-    return;
+  if (terminalHttpErrors === TERMINAL_MAX_RECONNECT && !terminalHttpOutageNoticeShown) {
+    terminalHttpOutageNoticeShown = true;
+    terminalNotice('The connection to Dok was interrupted. Still retrying; the session resumes automatically when the server is reachable.');
   }
-  setTerminalStatus(`Connection lost — retrying (${terminalHttpErrors}/${TERMINAL_MAX_RECONNECT})…`);
-  scheduleTerminalHttpPoll(sessionId, token, Math.min(500 * terminalHttpErrors, 5000));
+  if (terminalHttpErrors >= TERMINAL_MAX_RECONNECT) {
+    setTerminalStatus('Disconnected — still retrying…');
+  } else {
+    setTerminalStatus(`Connection lost — retrying (${terminalHttpErrors}/${TERMINAL_MAX_RECONNECT})…`);
+  }
+  scheduleTerminalHttpPoll(sessionId, token, Math.min(500 * Math.min(terminalHttpErrors, 10), 5000));
 }
 
 async function pollTerminalHttp(sessionId, token) {
@@ -4513,7 +4532,13 @@ async function pollTerminalHttp(sessionId, token) {
     return;
   }
   if (token !== terminalConnectToken || sessionId !== terminalSessionId || terminalTransport !== 'http') return;
+  const recoveredFromOutage = terminalHttpOutageNoticeShown;
   terminalHttpErrors = 0;
+  terminalHttpOutageNoticeShown = false;
+  if (recoveredFromOutage) {
+    setTerminalStatus('Connected (compatibility mode)');
+    terminalNotice('Connection restored.');
+  }
   if (!terminalHttpReady) {
     applyTerminalReady(data.session || {});
     terminalHttpReady = true;
@@ -4543,6 +4568,7 @@ async function pollTerminalHttp(sessionId, token) {
     setTerminalStatus(`Exited (${data.exitCode})`);
     toast(`Terminal session ended${data.exitCode === 0 ? '' : ` with code ${data.exitCode}`}`, data.exitCode !== 0);
     loadCoreOpencode();
+    loadAssistSessions();
     return;
   }
   scheduleTerminalHttpPoll(sessionId, token, chunks.length ? 25 : TERMINAL_HTTP_IDLE_MS);
@@ -4560,6 +4586,7 @@ function startTerminalHttp(sessionId, token) {
   terminalHttpErrors = 0;
   terminalHttpReady = false;
   terminalHttpInputQueue = '';
+  terminalHttpOutageNoticeShown = false;
   if (!terminalHttpFallbackNoticeShown) {
     terminalHttpFallbackNoticeShown = true;
     terminalHttpNoticePending = true;
@@ -4589,16 +4616,36 @@ function connectTerminal({ reconnect = false } = {}) {
   terminalTransport = 'ws';
   terminalSocket = ws;
   setTerminalStatus(reconnect ? 'Reconnecting…' : 'Connecting…');
+  // Some proxies never answer the upgrade request. Do not leave the chat stuck
+  // on "Connecting…"; give the handshake a deadline and use HTTP polling.
+  if (terminalReadyTimer) clearTimeout(terminalReadyTimer);
+  terminalReadyTimer = setTimeout(() => {
+    terminalReadyTimer = null;
+    if (token !== terminalConnectToken || terminalSessionId !== sessionId) return;
+    if (terminalSocket !== ws || opened) return;
+    try { ws.close(); } catch {}
+    startTerminalHttp(sessionId, token);
+  }, TERMINAL_CONNECT_TIMEOUT_MS);
 
   ws.onopen = () => {
     if (token !== terminalConnectToken || terminalSessionId !== sessionId) return;
     opened = true;
     terminalTransport = 'ws';
-    terminalReconnectAttempt = 0;
-    setTerminalStatus('Connected');
+    setTerminalStatus('Attaching…');
     startTerminalHeartbeat(ws, token);
     fitTerminal();
     if (terminal) terminal.focus();
+    // A proxy can accept the upgrade and then swallow the session frames. If
+    // the server's ready message never arrives, switch to HTTP polling instead
+    // of leaving the chat stuck on a silent socket.
+    if (terminalReadyTimer) clearTimeout(terminalReadyTimer);
+    terminalReadyTimer = setTimeout(() => {
+      terminalReadyTimer = null;
+      if (token !== terminalConnectToken || terminalSessionId !== sessionId) return;
+      if (terminalSocket !== ws) return;
+      try { ws.close(); } catch {}
+      startTerminalHttp(sessionId, token);
+    }, TERMINAL_READY_TIMEOUT_MS);
   };
 
   ws.onmessage = (event) => {
@@ -4609,6 +4656,18 @@ function connectTerminal({ reconnect = false } = {}) {
     if (message.type === 'output' && terminal) {
       terminal.write(message.data);
     } else if (message.type === 'ready') {
+      if (terminalReadyTimer) {
+        clearTimeout(terminalReadyTimer);
+        terminalReadyTimer = null;
+      }
+      // Restore the reconnect budget only after the socket has stayed open for
+      // a while, so a proxy that accepts and instantly drops every attempt
+      // reaches the HTTP fallback instead of reconnecting in a loop forever.
+      if (terminalStableTimer) clearTimeout(terminalStableTimer);
+      terminalStableTimer = setTimeout(() => {
+        terminalStableTimer = null;
+        if (token === terminalConnectToken && terminalSessionId === sessionId) terminalReconnectAttempt = 0;
+      }, TERMINAL_STABLE_MS);
       applyTerminalReady(message.session || {});
     } else if (message.type === 'ping') {
       try { ws.send(JSON.stringify({ type: 'pong', at: Date.now() })); } catch {}
@@ -4625,6 +4684,14 @@ function connectTerminal({ reconnect = false } = {}) {
     if (terminalHeartbeatTimer) {
       clearInterval(terminalHeartbeatTimer);
       terminalHeartbeatTimer = null;
+    }
+    if (terminalReadyTimer) {
+      clearTimeout(terminalReadyTimer);
+      terminalReadyTimer = null;
+    }
+    if (terminalStableTimer) {
+      clearTimeout(terminalStableTimer);
+      terminalStableTimer = null;
     }
     if (terminalSocket === ws) terminalSocket = null;
     if (terminalTransport !== 'ws') return;
@@ -4645,8 +4712,9 @@ function connectTerminal({ reconnect = false } = {}) {
   };
 }
 
-async function stopCurrentTerminalSession({ quiet = false, exceptId = '' } = {}) {
+async function stopCurrentTerminalSession({ quiet = false, exceptId = '', keepOpencode = false } = {}) {
   const id = terminalSessionId;
+  const wasOpencode = terminalSessionApp === 'opencode';
   terminalSessionId = null;
   terminalSessionApp = '';
   terminalConnectToken += 1;
@@ -4655,7 +4723,7 @@ async function stopCurrentTerminalSession({ quiet = false, exceptId = '' } = {})
     try { terminalSocket.close(); } catch {}
     terminalSocket = null;
   }
-  if (id && id !== exceptId) {
+  if (id && id !== exceptId && !(keepOpencode && wasOpencode)) {
     try {
       await api(`/api/terminal/sessions/${encodeURIComponent(id)}/stop`, { method: 'POST' });
     } catch (e) {
@@ -4664,11 +4732,13 @@ async function stopCurrentTerminalSession({ quiet = false, exceptId = '' } = {})
   }
   if (!quiet) setTerminalStatus('Stopped');
   loadCoreOpencode();
+  loadAssistSessions();
 }
 
 function closeTerminalSession() {
   terminalOpenToken += 1;
   const id = terminalSessionId;
+  const wasOpencode = terminalSessionApp === 'opencode';
   terminalSessionId = null;
   terminalSessionApp = '';
   terminalConnectToken += 1;
@@ -4677,11 +4747,19 @@ function closeTerminalSession() {
     try { terminalSocket.close(); } catch {}
     terminalSocket = null;
   }
-  if (id) {
+  // Closing the chat window must not cancel an OC Assist build. The explicit
+  // Stop button still ends it; otherwise it keeps running so the app can be
+  // finished and the chat reopened from App Creation later.
+  if (id && !wasOpencode) {
     fetch(`/api/terminal/sessions/${encodeURIComponent(id)}/stop`, { method: 'POST' }).catch(() => {});
+  } else if (id && wasOpencode) {
+    toast('OC Assist keeps running in the background. Reopen the chat from App Creation.', false, 7000);
   }
   resetTerminalView();
-  setTimeout(() => loadCoreOpencode(), 200);
+  setTimeout(() => {
+    loadCoreOpencode();
+    loadAssistSessions();
+  }, 200);
 }
 
 async function openTerminal({ mode = 'admin', app = 'shell' } = {}) {
@@ -4695,7 +4773,8 @@ async function openTerminal({ mode = 'admin', app = 'shell' } = {}) {
   setTerminalStatus('Starting…');
 
   const openToken = ++terminalOpenToken;
-  await stopCurrentTerminalSession({ quiet: true });
+  // Opening a shell should not cancel an OC Assist build that is still running.
+  await stopCurrentTerminalSession({ quiet: true, keepOpencode: true });
   if (openToken !== terminalOpenToken || modal.classList.contains('hidden')) return;
   resetTerminalView();
   terminalReconnectAttempt = 0;
@@ -4738,14 +4817,15 @@ async function openExistingTerminal(session) {
   const openToken = ++terminalOpenToken;
   // Never stop the session we are about to attach to. This can happen when the
   // server response is handled after a reconnect or a rapid double launch.
-  await stopCurrentTerminalSession({ quiet: true, exceptId: session.id });
+  // Other running OC Assist builds also keep going in the background.
+  await stopCurrentTerminalSession({ quiet: true, exceptId: session.id, keepOpencode: true });
   if (openToken !== terminalOpenToken || modal.classList.contains('hidden')) return;
   resetTerminalView();
   terminalReconnectAttempt = 0;
   if (!ensureTerminal()) {
     setTerminalStatus('Terminal unavailable');
-    toast('The terminal component failed to load. The OC Assist session was stopped.', true, 8000);
-    fetch(`/api/terminal/sessions/${encodeURIComponent(session.id)}/stop`, { method: 'POST' }).catch(() => {});
+    toast('The terminal component failed to load. OC Assist keeps running; reopen it from App Creation after reloading.', true, 8000);
+    loadAssistSessions();
     return;
   }
   terminalSessionId = session.id;
@@ -4801,11 +4881,19 @@ if (qs('#assistStartBtn')) {
       startedSession = data.session;
       if (output) output.textContent = `OpenCode is ready for ${data.appName}. Chat in the terminal; the app is saved stopped in Apps when it is ready so you can configure and deploy it.`;
       toast(`OC Assist started for ${data.appName}`, false, 6000);
-      await openExistingTerminal(data.session);
+      try {
+        await openExistingTerminal(data.session);
+      } catch (attachError) {
+        if (output) {
+          output.textContent = `${attachError.message || 'The chat could not be opened.'} OC Assist is still running; use Open chat below to reconnect.`;
+        }
+        toast('OC Assist is running, but the chat could not be opened. Use Open chat below.', true, 8000);
+      }
+      loadAssistSessions();
     } catch (e) {
       if (output) output.textContent = e.message;
       toast(e.message, true);
-      // Do not leave a running OpenCode TUI behind if the chat could not open.
+      // The start request itself failed, so there is no session to preserve.
       if (startedSession?.id) {
         fetch(`/api/terminal/sessions/${encodeURIComponent(startedSession.id)}/stop`, { method: 'POST' }).catch(() => {});
       }
@@ -4813,6 +4901,45 @@ if (qs('#assistStartBtn')) {
       setLoading(btn, false, 'Create App with OC Assist');
     }
   });
+}
+
+async function loadAssistSessions() {
+  const wrap = qs('#assistSessions');
+  const list = qs('#assistSessionsList');
+  if (!wrap || !list) return;
+  try {
+    const res = await api('/api/terminal');
+    const sessions = (res.sessions || []).filter(session => session && session.app === 'opencode' && !session.exited);
+    if (!sessions.length) {
+      wrap.classList.add('hidden');
+      list.innerHTML = '';
+      return;
+    }
+    list.innerHTML = sessions.map(session => {
+      const started = session.createdAt ? new Date(session.createdAt).toLocaleTimeString() : '';
+      const recentlyPolled = Number(session.lastClientAt) > 0 && Date.now() - Number(session.lastClientAt) < 6000;
+      const attached = Number(session.clients) > 0 || recentlyPolled;
+      const clients = attached ? 'chat attached' : 'chat not attached';
+      const meta = [session.title || 'OC Assist', started, clients].filter(Boolean).join(' · ');
+      return `
+        <div class="session-item">
+          <div class="session-item-meta">
+            <span class="session-item-title">${escapeHtml(session.title || 'OC Assist')}</span>
+            <span class="session-item-sub">${escapeHtml([started, clients].filter(Boolean).join(' · '))}</span>
+          </div>
+          <button class="btn" data-open-session="${escapeHtml(session.id)}" title="${escapeHtml(meta)}">Open chat</button>
+        </div>`;
+    }).join('');
+    list.querySelectorAll('[data-open-session]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const session = sessions.find(item => item.id === btn.dataset.openSession);
+        if (session) openExistingTerminal(session);
+      });
+    });
+    wrap.classList.remove('hidden');
+  } catch {
+    wrap.classList.add('hidden');
+  }
 }
 
 async function loadCoreOpencode() {
@@ -6270,3 +6397,4 @@ loadContainers();
 loadSettings();
 loadDesignerBranding();
 checkAppCreationNginxNotice();
+loadAssistSessions();

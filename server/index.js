@@ -11546,11 +11546,12 @@ app.post('/api/core/host-helper/run', async (req, res) => {
 const OPENCODE_MAX_SESSIONS = 8;
 const TERMINAL_BUFFER_LIMIT = 2 * 1024 * 1024;
 const TERMINAL_IDLE_MS = 30 * 60 * 1000;
-// A terminal is only useful while a browser is attached. Without this grace
-// window, an OC Assist session whose WebSocket never connected (blocked proxy,
-// closed tab, reversed host header) would keep the OpenCode TUI alive forever,
-// slowly exhausting the container's memory until Docker restarts Dok.
-const TERMINAL_DETACHED_MS = 3 * 60 * 1000;
+// OC Assist must finish building the app even when the browser cannot attach to
+// the chat. A short detach grace killed long builds while OpenCode was still
+// working (and background tabs can stop polling for minutes), so keep an
+// unattached OpenCode session alive for an hour. The session count is capped
+// and exited sessions are reaped, so this stays bounded.
+const TERMINAL_OPENCODE_DETACHED_MS = 60 * 60 * 1000;
 const TERMINAL_HEARTBEAT_MS = 25 * 1000;
 const TERMINAL_MODES = {
   admin: {
@@ -11988,11 +11989,12 @@ function scheduleTerminalCleanup(session, delay = 30000) {
       scheduleTerminalCleanup(session, 60000);
       return;
     }
-    // No client attached: stop after a short grace period. The grace lets a
-    // browser reconnect after a reload or a brief network drop without killing
-    // the running OpenCode session.
+    // No client attached. Shells are only useful while someone is watching, so
+    // reap them after the idle window. OpenCode may still be building the app,
+    // so keep it alive through the detached grace even if the chat never
+    // attached or the browser stopped polling while in the background.
     const detachedFor = now - (session.lastClientAt || session.createdAtMs || now);
-    const grace = session.app === 'opencode' ? TERMINAL_DETACHED_MS : TERMINAL_IDLE_MS;
+    const grace = session.app === 'opencode' ? TERMINAL_OPENCODE_DETACHED_MS : TERMINAL_IDLE_MS;
     if (detachedFor >= grace) {
       appendServerLog('INFO', `terminal session ${session.id} had no client for ${Math.round(detachedFor / 1000)}s; stopping`);
       stopTerminalSession(session.id);
@@ -12040,6 +12042,7 @@ function terminalSessionSummary(session) {
     cwd: session.cwd,
     pid: session.pty.pid,
     createdAt: session.createdAt,
+    lastClientAt: session.lastClientAt || null,
     clients: session.clients.size,
     exited: session.exited,
     exitCode: session.exitCode
@@ -12261,6 +12264,10 @@ app.get('/api/terminal/sessions/:id/output', (req, res) => {
   if (!session) return res.status(404).json({ error: 'Terminal session is no longer running' });
   session.lastActivity = Date.now();
   session.lastClientAt = Date.now();
+  if (!session.httpAttached) {
+    session.httpAttached = true;
+    appendServerLog('INFO', `terminal session ${session.id} attached via HTTP compatibility transport`);
+  }
   const output = terminalOutputSince(session, req.query.after);
   res.set('Cache-Control', 'no-store');
   res.json({
@@ -13201,6 +13208,7 @@ terminalWss.on('connection', (ws, req, session) => {
   } catch {}
 
   session.clients.add(ws);
+  appendServerLog('INFO', `terminal client attached to ${session.id} (${session.mode} ${session.app})`);
 
   ws.on('pong', () => { ws.isAlive = true; });
 
@@ -13237,6 +13245,7 @@ terminalWss.on('connection', (ws, req, session) => {
     session.clients.delete(ws);
     session.lastActivity = Date.now();
     session.lastClientAt = Date.now();
+    appendServerLog('INFO', `terminal client detached from ${session.id} (${session.mode} ${session.app})`);
     scheduleTerminalCleanup(session);
   });
 
