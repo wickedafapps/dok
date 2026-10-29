@@ -140,6 +140,7 @@
       html: `
         <p><strong>OC Assist</strong> creates an app from a written brief. Enter a required app title and prompt describing the app, optionally add pasted data such as a docker run command, compose file, or repository URL, and upload supporting files.</p>
         <p>When you select <strong>Create app with OC Assist</strong>, Dok writes a private brief and the uploaded files under <code>sources/oc-assist-&lt;stamp&gt;/</code>, then immediately opens the OpenCode chat in <strong>User mode</strong> with the dedicated <code>assist</code> agent. There is no shell or mode picker: the chat is the only thing shown. The brief and all creator fields are passed automatically; you only need to answer questions if OpenCode needs more information.</p>
+        <p>OC Assist reads any repository or reference URL you provide to identify the app&rsquo;s real GUI container port and always writes <code>VIRTUAL_PORT</code> on the primary GUI service, even when you do not supply a domain. For multi-port apps it selects the public web UI port rather than a database, metrics, or internal API port. <code>VIRTUAL_HOST</code> is added when you supply a hostname or ask for routing.</p>
         <p>If OpenCode fails during startup, Dok shows the captured terminal error instead of opening an empty chat. Inside the terminal, <strong>Escape</strong> is sent to OpenCode (for its own dialogs); use the terminal&rsquo;s close button to end the session.</p>
         <h4>What the assistant is allowed to do</h4>
         <ul>
