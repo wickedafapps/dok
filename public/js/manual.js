@@ -81,6 +81,7 @@
           <li><strong>Local upload</strong> uploads files or a folder from your computer.</li>
         </ul>
         <p>If a git clone or upload has no compose file or Dockerfile, Dok stores it under Projects instead of creating an app. You can deploy it later from that project.</p>
+        <p>Every creation method looks for the app&rsquo;s official repository or website and prefills it in <strong>Official repository or website</strong>. Dok checks project metadata, README links, compose and Dockerfile image labels, local image labels, and the git clone URL. If the result is missing or wrong, edit or clear the field before saving. The link appears in Apps for quick configuration reference.</p>
         <p>Created apps join Dok&rsquo;s default network (normally <code>wicked</code>). If nginx-proxy is installed, the routed service gets a matching <code>VIRTUAL_HOST</code>/<code>VIRTUAL_PORT</code> pair, is attached to that network, and its published host ports are removed so the GUI is served through nginx.</p>
         <p>Before finalising, Dok validates the compose file, resolves networks and bind mounts, checks published ports, and asks for any missing choices. <strong>Save to library</strong> saves the app stopped. <strong>Test launch (stops after test)</strong> starts it briefly, reports the container states, and stops it again. Nothing stays running until you deploy from Apps.</p>
       `
@@ -141,6 +142,7 @@
         <p><strong>OC Assist</strong> creates an app from a written brief. Enter a required app title and prompt describing the app, optionally add pasted data such as a docker run command, compose file, or repository URL, and upload supporting files.</p>
         <p>When you select <strong>Create app with OC Assist</strong>, Dok writes a private brief and the uploaded files under <code>sources/oc-assist-&lt;stamp&gt;/</code>, then immediately opens the OpenCode chat in <strong>User mode</strong> with the dedicated <code>assist</code> agent. There is no shell or mode picker: the chat is the only thing shown. The brief and all creator fields are passed automatically; you only need to answer questions if OpenCode needs more information.</p>
         <p>OC Assist reads any repository or reference URL you provide to identify the app&rsquo;s real GUI container port and always writes <code>VIRTUAL_PORT</code> on the primary GUI service, even when you do not supply a domain. For multi-port apps it selects the public web UI port rather than a database, metrics, or internal API port. <code>VIRTUAL_HOST</code> is added when you supply a hostname or ask for routing.</p>
+        <p>When the official repository or website is known, OC Assist passes it to the registration helper with <code>--reference-url</code>. It prefers the upstream source repository, homepage, or documentation site and omits the link rather than inventing one.</p>
         <p>If OpenCode fails during startup, Dok shows the captured terminal error instead of opening an empty chat. Inside the terminal, <strong>Escape</strong> is sent to OpenCode (for its own dialogs); use the terminal&rsquo;s close button to end the session.</p>
         <h4>What the assistant is allowed to do</h4>
         <ul>
@@ -156,6 +158,7 @@
       title: 'App configuration modal',
       html: `
         <p>Every creation method opens the app configuration modal. The left side shows the generated compose file and the right side shows editable fields.</p>
+        <p><strong>Official repository or website</strong> stores a reference link for the app. Dok prefills it from the image, compose labels, project metadata, or git source when available. Use <strong>Open reference</strong> to check it and clear the field if the detected link is not the official source. The saved link appears in Apps and is preserved through library export and import.</p>
         <h4>Visual builder</h4>
         <ul>
           <li>Services, networks, named volumes, and top-level settings are editable as fields.</li>
@@ -189,6 +192,7 @@
           <li><strong>Export library</strong> creates a portable archive of selected apps. <strong>Import library</strong> adds apps from another Dok installation.</li>
         </ul>
         <p>Badges show <strong>needs setup</strong> for imported apps and <strong>library</strong> for apps that came from an exported library.</p>
+        <p>Apps with an official repository or website show an <strong>Official repository / website</strong> link for configuration reference. Edit or clear the link in the app&rsquo;s Deploy compose editor.</p>
         <p>To edit raw YAML instead of the builder fields, use <strong>Manually edit compose file</strong> inside the builder. Saving updates the base compose; saving and deploying applies it immediately. If a container name would be renamed, Dok asks for approval first.</p>
       `
     },
@@ -556,6 +560,7 @@
   const FIELD_LABEL = {
     appCfgCompose: 'Compose file',
     appCfgName: 'App title',
+    appCfgReferenceUrl: 'Official repository or website',
     appCfgNetwork: 'Network',
     editContent: 'File content',
     editPath: 'File path',
@@ -579,6 +584,7 @@
     runImage: 'Image to run in the quick-run helper.',
     runName: 'Required app title for the new app. It becomes the apps/<name> folder and the compose project name.',
     appCfgName: 'Required app title. It becomes the apps/<name> folder and the compose project name.',
+    appCfgReferenceUrl: 'Optional official repository, homepage, or documentation URL. Dok detects it from the image, compose labels, project metadata, or the git source when available. It is shown as a link in Apps for configuration reference.',
     appCfgCompose: 'Raw compose file. Editing here switches the modal to manual mode.',
     appCfgNetwork: 'Default network used by the compose preview when no service network is selected.',
     runCmd: 'Complete docker run command to convert into an app compose file.',

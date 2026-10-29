@@ -8,6 +8,15 @@ This file is managed by Dok. Every app created by OC Assist and every app added 
 - Save the app to the library in a complete, validated, ready-to-launch state, but stopped. Never leave containers running.
 - The user configures routing, ports, paths, and secrets in Dok's compose editor before the real deploy from Apps. Do not claim the app is running or reachable.
 - A test launch is allowed only to verify the app starts. Dok stops it again before reporting the result.
+- Record the app's official repository or website when one is available, so users can review upstream configuration and documentation from the Apps tab.
+
+## Official reference
+
+- If the user supplies a repository or project website, treat it as the primary reference and use it to identify the official upstream project.
+- Prefer the official source repository, homepage, or documentation site. Do not use a fork, mirror, unrelated tutorial, or random third-party page as the official reference.
+- Use upstream metadata such as `package.json`, `composer.json`, `pyproject.toml`, `Cargo.toml`, `Dockerfile` image labels, and the project README to confirm the official repository or website.
+- Pass the link to publishing with `--reference-url <url>`. Omit the flag when no reliable official link is available; never invent one.
+- The link is configuration guidance only. It does not replace the README, `.env.example`, and GUI-port documentation inside the app.
 
 ## Required layout
 
@@ -102,7 +111,7 @@ Apps must be portable between Dok installations.
 
 1. Create the app files under `apps/<app-name>/` using the required app title.
 2. Validate the compose file and resolve missing networks, paths, ports, and required environment values. Make the app functional and ready to launch once the user supplies installation-specific settings.
-3. Publish with the command in the OC Assist brief. Publishing saves the app to the library **stopped**.
+3. Publish with the command in the OC Assist brief, adding `--reference-url <url>` when the official repository or website is known. Publishing saves the app to the library **stopped**.
 4. `--test` is optional. It starts the app briefly so you can verify it, then the server stops it again and returns the container states. Never leave an app running.
 5. The user applies routing, ports, paths, and secrets in the Dok compose editor and deploys from the Apps tab. Do not claim the app is deployed or reachable yet.
 6. If publishing reports existing app data, explain that the app will reuse it; do not attempt to reset it.
@@ -118,4 +127,5 @@ Apps must be portable between Dok installations.
 - [ ] The primary GUI service sets `VIRTUAL_PORT` to the GUI container port, even when no domain was supplied.
 - [ ] Any `VIRTUAL_HOST` or `LETSENCRYPT_HOST` is literal and paired with the correct container-port `VIRTUAL_PORT`.
 - [ ] `.env.example` and README explain required values, the GUI port, and persistent paths.
+- [ ] The official repository or website is passed with `--reference-url` when one was found; no link is invented.
 - [ ] The compose file validates and the app can be configured through the Dok compose builder.

@@ -264,6 +264,8 @@ The unified way to deploy applications. Every app is stored in `apps/<name>/` wi
 
 Every creation method requires an app title; the API rejects creator requests without one. Apps are always saved to the library **stopped**; users configure and deploy them from the Apps tab.
 
+Every creation method also detects the app's official repository or website when one is available and prefills it into the compose editor. The link is stored as `referenceUrl` in `data/registry.json`, shown in Apps for configuration reference, and carried through library export/import.
+
 Created and saved composes always join the configured default Dok network (normally `wicked`, written as an external Compose `default` network). When nginx-proxy is installed, a routed app must carry `VIRTUAL_HOST` and the matching container-port `VIRTUAL_PORT` on the same service; Dok always adds `VIRTUAL_PORT` automatically (explicit form value, then an existing `VIRTUAL_PORT`, then the first published/`expose` container port, then `PORT`, then 80). Finalize resolves routing from the form quick fields **or** from a `VIRTUAL_HOST` already present in the compose (OC Assist, imported, pasted, or `docker run` env), so a host name is never saved without its port. Because nginx reaches the container over the shared network, published host `ports` are removed from the routed service so the app GUI is served through nginx and multiple apps can use the same container port without host conflicts. The routing service is also attached to the `default` Dok network even when it lists other networks.
 
 1. **OC Assist** (default tab) - Describe the app in a required prompt, optionally paste data (docker run, compose, repository/page URL) and upload files. WickedAFDok writes a private brief plus the uploads under `sources/oc-assist-<stamp>-<random>/`, starts a **User-mode** OpenCode session with the dedicated `assist` agent and the creator fields already in the first prompt, and immediately opens the chat in the terminal modal. The assist agent is restricted to app files, the OC Assist source/brief folders, and the registration helper; it creates the compose and registers the app through `server/assist-register.mjs`. Registration saves the app stopped; an optional `--test` performs a temporary launch that the server stops again. Use `#assistPrompt`, `#assistData`, `#assistName`, `#assistFiles`, `#assistFolder`, `#assistStartBtn`, `#assistOutput`, and the `#assistSessions`/`#assistSessionsList` running-session list with **Open chat** buttons. The start route waits briefly for OpenCode's first frame; if OpenCode exits during startup, the UI receives the captured terminal error instead of a blank session.
@@ -274,6 +276,7 @@ Created and saved composes always join the configured default Dok network (norma
 
 **App Configuration Modal:**
 - Opens with a visual Compose builder (`#appCfgBuilder`) populated from the managed compose via `/api/compose/parse`
+- **Official repository or website** (`#appCfgReferenceUrl`) is prefilled by the creator when a reliable link is found and can be edited or cleared; `#appCfgReferenceLink` opens the current value. It is saved with the app and shown in Apps; non-http(s) values are rejected.
 - Builder model shape: `{ services: [{ name, fields: [{ key, type, value, required? }] }], networks: [{ key, external, name, driver, extra? }], volumes: [...], other?: string }`
 - Services, networks, volumes, and top-level settings are editable as fields; `+ Add service`, `+ Add field`, `+ Add network`, and `+ Add volume` add fields, while `−` removes them
 - The service field type dropdown covers common Compose keys; unknown parsed keys appear as custom JSON fields. Advanced structures are preserved in raw/JSON fields (`depends_on` conditions, network aliases/options, long ports/volumes, multiline commands, `extra_hosts`, unknown top-level keys)
@@ -304,6 +307,7 @@ Created and saved composes always join the configured default Dok network (norma
 - Lists all apps from `data/registry.json`
 - Each app managed from `apps/<name>/` via docker compose
 - Actions: **Deploy** (opens the visual compose builder for the app's base config), **Stop**, **Browse** (when source exists), and **Remove**. Deploy is the only way to start or redeploy an app. Imported apps show **Configure & Deploy** instead of **Deploy**.
+- Apps with a saved `referenceUrl` show an **Official repository / website** link under the app summary.
 - Deploy saves the edited compose as the new base `docker-compose.yml` (or the app's existing compose filename), removes the generated `docker-compose.wickedafdok.yml` override, re-adds the `wicked` default network and prior `VIRTUAL_HOST`/`VIRTUAL_PORT` when needed, and can save only or save and deploy. When nginx-proxy is installed it also re-applies the routing policy: the routed service joins the default network, `VIRTUAL_PORT` is filled from the container port when missing, and published host ports are removed. It loads the visual builder from `/api/apps/:id/compose`; the response surfaces the saved routing env from the generated override in the editable base compose and includes parsed network/vhost data and issues, but missing networks/volumes are reported as guidance because this route edits the base compose directly.
 - Deploy resolves duplicate `container_name` conflicts by renaming the stale non-core container to `<name>-previous-<shortid>`; conflicts with protected core services abort with `409`. Before renaming, the API returns `409 needsAmendApproval` with an `amendments` list, and the UI shows `#amendApprovalModal` so the user can review every affected instance (including `this app` vs `other instance`) and approve or cancel. Approval resubmits with `confirmAmend: true`.
 - A first start that reports failure while project containers already exist is returned as `launchPending` instead of a failure so slow builds are not misreported
@@ -314,6 +318,7 @@ Created and saved composes always join the configured default Dok network (norma
 - `POST /api/library/export` accepts `{ apps: [ids], name }` and returns a `.tar.gz` attachment. Apps are stripped of installation-specific data: `container_name`, `VIRTUAL_HOST`/`VIRTUAL_PORT`/`ENABLE_AUTH`/`LETSENCRYPT_*`, published host ports, absolute bind sources (except `/var/run/docker.sock`, `/etc/localtime`, `/etc/timezone`), top-level `name`, external network names (except the shared `wicked` network), external/name fields on named volumes, generated `docker-compose.wickedafdok.yml`, `.env*` (except `.env.example`), `.git`, `node_modules`, and the app's root `data` directory. Requirements metadata is sanitized the same way.
 - `POST /api/library/import` accepts the archive (multipart `file`), validates the manifest, and imports into `apps/<name>`. Existing non-empty apps return `409` with `needsOverwrite`; overwriting preserves the existing root `data` directory and `.env*` files and reports the reused paths through `reuseData`/`message`. Imported apps are registered with `needsConfig: true` and library metadata; the Apps UI shows **Configure & Deploy**, which opens the visual compose editor so the user can supply local domains, ports, paths, and secrets.
 - `POST /api/library/import-repo` clones a git repository (`repo`, optional `branch`, `path`, `name`, `description`, `overwrite`) and reuses the same importer. A repository with `dok-library.json` imports its apps; one with only a compose file or Dockerfile becomes a single app. Conflicts return `409 needsOverwrite`. Shared helpers: `libraryManifestFromDirectory()`, `importLibraryTree()`, `synthesizeLibraryFromRepository()`.
+- `referenceUrl` is written into `dok-library.json` and restored on import. Importing a repository uses the cloned repository URL as the default reference for apps that do not carry their own link.
 - UI: `#libraryExportBtn`, `#libraryImportFile`, `#libraryImportRepoBtn`, `#libraryRepoModal`, `#libraryRepoUrl`, `#libraryRepoBranch`, `#libraryRepoPath`, `#libraryRepoName`, `#libraryRepoDo`, `#libraryExportModal`, `#libraryExportList`, `#libraryExportDo`.
 
 ### Projects / Sources
@@ -501,8 +506,9 @@ The **Core Services** subtab manages installed bundled services. Installation no
 - `POST /api/launch/git` - Clone git repo and process (required `name` app title)
 - `POST /api/launch/upload` - Upload files and process (required `name` app title)
 - `POST /api/launch/source` - Deploy from sources directory (required `name` app title)
+- Creator routes return the detected `referenceUrl` for the compose editor when an official repository or website is found.
 - `POST /api/assist/start` - Upload optional files, write the OC Assist brief, and start a User-mode `assist` OpenCode session (required `prompt` and `name` app title, optional `data`, `files`, `paths`)
-- `POST /api/launch/finalize` - Complete creation (required app title; save to apps dir, update registry, optional test launch that is always stopped again); a per-app lock returns `409 alreadyFinalizing` and failures after the registry write return `created: true`
+- `POST /api/launch/finalize` - Complete creation (required app title; save to apps dir, update registry, optional test launch that is always stopped again); accepts `referenceUrl` and otherwise detects it; a per-app lock returns `409 alreadyFinalizing` and failures after the registry write return `created: true`
 - `POST /api/compose/validate` - Validate compose file content
 - `POST /api/compose/parse` - Parse a compose file into editable builder fields
 - `POST /api/compose/build` - Generate compose from builder fields and return field-level issues
@@ -572,8 +578,8 @@ The **Core Services** subtab manages installed bundled services. Installation no
 - `GET /api/registry` - List apps in registry
 - `POST /api/registry/:id/deploy` - Legacy one-click compose up (the UI now deploys through the compose editor); resolves duplicate container names
 - `POST /api/registry/:id/:action(start|stop|restart)` - App compose lifecycle actions
-- `GET /api/apps/:id/compose` - Read the app's base compose file (with saved routing env surfaced) plus network/vhost analysis and issues
-- `POST /api/apps/:id/compose` - Save an edited compose as the new base (`deploy: true` re-deploys; `force: true` saves despite validation issues; `confirmAmend: true` approves container renames)
+- `GET /api/apps/:id/compose` - Read the app's base compose file (with saved routing env surfaced) plus network/vhost analysis, `referenceUrl`, and issues
+- `POST /api/apps/:id/compose` - Save an edited compose as the new base (`deploy: true` re-deploys; `force: true` saves despite validation issues; `confirmAmend: true` approves container renames; `referenceUrl` updates or clears the saved link)
 - `DELETE /api/registry/:id` - Remove from registry
 
 ### App Library
@@ -618,6 +624,12 @@ The **Core Services** subtab manages installed bundled services. Installation no
 7. Every new app preview is staged in a hidden `apps/.preview-<name>-.../` directory, including when `apps/<name>/` does not exist yet, and is copied to the target only on finalize. This prevents finalize from mistaking its own preview for an existing app. Stale previews older than 24 hours are cleaned up. Finalizing into a non-empty existing app name returns `409` with `needsOverwrite`/`appName`; the UI asks for confirmation and resubmits with `overwrite: true`.
 8. `finalizeLocks` (keyed by sanitized app name) rejects concurrent finalizes with `409 alreadyFinalizing`, and the lock is released in `finally` after the handler completes rather than when the client socket closes. Once the registry entry is written, later failures return `created: true` with the app name, so the UI closes and refreshes instead of prompting a duplicate install.
 9. App persistent data is never removed or overwritten. Finalize and library import skip app-root `data/` and `.env*` when copying over an existing app, and app backup restore preserves them. Responses include `reuseData`/`dataNotice` when the new app will connect to existing data; the overwrite prompt lists the preserved data paths. Fresh data requires a new app name or data location, or manual deletion by the user.
+
+### App Reference Links
+- `detectAppReferenceUrl()` runs in every creator route and in finalize. It prefers project metadata (`package.json`, `composer.json`, `pyproject.toml`, `Cargo.toml`), README website/repository lines, compose and Dockerfile image labels (`org.opencontainers.image.source|url|documentation`, `org.label-schema.vcs-url|url`), labels on locally available images, and finally the git clone URL.
+- `sanitizeAppReferenceUrl()` converts common git/SSH/scp forms to https, strips a trailing `.git`, and accepts only normal http(s) URLs without credentials or a fragment. Invalid values are rejected on finalize and on app compose save; an explicitly empty value clears the saved link.
+- The detected or user-edited value is saved as `referenceUrl` in `data/registry.json`, returned by `GET /api/apps/:id/compose`, rendered as the Apps **Official repository / website** link, and written to library manifests.
+- OC Assist passes a reliable official link with `server/assist-register.mjs --reference-url <url>` and is instructed to omit it rather than invent one.
 
 ### Defaults and App Data
 - `defaultsDefaults()` owns `settings.defaults`; `configuredDefaults()` normalizes it, `defaultsForClient()` redacts the admin password as `adminPasswordSet`, and `defaultsPatch()` validates/saves input. `POST /api/settings/defaults` also applies the data location and syncs Authelia vhosts when Dok protection is enabled.
@@ -753,7 +765,7 @@ The **Core Services** subtab manages installed bundled services. Installation no
 - Terminal Modal: `#terminalModal`, `#terminalContainer`, `#terminalStopBtn`, `#terminalStatus`, `#terminalSessionLabel`
 - OpenCode Card: `#coreOpencodeCard`, `#opencodeStatus`, `#opencodeSessions`, `#opencodeStopBtn`, `#opencodeModel`, `#opencodeProvider`, `#opencodeApiKey`, `#opencodeSaveSettings`
 - App Creation: `#runCreateBtn`, `#composeCreateBtn`, `#gitCloneBtn`, `#uploadBtn`, OC Assist (`#assistPrompt`, `#assistData`, `#assistName`, `#assistFiles`, `#assistFolder`, `#assistStartBtn`, `#assistOutput`, `#assistSessions`, `#assistSessionsList`)
-- App Config Modal: `#appConfigModal`, `#appCfgBuilder`, `#appCfgCompose`, `#appCfgEditCompose`, `#appCfgValidate`, `#appCfgComplete`, `#appCfgCompleteRun`, `#appCfgProgress`
+- App Config Modal: `#appConfigModal`, `#appCfgBuilder`, `#appCfgCompose`, `#appCfgEditCompose`, `#appCfgValidate`, `#appCfgReferenceUrl`, `#appCfgReferenceLink`, `#appCfgComplete`, `#appCfgCompleteRun`, `#appCfgProgress`
 - Notices: `#appCfgNetworkNotice`, `#appCfgVolumeNotice`, `#appCreationNginxNotice`, `#appCreationNginxNoticeModal`
 - Modals: `#composeEditWarningModal`, `#composeSaveConfirmModal`, `#appOverwriteModal`, `#amendApprovalModal`, `#libraryExportModal`, `#manualModal`, `#authContainersModal`, `#autheliaUsersModal`, `#designerModal`
 - Apps List: `#appsList`, `#appsRefresh`, `#libraryExportBtn`, `#libraryImportFile`, `#libraryExportList`, `#libraryExportDo`
@@ -819,5 +831,16 @@ The **Core Services** subtab manages installed bundled services. Installation no
 - Highlight conflicts and invalid values in red, including duplicate service/container names, duplicate published ports, invalid ports, and invalid JSON.
 - Regenerate the compose from the field model for every change and validate server-side.
 - Remove the old quick port/domain fields above the raw compose; derive finalize ports and `VIRTUAL_HOST`/`VIRTUAL_PORT` from the builder model.
+- Show the **Official repository or website** field above the builder, keep its **Open reference** link in sync as it is edited, and save or clear the value with the app.
 - With nginx-proxy installed, the routed service must use `VIRTUAL_HOST` + `VIRTUAL_PORT` and no published host ports; keep the service on the Dok default network.
 - Open the builder with the generated compose, let the user approve or adjust it, then save to the app library with one-click deploy/redeploy.
+
+
+
+##-------------------------------------Tasks-----------------------------------
+
+# Do these tasks 1 at a time and focus on the single task at hand. Do a task, push to github, Update AGENTS.md and remove the task, inform the user that you are ready to start the next task.
+
+- App Creator methods should examine any given repository links for information on configuration to create the best possible compose file
+
+- App Library: Add an option to deploy without saving. That way it will keep the base config.

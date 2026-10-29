@@ -6486,6 +6486,171 @@ function findComposeFile(dir) {
   return composeFiles.map(f => path.join(dir, f)).find(f => fs.existsSync(f)) || null;
 }
 
+const APP_REFERENCE_MAX_URL = 500;
+const APP_REFERENCE_LABELS = [
+  'org.opencontainers.image.source',
+  'org.opencontainers.image.url',
+  'org.opencontainers.image.documentation',
+  'org.label-schema.vcs-url',
+  'org.label-schema.url'
+];
+
+// App metadata only needs a single official repository or website link. Keep
+// it to normal web URLs so the Apps tab never renders an unsafe scheme and the
+// value cannot grow into a large blob in registry.json.
+function sanitizeAppReferenceUrl(value) {
+  let raw = String(value ?? '').trim().replace(/^git\+/i, '');
+  if (!raw || raw.length > APP_REFERENCE_MAX_URL * 2) return '';
+  const scp = raw.match(/^(?:git@|ssh:\/\/git@)([^:/]+)[:/](.+)$/i);
+  if (scp) {
+    raw = `https://${scp[1]}/${scp[2]}`;
+  } else if (/^(?:github|gitlab|bitbucket):/i.test(raw)) {
+    const [provider, ...rest] = raw.split(':');
+    raw = `https://${provider.toLowerCase()}.com/${rest.join(':')}`;
+  } else if (/^git:\/\//i.test(raw)) {
+    raw = raw.replace(/^git:\/\//i, 'https://');
+  } else if (/^ssh:\/\//i.test(raw)) {
+    try {
+      const parsed = new URL(raw);
+      raw = `https://${parsed.hostname}${parsed.pathname}`;
+    } catch {
+      return '';
+    }
+  }
+  raw = raw.replace(/\.git$/i, '');
+  try {
+    const url = new URL(raw);
+    if (!['http:', 'https:'].includes(url.protocol)) return '';
+    if (!url.hostname || url.username || url.password) return '';
+    if (url.href.length > APP_REFERENCE_MAX_URL) return '';
+    return url.href;
+  } catch {
+    return '';
+  }
+}
+
+function referenceUrlFromGitUrl(repo) {
+  return sanitizeAppReferenceUrl(repo);
+}
+
+function referenceUrlFromMetadataText(text) {
+  const source = String(text || '');
+  for (const label of APP_REFERENCE_LABELS) {
+    const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const match = source.match(new RegExp(`${escaped}\\s*[:=]\\s*["']?([^\\s"'#\\\\]+)`, 'i'));
+    if (match) {
+      const url = sanitizeAppReferenceUrl(match[1]);
+      if (url) return url;
+    }
+  }
+  return '';
+}
+
+function referenceUrlFromPackageData(data) {
+  if (!data || typeof data !== 'object') return '';
+  const candidates = [];
+  if (typeof data.repository === 'string') candidates.push(data.repository);
+  else if (data.repository && typeof data.repository === 'object') candidates.push(data.repository.url);
+  if (data.homepage) candidates.push(data.homepage);
+  for (const candidate of candidates) {
+    const url = sanitizeAppReferenceUrl(candidate);
+    if (url) return url;
+  }
+  return '';
+}
+
+function referenceUrlFromProjectFiles(dir) {
+  const read = (name, limit = 1024 * 1024) => {
+    try {
+      const file = path.join(dir, name);
+      if (!fs.existsSync(file) || fs.statSync(file).size > limit) return '';
+      return fs.readFileSync(file, 'utf-8');
+    } catch {
+      return '';
+    }
+  };
+  for (const name of ['package.json', 'composer.json']) {
+    const text = read(name);
+    if (!text) continue;
+    try {
+      const url = referenceUrlFromPackageData(JSON.parse(text));
+      if (url) return url;
+    } catch {}
+  }
+  const pyproject = read('pyproject.toml');
+  if (pyproject) {
+    for (const key of ['Homepage', 'Repository', 'Source', 'Documentation', 'Website']) {
+      const match = pyproject.match(new RegExp(`^\\s*${key}\\s*=\\s*["']([^"']+)["']`, 'im'));
+      const url = match ? sanitizeAppReferenceUrl(match[1]) : '';
+      if (url) return url;
+    }
+  }
+  const cargo = read('Cargo.toml');
+  if (cargo) {
+    const section = cargo.match(/\[package\]([\s\S]*?)(?=\n\[|$)/);
+    if (section) {
+      for (const key of ['repository', 'homepage']) {
+        const match = section[1].match(new RegExp(`^\\s*${key}\\s*=\\s*["']([^"']+)["']`, 'im'));
+        const url = match ? sanitizeAppReferenceUrl(match[1]) : '';
+        if (url) return url;
+      }
+    }
+  }
+  for (const name of ['README.md', 'README.markdown', 'README.rst', 'README.txt']) {
+    const text = read(name);
+    if (!text) continue;
+    for (const line of text.split(/\r?\n/)) {
+      if (!/^\s*(?:[-*]\s*)?(?:\*\*)?(?:official\s+)?(?:website|site|homepage|source(?:\s+code)?|repository|documentation|docs)(?:\*\*)?\s*[:|-]\s*/i.test(line)) continue;
+      const match = line.match(/https?:\/\/[^\s)>\]]+/i);
+      if (!match) continue;
+      const url = sanitizeAppReferenceUrl(match[0]);
+      if (url && !/(?:img\.shields\.io|badge|github\.com\/[^/]+\/[^/]+\/actions|discord\.(?:gg|com))/i.test(url)) return url;
+    }
+  }
+  for (const name of ['Dockerfile', 'Containerfile']) {
+    const text = read(name);
+    if (!text) continue;
+    const url = referenceUrlFromMetadataText(text);
+    if (url) return url;
+  }
+  return '';
+}
+
+function composeImageReferences(compose) {
+  const images = [];
+  for (const match of String(compose || '').matchAll(/^\s*image:\s*["']?([^"'#\s]+)/gm)) {
+    const image = match[1];
+    if (image && image !== 'scratch' && !images.includes(image)) images.push(image);
+  }
+  return images.slice(0, 5);
+}
+
+async function referenceUrlFromImages(images) {
+  for (const image of images) {
+    try {
+      const info = await docker.getImage(image).inspect();
+      const labels = info?.Config?.Labels || {};
+      for (const label of APP_REFERENCE_LABELS) {
+        const url = sanitizeAppReferenceUrl(labels[label]);
+        if (url) return url;
+      }
+    } catch {}
+  }
+  return '';
+}
+
+async function detectAppReferenceUrl({ dirs = [], compose = '', fallbackUrl = '' } = {}) {
+  for (const dir of [...new Set(dirs.filter(Boolean))]) {
+    const url = referenceUrlFromProjectFiles(dir);
+    if (url) return url;
+  }
+  const metadataUrl = referenceUrlFromMetadataText(compose);
+  if (metadataUrl) return metadataUrl;
+  const imageUrl = await referenceUrlFromImages(composeImageReferences(compose));
+  if (imageUrl) return imageUrl;
+  return sanitizeAppReferenceUrl(fallbackUrl);
+}
+
 function appDirFor(entry) {
   const name = projectName(entry?.name, 'app');
   if (entry?.appDir && isInsideApps(entry.appDir)) return entry.appDir;
@@ -7073,6 +7238,7 @@ app.post('/api/launch/run', async (req, res) => {
       projectDir: appDir,
       networkNames: networkNamesForAnalysis(networkNames)
     });
+    const referenceUrl = await detectAppReferenceUrl({ dirs: [appDir], compose: conv.compose });
     res.json({
       ok: true,
       needsConfig: true,
@@ -7080,6 +7246,7 @@ app.post('/api/launch/run', async (req, res) => {
       appName,
       appDir,
       command,
+      referenceUrl,
       compose: conv.compose,
       generatedCompose: conv.compose,
       ports: conv.ports.join(','),
@@ -7115,6 +7282,7 @@ app.post('/api/launch/compose', async (req, res) => {
       projectDir: appDir,
       networkNames: networkNamesForAnalysis(networkNames)
     });
+    const referenceUrl = await detectAppReferenceUrl({ dirs: [appDir], compose: launchCompose });
     res.json({
       ok: true,
       needsConfig: true,
@@ -7122,6 +7290,7 @@ app.post('/api/launch/compose', async (req, res) => {
       appName: proj,
       appDir,
       fileName: 'docker-compose.yml',
+      referenceUrl,
       yaml: launchCompose,
       compose: launchCompose,
       generatedCompose: launchCompose,
@@ -7201,6 +7370,11 @@ app.post('/api/launch/git', async (req, res) => {
       projectDir: appDir,
       networkNames: networkNamesForAnalysis(networkNames)
     });
+    const referenceUrl = await detectAppReferenceUrl({
+      dirs: [dir, appDir],
+      compose: launchCompose,
+      fallbackUrl: referenceUrlFromGitUrl(repo)
+    });
     res.json({
       ok: true,
       needsConfig: true,
@@ -7210,6 +7384,7 @@ app.post('/api/launch/git', async (req, res) => {
       type: 'git',
       sourcePath: dir,
       sourceRel: proj,
+      referenceUrl,
       compose: launchCompose,
       generatedCompose: launchCompose,
       ports: launchCompose ? composePortsFromText(launchCompose).join(',') : '',
@@ -7356,6 +7531,7 @@ app.post('/api/launch/upload', upload.array('files', 200), async (req, res) => {
       projectDir: appDir,
       networkNames: networkNamesForAnalysis(networkNames)
     });
+    const referenceUrl = await detectAppReferenceUrl({ dirs: [dir, appDir], compose: launchCompose });
     res.json({
       ok: true,
       needsConfig: true,
@@ -7366,6 +7542,7 @@ app.post('/api/launch/upload', upload.array('files', 200), async (req, res) => {
       sourcePath: dir,
       sourceRel: proj,
       count: movedFiles.length,
+      referenceUrl,
       compose: launchCompose,
       generatedCompose: launchCompose,
       ports: launchCompose ? composePortsFromText(launchCompose).join(',') : '',
@@ -7441,6 +7618,7 @@ app.post('/api/launch/source', async (req, res) => {
       projectDir: appDir,
       networkNames: networkNamesForAnalysis(networkNames)
     });
+    const referenceUrl = await detectAppReferenceUrl({ dirs: [dir, appDir], compose });
 
     res.json({
       ok: true,
@@ -7452,6 +7630,7 @@ app.post('/api/launch/source', async (req, res) => {
       mode,
       sourcePath: dir,
       sourceRel: path.relative(fs.realpathSync(sourcesDir), dir),
+      referenceUrl,
       compose,
       generatedCompose: compose,
       ports: ports || (compose ? composePortsFromText(compose).join(',') : ''),
@@ -7560,6 +7739,7 @@ app.post('/api/assist/start', upload.array('files', 100), async (req, res) => {
       '- Include docker-compose.yml, a README, and .env.example when the app needs configuration. Keep user data under relative ./data paths and never reset it.',
       '- Use the publish command without --test to save it. Use --test only to verify that the app starts; the server stops it again before returning.',
       '- Always set VIRTUAL_PORT on the primary GUI service to the app\'s actual GUI container port, even when no domain was supplied. Inspect any repository/reference URL, README, compose files, Dockerfile EXPOSE lines, image docs, and default config to find the real port; for multi-port apps use the public web UI port, not a database, queue, metrics, or internal API port. Do not rely on Dok to infer it.',
+      '- Identify the app\'s official repository or website from the user\'s reference data or upstream project metadata and pass it with --reference-url when publishing. Prefer the official source repository, homepage, or documentation site; omit the flag instead of inventing a link.',
       '- The user configures routing, paths, and secrets in the Dok compose editor before the real deploy from Apps. Dok can add VIRTUAL_HOST, ENABLE_AUTH, and certificate fields from the installed core services, so keep those installation-specific values portable unless the user supplied them.',
       '',
       '## Default admin account',
@@ -7606,6 +7786,7 @@ app.post('/api/assist/start', upload.array('files', 100), async (req, res) => {
       'Publishing saves the app stopped. If you need to verify it starts, rerun the command with --test; the server stops the app again and reports the container states. Never leave the app running.',
       'If publishing fails, read the error, fix the compose, and retry once.',
       'Always set VIRTUAL_PORT on the primary GUI service to the app GUI container port, even when the user did not supply a domain. Read any repository/reference link, README, compose files, Dockerfile EXPOSE lines, image docs, and default config to determine the port; for multi-port apps choose the public web UI port, not a database, queue, metrics, or internal API port. Do not guess and do not rely on Dok to infer it.',
+      'Find the app\'s official repository or website from the supplied reference or upstream metadata. Prefer the official source repository, homepage, or documentation site. Add --reference-url <url> to the publish command when it is reliable; omit it rather than inventing a link.',
       'If the user supplied a domain, also set VIRTUAL_HOST on that same service (and LETSENCRYPT_HOST when requested), or pass --vhost and --vhost-port to the publish command.',
       'Use --network only when the app must join a specific existing Docker network.',
       'If the publish response asks for amendment approval (needsAmendApproval), summarize the listed containers and changes to the user and wait for approval before rerunning with --confirm-amend.',
@@ -8103,6 +8284,18 @@ app.post('/api/launch/finalize', async (req, res) => {
     const finalVhostPort = analysis?.vhostPort || (finalVhost
       ? composeVhostPortForService(finalCompose, finalRouting.service || targetService, cleanVhostPort, settingsVhostPort)
       : '');
+    const referenceFieldProvided = Object.prototype.hasOwnProperty.call(body, 'referenceUrl');
+    const requestedReferenceUrl = String(body.referenceUrl ?? '').trim();
+    const normalizedReferenceUrl = sanitizeAppReferenceUrl(requestedReferenceUrl);
+    if (referenceFieldProvided && requestedReferenceUrl && !normalizedReferenceUrl) {
+      throw httpError(400, 'The app reference must be an http(s) repository or website URL');
+    }
+    const detectedReferenceUrl = referenceFieldProvided
+      ? normalizedReferenceUrl
+      : await detectAppReferenceUrl({ dirs: [targetDir], compose: finalCompose });
+    const referencePatch = referenceFieldProvided || detectedReferenceUrl
+      ? { referenceUrl: detectedReferenceUrl }
+      : {};
 
     addRegistryEntry({
       type: type || 'compose',
@@ -8115,6 +8308,7 @@ app.post('/api/launch/finalize', async (req, res) => {
       composeFile: 'docker-compose.yml',
       command: command || '',
       dataPath: appDataPath,
+      ...referencePatch,
       launch: {
         mode: type === 'run' ? 'compose' : mode,
         name,
@@ -8609,6 +8803,7 @@ function libraryManifestApp(entry, appDir) {
   return {
     name: projectName(entry.name, 'app'),
     description: String(entry.description || '').slice(0, 500),
+    referenceUrl: sanitizeAppReferenceUrl(entry.referenceUrl),
     composeFile: composeRel,
     files,
     requirements: sanitized.requirements,
@@ -8645,6 +8840,7 @@ app.post('/api/library/export', async (req, res) => {
       apps.push({
         name: manifestApp.name,
         description: manifestApp.description,
+        referenceUrl: manifestApp.referenceUrl,
         composeFile: manifestApp.composeFile,
         files: manifestApp.files,
         requirements: manifestApp.requirements
@@ -8716,7 +8912,7 @@ function copyDirectoryTree(source, dest, { skipTop = [] } = {}) {
 
 // Builds a library tree from a repository that has a compose file or
 // Dockerfile but no dok-library.json. The repository becomes a single app.
-function synthesizeLibraryFromRepository(repoDir, { name = '', description = '' } = {}) {
+function synthesizeLibraryFromRepository(repoDir, { name = '', description = '', referenceUrl = '' } = {}) {
   const repoBase = path.basename(String(repoDir).replace(/[/\\]+$/, ''));
   const appName = projectName(name || repoBase, `repo-${Date.now()}`);
   const composeFile = findComposeFile(repoDir);
@@ -8744,6 +8940,7 @@ function synthesizeLibraryFromRepository(repoDir, { name = '', description = '' 
     apps: [{
       name: appName,
       description: String(description || '').slice(0, 500),
+      referenceUrl: sanitizeAppReferenceUrl(referenceUrl),
       composeFile: composeRel,
       files: libraryFiles(appDir),
       requirements: {}
@@ -8752,7 +8949,7 @@ function synthesizeLibraryFromRepository(repoDir, { name = '', description = '' 
   return { root, manifest, appsRoot: path.join(root, 'apps') };
 }
 
-async function importLibraryTree({ manifest, appsRoot, overwrite = false }) {
+async function importLibraryTree({ manifest, appsRoot, overwrite = false, defaultReferenceUrl = '' }) {
   const entries = [];
   for (const app of manifest.apps) {
     const name = String(app?.name || '').trim();
@@ -8791,6 +8988,7 @@ async function importLibraryTree({ manifest, appsRoot, overwrite = false }) {
       occupied,
       existingData: [...new Set(existingData)],
       description: String(app.description || '').slice(0, 500),
+      referenceUrl: sanitizeAppReferenceUrl(app.referenceUrl) || sanitizeAppReferenceUrl(defaultReferenceUrl),
       requirements: app.requirements && typeof app.requirements === 'object' ? app.requirements : sanitized.requirements
     });
   }
@@ -8831,6 +9029,7 @@ async function importLibraryTree({ manifest, appsRoot, overwrite = false }) {
       dataPath: '',
       needsConfig: true,
       description: entry.description,
+      referenceUrl: entry.referenceUrl,
       library: {
         schema: manifest.schema,
         name: String(manifest.name || ''),
@@ -8925,14 +9124,20 @@ app.post('/api/library/import-repo', async (req, res) => {
     if (branch) args.push('--branch', branch);
     args.push(repo, repoDir);
     await run('git', args, { env: gitEnvironment(repo) });
+    const repositoryReference = referenceUrlFromGitUrl(repo);
     let loaded = libraryManifestFromDirectory(repoDir, subdir);
     if (!loaded) {
       loaded = synthesizeLibraryFromRepository(repoDir, {
         name: body.name || '',
-        description: body.description || ''
+        description: body.description || '',
+        referenceUrl: repositoryReference
       });
     }
-    const result = await importLibraryTree({ ...loaded, overwrite });
+    const result = await importLibraryTree({
+      ...loaded,
+      overwrite,
+      defaultReferenceUrl: repositoryReference
+    });
     if (loaded.root) { try { fs.rmSync(loaded.root, { recursive: true, force: true }); } catch {} }
     res.json({ ...result, source: 'repository', repo });
   } catch (e) {
@@ -9038,6 +9243,7 @@ app.get('/api/apps/:id/compose', async (req, res) => {
       composeFile,
       compose,
       network: entry.launch?.network || '',
+      referenceUrl: sanitizeAppReferenceUrl(entry.referenceUrl),
       vhost: analysis?.vhost || entry.launch?.vhost || '',
       vhostPort: analysis?.vhostPort || entry.launch?.vhostPort || '',
       vhostService: analysis?.vhostService || '',
@@ -9061,6 +9267,12 @@ app.post('/api/apps/:id/compose', async (req, res) => {
     const deploy = req.body?.deploy === true;
     const force = req.body?.force === true;
     const vhostTouched = req.body?.vhostTouched === true;
+    const referenceFieldProvided = Object.prototype.hasOwnProperty.call(req.body || {}, 'referenceUrl');
+    const requestedReferenceUrl = String(req.body?.referenceUrl ?? '').trim();
+    const normalizedReferenceUrl = sanitizeAppReferenceUrl(requestedReferenceUrl);
+    if (referenceFieldProvided && requestedReferenceUrl && !normalizedReferenceUrl) {
+      throw httpError(400, 'The app reference must be an http(s) repository or website URL');
+    }
     const existingComposePath = findComposeFile(appDir);
     let compose = normalizeEditedAppCompose(entry, req.body?.compose || '', { vhostTouched });
     if (!compose.trim()) return res.status(400).json({ error: 'Compose file is empty' });
@@ -9114,6 +9326,7 @@ app.post('/api/apps/:id/compose', async (req, res) => {
       if (current) {
         current.needsConfig = false;
         current.composeFile = path.relative(appDir, composePath) || 'docker-compose.yml';
+        if (referenceFieldProvided) current.referenceUrl = normalizedReferenceUrl;
         current.launch = current.launch || {};
         let analyzed = false;
         try {

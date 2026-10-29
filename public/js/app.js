@@ -1864,6 +1864,24 @@ function updateAppCfgRequired() {
   else name.removeAttribute('title');
 }
 
+function syncAppCfgReferenceLink() {
+  const input = qs('#appCfgReferenceUrl');
+  const link = qs('#appCfgReferenceLink');
+  if (!input || !link) return;
+  let href = '';
+  try {
+    const url = new URL(input.value.trim());
+    if (['http:', 'https:'].includes(url.protocol)) href = url.href;
+  } catch {}
+  link.classList.toggle('hidden', !href);
+  if (href) link.href = href;
+  else link.removeAttribute('href');
+}
+
+if (qs('#appCfgReferenceUrl')) {
+  qs('#appCfgReferenceUrl').addEventListener('input', syncAppCfgReferenceLink);
+}
+
 function openAppConfig(data) {
   const initialCompose = data.compose || data.yaml || data.generatedCompose || '';
   pendingAppConfig = {
@@ -1877,6 +1895,8 @@ function openAppConfig(data) {
   };
   pendingSaveAction = null;
   qs('#appCfgName').value = data.appName || '';
+  if (qs('#appCfgReferenceUrl')) qs('#appCfgReferenceUrl').value = data.referenceUrl || '';
+  syncAppCfgReferenceLink();
   qs('#appCfgNetwork').value = data.network || installDefaults.defaultNetwork || 'wicked';
   const notices = [];
   if (Array.isArray(data.unsupported) && data.unsupported.length) {
@@ -2078,6 +2098,7 @@ async function doAppComplete(deployNow = false, force = false, overwrite = false
     try {
       const res = await api(`/api/apps/${encodeURIComponent(data.editAppId)}/compose`, jsonBody({
         compose,
+        referenceUrl: qs('#appCfgReferenceUrl')?.value.trim() || '',
         deploy: deployNow,
         force,
         confirmAmend,
@@ -2143,6 +2164,7 @@ async function doAppComplete(deployNow = false, force = false, overwrite = false
   const payload = {
     ...data,
     appName: qs('#appCfgName').value.trim() || data.appName,
+    referenceUrl: qs('#appCfgReferenceUrl')?.value.trim() || '',
     network,
     ports: quick.ports,
     vhost,
@@ -2719,6 +2741,7 @@ async function loadRegistry() {
             <div>
               <div class="item-title">${escapeHtml(entry.name)} ${badge(typeLabels[entry.type] || entry.type, 'type')} ${entry.needsConfig ? badge('needs setup', 'type') : (entry.library ? badge('library', 'type') : '')}</div>
               <div class="item-sub mono">${escapeHtml(detail)}</div>
+              ${entry.referenceUrl ? `<div class="item-sub"><a href="${escapeHtml(entry.referenceUrl)}" target="_blank" rel="noopener noreferrer">Official repository / website ↗</a></div>` : ''}
               <div class="item-sub">${meta ? escapeHtml(meta) + ' · ' : ''}${entry.needsConfig ? 'Configure before deploying · ' : ''}Saved ${entry.created ? new Date(entry.created).toLocaleString() : 'unknown'}</div>
             </div>
             <div class="item-actions">
@@ -2768,6 +2791,7 @@ async function loadRegistry() {
                 appDir: res.appDir,
                 compose: res.compose,
                 editAppId: entry.id,
+                referenceUrl: res.referenceUrl || entry.referenceUrl || '',
                 network: res.network || entry.launch?.network || 'wicked',
                 vhost: res.vhost || entry.launch?.vhost || '',
                 vhostPort: res.vhostPort || entry.launch?.vhostPort || '',

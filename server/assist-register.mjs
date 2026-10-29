@@ -15,7 +15,7 @@ const option = (name, fallback = '') => {
 
 const name = String(option('--name') || '').trim();
 if (!name || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) {
-  console.error('Usage: node /app/server/assist-register.mjs --name <app> [--dir /app/apps/<app>] [--compose <file>] [--test] [--confirm-amend] [--vhost <host>] [--vhost-port <port>] [--network <name>]');
+  console.error('Usage: node /app/server/assist-register.mjs --name <app> [--dir /app/apps/<app>] [--compose <file>] [--test] [--confirm-amend] [--vhost <host>] [--vhost-port <port>] [--network <name>] [--reference-url <url>]');
   process.exit(2);
 }
 
@@ -48,6 +48,8 @@ const payload = {
   ports: option('--ports'),
   vhostTouched: !!option('--vhost')
 };
+const referenceUrl = option('--reference-url');
+if (referenceUrl) payload.referenceUrl = referenceUrl;
 
 const port = process.env.WICKEDAFDOK_PORT || process.env.PORT || '8080';
 const response = await fetch(`http://127.0.0.1:${port}/api/launch/finalize`, {
