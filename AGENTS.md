@@ -438,14 +438,14 @@ The **Core Services** subtab manages installed bundled services. Installation no
 - Socket/token stored in `data/host-helper`; compose stored in `core/host-helper/docker-compose.yml`. Dok starts Maintenance on demand when a host directory must be created.
 
 **OpenCode (on demand, not a compose service):**
-- AI coding agent available from the dashboard **OpenCode** and **Terminal** buttons or the Settings → Core Services card
-- Unlike the other core services it is not a container in `core/` and is excluded from Start all/Stop all; each launch starts a PTY inside the WickedAFDok container and closing the terminal stops it
-- **Admin mode:** only available inside the Dok Maintenance container (cwd `/dok`, full host/Docker access). Dok rejects admin OpenCode sessions with `409` and its dashboard/card buttons open Maintenance instead.
+- OpenCode powers OC Assist in App Creation. The only OpenCode launch control in Dok is **App Creation → Create app with OC Assist**; the Dashboard and Settings card no longer launch OpenCode or offer Admin/User mode choices.
+- Unlike the other core services it is not a container in `core/` and is excluded from Start all/Stop all; each OC Assist launch starts a User-mode PTY inside the WickedAFDok container and closing the chat stops it
+- **Admin mode:** only available inside the Dok Maintenance container (cwd `/dok`, full host/Docker access). Dok rejects admin OpenCode sessions with `409`.
 - **User mode:** cwd `/app/apps`, `external_directory: deny`, and a bash/read allowlist tuned for app work; Docker, system package management, privilege escalation, and WickedAFDok source paths are intended to be off limits
 - Generated configs live at `data/opencode/<mode>/opencode.json`; per-mode `HOME`/XDG directories keep sessions separate, while provider login/auth and caches are shared under `data/opencode/shared`
 - `OPENCODE_DISABLE_PROJECT_CONFIG=1` prevents an app-level `opencode.json` from widening mode permissions
-- Optional `services.opencode` settings (model, provider, API key) preconfigure a provider. If provider is blank, it is inferred from the `provider/model` prefix. The key is passed as `OPENCODE_PROVIDER_API_KEY` and generated configs reference `{env:OPENCODE_PROVIDER_API_KEY}`; it is encrypted at rest in `data/settings.json` and redacted as `apiKeySet` in API responses. It can also be added interactively with `/connect`
-- The same terminal modal can open a plain bash shell. Admin shell starts in `/app`; the apps shell starts in `apps/`. Shell sessions run as the container user and are not permission-restricted like User-mode OpenCode.
+- Optional `services.opencode` settings (model, provider, API key) preconfigure OC Assist. If provider is blank, it is inferred from the `provider/model` prefix. The key is passed as `OPENCODE_PROVIDER_API_KEY` and generated configs reference `{env:OPENCODE_PROVIDER_API_KEY}`; it is encrypted at rest in `data/settings.json` and redacted as `apiKeySet` in API responses. It can also be added interactively with `/connect`
+- The Dashboard **Terminal** button opens a plain admin shell in `/app`. The terminal modal has no mode, shell, or OpenCode picker; shell sessions run as the container user and are not permission-restricted like User-mode OpenCode.
 
 **Logs:**
 - Server console output plus mutating `/api` requests are written to `data/logs/server.log` and a 2000-line in-memory ring buffer
@@ -536,7 +536,7 @@ The **Core Services** subtab manages installed bundled services. Installation no
 - `GET /api/core/dashboard` - Installed core services with web UIs, their configured/localhost URLs, and running state for the Dashboard console buttons
 - `GET /api/core/opencode` - OpenCode install/version, running sessions, modes, and generated configs
 - `POST /api/core/opencode/settings` - Save optional model/provider/API key
-- `POST /api/core/opencode/run` - Start an OpenCode Admin or User session
+- `POST /api/core/opencode/run` - Legacy OpenCode launcher; Dok's UI no longer calls it (OC Assist starts through `POST /api/assist/start`)
 - `POST /api/core/opencode/stop` - Stop all running OpenCode sessions
 
 ### Terminal
@@ -738,9 +738,9 @@ The **Core Services** subtab manages installed bundled services. Installation no
 
 **Key UI Elements:**
 - Containers: `#containersList`, `#containerSearch`, `#containersOpenApps` (opens the Apps tab), `#refreshContainers`
-- Dashboard: `#dashboardTerminalBtn`, `#dashboardOpencodeBtn`, `#dashboardCoreLinks`, `#dashboardCoreRefresh`
-- Terminal Modal: `#terminalModal`, `#terminalContainer`, `#terminalModeSelect`, `#terminalShellBtn`, `#terminalOpencodeBtn`, `#terminalStopBtn`, `#terminalStatus`, `#terminalModeBadge`
-- OpenCode Card: `#coreOpencodeCard`, `#opencodeLaunchAdmin`, `#opencodeLaunchUser`, `#opencodeShellAdmin`, `#opencodeShellUser`, `#opencodeStopBtn`, `#opencodeModel`, `#opencodeProvider`, `#opencodeApiKey`, `#opencodeSaveSettings`
+- Dashboard: `#dashboardTerminalBtn`, `#dashboardCoreLinks`, `#dashboardCoreRefresh`
+- Terminal Modal: `#terminalModal`, `#terminalContainer`, `#terminalStopBtn`, `#terminalStatus`, `#terminalSessionLabel`
+- OpenCode Card: `#coreOpencodeCard`, `#opencodeStatus`, `#opencodeSessions`, `#opencodeStopBtn`, `#opencodeModel`, `#opencodeProvider`, `#opencodeApiKey`, `#opencodeSaveSettings`
 - App Creation: `#runCreateBtn`, `#composeCreateBtn`, `#gitCloneBtn`, `#uploadBtn`, OC Assist (`#assistPrompt`, `#assistData`, `#assistName`, `#assistFiles`, `#assistFolder`, `#assistStartBtn`, `#assistOutput`)
 - App Config Modal: `#appConfigModal`, `#appCfgBuilder`, `#appCfgCompose`, `#appCfgEditCompose`, `#appCfgValidate`, `#appCfgComplete`, `#appCfgCompleteRun`, `#appCfgProgress`
 - Notices: `#appCfgNetworkNotice`, `#appCfgVolumeNotice`, `#appCreationNginxNotice`, `#appCreationNginxNoticeModal`

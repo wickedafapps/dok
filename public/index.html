@@ -72,7 +72,6 @@
         </div>
         <div class="inline">
           <button id="dashboardTerminalBtn" class="btn" title="Open an admin shell in the browser">Terminal</button>
-          <button id="dashboardOpencodeBtn" class="btn btn-primary" title="Launch OpenCode in Admin mode">OpenCode</button>
           <button id="refreshStats" class="btn">Refresh</button>
         </div>
       </div>
@@ -672,38 +671,14 @@
         <div class="card" id="coreOpencodeCard">
           <div class="row" style="margin-top:0; justify-content:space-between">
             <div>
-              <h3>OpenCode <span class="muted">(on demand)</span></h3>
-              <p class="muted">AI coding agent with full terminal access while a session is open. OpenCode is preconfigured and is never started by <em>Start all</em>.</p>
+              <h3>OpenCode <span class="muted">(OC Assist)</span></h3>
+              <p class="muted">OpenCode powers OC Assist in App Creation. It runs in User mode with access limited to the apps workspace. Start a chat from <strong>App Creation → OC Assist</strong>; Admin OpenCode is available only in the Dok Maintenance container.</p>
             </div>
             <span id="opencodeStatus" class="mode-pill">Checking…</span>
           </div>
-          <div class="mode-grid">
-            <div class="mode-card mode-admin">
-              <div class="mode-card-head">
-                <strong>Admin mode</strong>
-                <span class="mode-pill danger">Full access</span>
-              </div>
-              <p class="muted">Maintenance, troubleshooting, Docker, and changes to WickedAFDok itself.</p>
-              <div class="row" style="margin-top:10px">
-                <button id="opencodeLaunchAdmin" class="btn btn-primary">Launch OpenCode</button>
-                <button id="opencodeShellAdmin" class="btn">Admin shell</button>
-              </div>
-            </div>
-            <div class="mode-card mode-user">
-              <div class="mode-card-head">
-                <strong>User mode</strong>
-                <span class="mode-pill">Apps only</span>
-              </div>
-              <p class="muted">Create apps and get basic troubleshooting help. OpenCode is restricted to the app workspace and safe commands; the raw shell still runs as the container user.</p>
-              <div class="row" style="margin-top:10px">
-                <button id="opencodeLaunchUser" class="btn btn-primary">Launch OpenCode</button>
-                <button id="opencodeShellUser" class="btn" title="Shell in /app/apps (not permission-restricted)">Apps shell</button>
-              </div>
-            </div>
-          </div>
           <details class="opencode-settings">
             <summary>Model and provider (optional)</summary>
-            <p class="muted">OpenCode can use its own provider login. Set a model and API key here to preconfigure Admin and User modes for one-click launches.</p>
+            <p class="muted">Set a model and API key to preconfigure the OC Assist chat. If the provider is blank it is inferred from the <code>provider/model</code> prefix.</p>
             <div class="row">
               <input id="opencodeModel" class="input flex" placeholder="Model, e.g. anthropic/claude-sonnet-4-5">
               <input id="opencodeProvider" class="input" placeholder="Provider, e.g. anthropic">
@@ -716,10 +691,9 @@
             </div>
           </details>
           <div class="row" style="border-top:1px solid var(--border); padding-top:12px; justify-content:space-between">
-            <span id="opencodeSessions" class="muted">No OpenCode sessions running.</span>
+            <span id="opencodeSessions" class="muted">No OC Assist sessions running.</span>
             <div class="inline">
-              <button id="opencodeStopBtn" class="btn btn-danger" disabled>Stop OpenCode</button>
-              <button id="opencodeTerminalBtn" class="btn">Open terminal</button>
+              <button id="opencodeStopBtn" class="btn btn-danger" disabled>Stop OC Assist sessions</button>
             </div>
           </div>
         </div>
@@ -1298,24 +1272,16 @@
         <div>
           <h3 id="terminalTitle">Terminal</h3>
           <div class="inline terminal-meta">
-            <span id="terminalModeBadge" class="mode-pill">Admin</span>
             <span id="terminalStatus" class="muted">Connecting…</span>
           </div>
         </div>
         <div class="inline">
-          <select id="terminalModeSelect" class="input" title="Mode for the next session">
-            <option value="admin">Admin mode</option>
-            <option value="user">User mode</option>
-          </select>
-          <button id="terminalShellBtn" class="btn">Shell</button>
-          <button id="terminalOpencodeBtn" class="btn btn-primary">OpenCode</button>
           <button id="terminalStopBtn" class="btn btn-danger">Stop</button>
           <button class="btn" data-close="terminalModal">Close</button>
         </div>
       </div>
       <div id="terminalContainer" class="terminal-container"></div>
       <div class="terminal-footer">
-        <span class="muted">Admin mode has full container access. User mode restricts OpenCode to apps; shells always run as the container user.</span>
         <span id="terminalSessionLabel" class="muted"></span>
       </div>
     </div>

@@ -4076,20 +4076,10 @@ let terminal = null;
 let terminalFit = null;
 let terminalSocket = null;
 let terminalSessionId = null;
+let terminalSessionApp = '';
 let terminalResizeObserver = null;
 let terminalConnectToken = 0;
 let terminalOpenToken = 0;
-
-function terminalModeLabel(mode) {
-  return mode === 'user' ? 'User mode' : 'Admin mode';
-}
-
-function setTerminalModeBadge(mode) {
-  const badge = qs('#terminalModeBadge');
-  if (!badge) return;
-  badge.textContent = terminalModeLabel(mode);
-  badge.className = 'mode-pill' + (mode === 'user' ? '' : ' danger');
-}
 
 function resetTerminalView() {
   if (terminalSocket) {
@@ -4212,9 +4202,10 @@ function connectTerminal() {
         try { terminal.reset(); } catch {}
       }
       if (qs('#terminalTitle')) qs('#terminalTitle').textContent = session.title || 'Terminal';
-      setTerminalModeBadge(session.mode || 'admin');
       if (qs('#terminalSessionLabel')) {
-        qs('#terminalSessionLabel').textContent = `${session.app === 'opencode' ? 'OpenCode' : 'Shell'} · ${session.cwd || ''} · pid ${session.pid || '—'}`;
+        qs('#terminalSessionLabel').textContent = session.app === 'opencode'
+          ? 'OC Assist can ask follow-up questions. The app appears in Apps when it is ready.'
+          : `Shell · ${session.cwd || ''} · pid ${session.pid || '—'}`;
       }
       setTerminalStatus('Connected');
     } else if (message.type === 'exit') {
@@ -4240,6 +4231,7 @@ function connectTerminal() {
 async function stopCurrentTerminalSession({ quiet = false, exceptId = '' } = {}) {
   const id = terminalSessionId;
   terminalSessionId = null;
+  terminalSessionApp = '';
   terminalConnectToken += 1;
   if (terminalSocket) {
     try { terminalSocket.close(); } catch {}
@@ -4260,6 +4252,7 @@ function closeTerminalSession() {
   terminalOpenToken += 1;
   const id = terminalSessionId;
   terminalSessionId = null;
+  terminalSessionApp = '';
   terminalConnectToken += 1;
   if (terminalSocket) {
     try { terminalSocket.close(); } catch {}
@@ -4278,9 +4271,7 @@ async function openTerminal({ mode = 'admin', app = 'shell' } = {}) {
   const modal = qs('#terminalModal');
   if (!modal) return;
   modal.classList.remove('hidden');
-  if (qs('#terminalModeSelect')) qs('#terminalModeSelect').value = mode;
-  if (qs('#terminalTitle')) qs('#terminalTitle').textContent = app === 'opencode' ? 'OpenCode' : 'Terminal';
-  setTerminalModeBadge(mode);
+  if (qs('#terminalTitle')) qs('#terminalTitle').textContent = 'Terminal';
   if (qs('#terminalSessionLabel')) qs('#terminalSessionLabel').textContent = '';
   setTerminalStatus('Starting…');
 
@@ -4300,8 +4291,9 @@ async function openTerminal({ mode = 'admin', app = 'shell' } = {}) {
       return;
     }
     terminalSessionId = res.session?.id || null;
+    terminalSessionApp = app;
     if (!terminalSessionId) throw new Error('The server did not return a terminal session');
-    if (qs('#terminalTitle')) qs('#terminalTitle').textContent = res.session.title || (app === 'opencode' ? 'OpenCode' : 'Terminal');
+    if (qs('#terminalTitle')) qs('#terminalTitle').textContent = 'Terminal';
     connectTerminal();
     setTimeout(fitTerminal, 120);
   } catch (e) {
@@ -4315,12 +4307,9 @@ async function openExistingTerminal(session) {
   if (!session?.id) return;
   const modal = qs('#terminalModal');
   if (!modal) return;
-  const mode = session.mode === 'user' ? 'user' : 'admin';
   const app = session.app === 'opencode' ? 'opencode' : 'shell';
   modal.classList.remove('hidden');
-  if (qs('#terminalModeSelect')) qs('#terminalModeSelect').value = mode;
-  if (qs('#terminalTitle')) qs('#terminalTitle').textContent = session.title || (app === 'opencode' ? 'OpenCode' : 'Terminal');
-  setTerminalModeBadge(mode);
+  if (qs('#terminalTitle')) qs('#terminalTitle').textContent = session.title || 'Terminal';
   setTerminalStatus('Connecting…');
   const openToken = ++terminalOpenToken;
   // Never stop the session we are about to attach to. This can happen when the
@@ -4330,7 +4319,12 @@ async function openExistingTerminal(session) {
   resetTerminalView();
   ensureTerminal();
   terminalSessionId = session.id;
-  if (qs('#terminalSessionLabel')) qs('#terminalSessionLabel').textContent = session.title || session.id;
+  terminalSessionApp = app;
+  if (qs('#terminalSessionLabel')) {
+    qs('#terminalSessionLabel').textContent = app === 'opencode'
+      ? 'OC Assist can ask follow-up questions. The app appears in Apps when it is ready.'
+      : session.title || session.id;
+  }
   connectTerminal();
   setTimeout(fitTerminal, 120);
 }
@@ -4392,8 +4386,8 @@ async function loadCoreOpencode() {
     const sessions = res.sessions || [];
     if (qs('#opencodeSessions')) {
       qs('#opencodeSessions').textContent = sessions.length
-        ? `${sessions.length} OpenCode session${sessions.length === 1 ? '' : 's'} running · ${sessions.map(s => terminalModeLabel(s.mode)).join(', ')}`
-        : 'No OpenCode sessions running.';
+        ? `${sessions.length} OC Assist session${sessions.length === 1 ? '' : 's'} running`
+        : 'No OC Assist sessions running.';
     }
     if (qs('#opencodeStopBtn')) qs('#opencodeStopBtn').disabled = sessions.length === 0;
     if (qs('#opencodeModel')) qs('#opencodeModel').value = res.settings?.model || '';
@@ -4410,37 +4404,6 @@ async function loadCoreOpencode() {
 if (qs('#dashboardTerminalBtn')) {
   qs('#dashboardTerminalBtn').addEventListener('click', () => openTerminal({ mode: 'admin', app: 'shell' }));
 }
-if (qs('#dashboardOpencodeBtn')) {
-  qs('#dashboardOpencodeBtn').addEventListener('click', () => openMaintenancePanel({ start: true }));
-}
-if (qs('#opencodeLaunchAdmin')) {
-  qs('#opencodeLaunchAdmin').addEventListener('click', () => openMaintenancePanel({ start: true }));
-}
-if (qs('#opencodeLaunchUser')) {
-  qs('#opencodeLaunchUser').addEventListener('click', () => openTerminal({ mode: 'user', app: 'opencode' }));
-}
-if (qs('#opencodeShellAdmin')) {
-  qs('#opencodeShellAdmin').addEventListener('click', () => openTerminal({ mode: 'admin', app: 'shell' }));
-}
-if (qs('#opencodeShellUser')) {
-  qs('#opencodeShellUser').addEventListener('click', () => openTerminal({ mode: 'user', app: 'shell' }));
-}
-if (qs('#opencodeTerminalBtn')) {
-  qs('#opencodeTerminalBtn').addEventListener('click', () => openTerminal({ mode: 'admin', app: 'shell' }));
-}
-if (qs('#terminalShellBtn')) {
-  qs('#terminalShellBtn').addEventListener('click', () => openTerminal({
-    mode: qs('#terminalModeSelect')?.value || 'admin',
-    app: 'shell'
-  }));
-}
-if (qs('#terminalOpencodeBtn')) {
-  qs('#terminalOpencodeBtn').addEventListener('click', () => {
-    const mode = qs('#terminalModeSelect')?.value || 'admin';
-    if (mode === 'admin') return openMaintenancePanel({ start: true });
-    openTerminal({ mode: 'user', app: 'opencode' });
-  });
-}
 if (qs('#terminalStopBtn')) {
   qs('#terminalStopBtn').addEventListener('click', () => stopCurrentTerminalSession());
 }
@@ -4450,9 +4413,10 @@ if (qs('#opencodeStopBtn')) {
     setLoading(btn, true);
     try {
       const res = await api('/api/core/opencode/stop', jsonBody({}));
-      toast(res.stopped ? `Stopped ${res.stopped} OpenCode session${res.stopped === 1 ? '' : 's'}` : 'No OpenCode sessions were running');
-      if (terminalSessionId && qs('#terminalTitle')?.textContent === 'OpenCode') {
+      toast(res.stopped ? `Stopped ${res.stopped} OC Assist session${res.stopped === 1 ? '' : 's'}` : 'No OC Assist sessions were running');
+      if (terminalSessionId && terminalSessionApp === 'opencode') {
         terminalSessionId = null;
+        terminalSessionApp = '';
         terminalConnectToken += 1;
         if (terminalSocket) { try { terminalSocket.close(); } catch {} terminalSocket = null; }
         setTerminalStatus('Stopped');
@@ -4461,7 +4425,7 @@ if (qs('#opencodeStopBtn')) {
     } catch (e) {
       toast(e.message, true);
     } finally {
-      setLoading(btn, false, 'Stop OpenCode');
+      setLoading(btn, false, 'Stop OC Assist sessions');
     }
   });
 }

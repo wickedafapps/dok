@@ -34,8 +34,7 @@
         <p>The Dashboard is a live health view of the Docker host and engine. Cards show CPU, memory, disk, load average, uptime, Docker engine information, and network details.</p>
         <ul>
           <li><strong>Refresh</strong> reloads statistics immediately. The view also refreshes automatically.</li>
-          <li><strong>Terminal</strong> opens a shell inside the Dok container. Admin shell starts in <code>/app</code>; the apps shell starts in <code>apps/</code>.</li>
-          <li><strong>OpenCode</strong> opens the AI assistant in Admin or User mode.</li>
+          <li><strong>Terminal</strong> opens an admin shell inside the Dok container starting in <code>/app</code>.</li>
           <li><strong>Core Service Consoles</strong> shows an <strong>Open GUI</strong> button for each installed service that has a web interface: Authentik, Authelia, Technitium, AdGuard Home, Mailpit, and Stalwart. The button uses the configured domain when one is set, otherwise the localhost port. Stopped services are disabled until you start them.</li>
         </ul>
         <p>High disk usage usually points to images, volumes, or backups that can be removed from Images and Maintenance. High load with low CPU can indicate blocked I/O inside a container.</p>
@@ -139,7 +138,7 @@
       title: 'OC Assist',
       html: `
         <p><strong>OC Assist</strong> creates an app from a written brief. Enter a required prompt describing the app, optionally add pasted data such as a docker run command, compose file, or repository URL, upload supporting files, and optionally choose the app name and folder.</p>
-        <p>When you select <strong>Create app with OC Assist</strong>, Dok writes a private brief and the uploaded files under <code>sources/oc-assist-&lt;stamp&gt;/</code>, then immediately opens the OpenCode chat in <strong>User mode</strong> with the dedicated <code>assist</code> agent. The brief and all creator fields are passed automatically; you only need to answer questions if OpenCode needs more information.</p>
+        <p>When you select <strong>Create app with OC Assist</strong>, Dok writes a private brief and the uploaded files under <code>sources/oc-assist-&lt;stamp&gt;/</code>, then immediately opens the OpenCode chat in <strong>User mode</strong> with the dedicated <code>assist</code> agent. There is no shell or mode picker: the chat is the only thing shown. The brief and all creator fields are passed automatically; you only need to answer questions if OpenCode needs more information.</p>
         <p>If OpenCode fails during startup, Dok shows the captured terminal error instead of opening an empty chat. Inside the terminal, <strong>Escape</strong> is sent to OpenCode (for its own dialogs); use the terminal&rsquo;s close button to end the session.</p>
         <h4>What the assistant is allowed to do</h4>
         <ul>
@@ -246,18 +245,13 @@
       `
     },
     terminal: {
-      title: 'Terminal and OpenCode',
+      title: 'Terminal and OC Assist',
       html: `
-        <p>The terminal modal provides an interactive shell and on-demand OpenCode AI sessions inside the Dok container. Sessions exist only while running and stop when the terminal is closed, the session exits, or the server shuts down.</p>
-        <h4>Shell</h4>
-        <p>Admin shell starts in <code>/app</code>. The apps shell starts in <code>apps/</code>. Shells run as the Dok container user and are not permission-restricted like User-mode OpenCode.</p>
-        <h4>OpenCode modes</h4>
-        <ul>
-          <li><strong>Admin mode</strong> has broad access to the Dok source and host-managed files. Use it for maintenance and troubleshooting.</li>
-          <li><strong>User mode</strong> is limited to app work with an allowlist for app files and commands. It is a guardrail, not an operating-system sandbox.</li>
-          <li><strong>OC Assist</strong> uses a dedicated assist agent in User mode with permission to edit apps and register or launch them.</li>
-        </ul>
-        <p>Provider settings can be saved under Settings → Core Services → OpenCode, or configured interactively with <code>/connect</code>. Closing the terminal stops the active session.</p>
+        <p>The Dashboard <strong>Terminal</strong> button opens an interactive shell in the Dok container. Shell sessions exist only while running and stop when the terminal is closed, the session exits, or the server shuts down.</p>
+        <p>The shell starts in <code>/app</code> and runs as the Dok container user. It is not permission-restricted.</p>
+        <h4>OC Assist</h4>
+        <p>OC Assist is the only OpenCode chat launched from Dok. Start it from <strong>App Creation → OC Assist</strong>; Dok opens the chat directly, without shell or mode options. The assistant runs in User mode with permission to edit apps and register or launch them.</p>
+        <p>Admin OpenCode is available only inside the Dok Maintenance container. Provider settings for OC Assist can be saved under Settings → Core Services → OpenCode.</p>
       `
     },
     'settings-core': {
@@ -360,15 +354,16 @@
     'core-opencode': {
       title: 'OpenCode',
       html: `
-        <p>OpenCode is an AI coding assistant that runs inside the Dok container on demand. It is not a compose service and is excluded from Start all/Stop all.</p>
+        <p>OpenCode powers <strong>OC Assist</strong> in App Creation. It is not a compose service and is excluded from Start all/Stop all.</p>
         <ul>
-          <li><strong>Admin mode</strong> starts in <code>/app</code> with broad file and shell access for maintenance.</li>
-          <li><strong>User mode</strong> starts in <code>apps/</code> and restricts the agent to app work.</li>
-          <li>Provider, model, and API key can be saved here. If the provider is left blank it is inferred from the <code>provider/model</code> prefix.</li>
+          <li>OC Assist runs in User mode, starts in <code>apps/</code>, and restricts the agent to app work.</li>
+          <li>Start an OC Assist chat only from <strong>App Creation → OC Assist</strong>. Dok opens the chat directly with no shell or mode picker.</li>
+          <li>Admin OpenCode is available only inside the Dok Maintenance container, where it can access Docker and the full Dok checkout.</li>
+          <li>Provider, model, and API key can be saved here to preconfigure OC Assist. If the provider is left blank it is inferred from the <code>provider/model</code> prefix.</li>
           <li>The API key is encrypted at rest and only reported as set or not set.</li>
-          <li>Provider login and caches are shared between modes; session state is separate.</li>
+          <li><strong>Stop OC Assist sessions</strong> ends any running OC Assist chats.</li>
         </ul>
-        <p>Closing the terminal stops the session. OpenCode is installed in the image; set <code>OPENCODE_BIN</code> only for development with a different binary.</p>
+        <p>OpenCode is installed in the image; set <code>OPENCODE_BIN</code> only for development with a different binary.</p>
       `
     },
     'core-host-helper': {
@@ -749,7 +744,6 @@
     'Other top-level settings': 'Optional JSON for top-level configs, secrets, or x-* extension fields.',
     'Additional settings': 'Compose keys that do not have a dedicated field. Use the field type selector to add common keys or raw JSON.',
     sourcesPath: 'Path inside sources/ to browse or edit.',
-    terminalModeSelect: 'Mode for the next terminal session: Admin or User.',
     authPort: 'Container port used by the Authentik server.',
     authPassword: 'Initial Authentik admin password.',
     authEmail: 'Initial Authentik admin email.',
