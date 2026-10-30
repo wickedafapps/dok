@@ -5360,6 +5360,69 @@ function openAssistChat(chat) {
   setTimeout(() => qs('#assistChatInput')?.focus(), 100);
 }
 
+function openAssistChatPreparing(appName) {
+  const modal = qs('#assistChatModal');
+  if (!modal) return 0;
+  closeAssistChat();
+  modal.classList.remove('hidden');
+  const token = ++assistChatToken;
+  if (qs('#assistChatTitle')) {
+    qs('#assistChatTitle').textContent = appName ? `OC Assist · ${appName}` : 'OC Assist';
+  }
+  if (qs('#assistChatApp')) {
+    qs('#assistChatApp').textContent = appName ? `App: ${appName}` : '';
+  }
+  const box = qs('#assistChatMessages');
+  if (box) {
+    box.innerHTML = '';
+    const empty = assistElement('div', 'assist-chat-empty');
+    empty.appendChild(assistElement('span', 'spinner'));
+    empty.appendChild(document.createTextNode('Starting OC Assist… The chat opens as soon as the session is ready.'));
+    box.appendChild(empty);
+  }
+  const pending = qs('#assistChatPending');
+  if (pending) {
+    pending.innerHTML = '';
+    pending.classList.add('hidden');
+  }
+  setAssistChatStatus('Starting…');
+  updateAssistChatComposer();
+  return token;
+}
+
+function showAssistChatStartError(message) {
+  const box = qs('#assistChatMessages');
+  if (box) {
+    box.innerHTML = '';
+    const empty = assistElement('div', 'assist-chat-empty');
+    empty.appendChild(assistElement('strong', '', 'OC Assist could not start'));
+    empty.appendChild(assistElement('div', '', String(message || 'The server did not return a chat session.')));
+    box.appendChild(empty);
+  }
+  setAssistChatStatus('Could not start');
+  updateAssistChatComposer();
+}
+
+async function recoverAssistChat(appName, token, timeout = 30000) {
+  const modal = qs('#assistChatModal');
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (token !== assistChatToken || !modal || modal.classList.contains('hidden')) return null;
+    try {
+      const res = await api('/api/assist/chats');
+      const chat = (Array.isArray(res.chats) ? res.chats : []).find(item => item.appName === appName);
+      if (chat) {
+        openAssistChat(chat);
+        return chat;
+      }
+    } catch {}
+    if (Date.now() >= deadline) break;
+    setAssistChatStatus('Waiting for the running chat…');
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+  return null;
+}
+
 async function abortAssistChatRun() {
   if (!assistChatId) return;
   const btn = qs('#assistChatAbortBtn');
@@ -5429,23 +5492,35 @@ if (qs('#assistStartBtn')) {
       output.textContent = 'Starting OC Assist…';
       output.classList.remove('hidden');
     }
-    let startedChat = null;
+    const appName = qs('#assistName')?.value.trim() || '';
+    const chatToken = openAssistChatPreparing(appName);
     try {
-      const res = await fetch('/api/assist/start', { method: 'POST', body: form });
+      const res = await fetch('/api/assist/start', {
+        method: 'POST',
+        body: form,
+        signal: typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(60000) : undefined
+      });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || res.statusText || 'OC Assist failed to start');
-      startedChat = data.chat;
+      if (!data.chat?.id) throw new Error('The server did not return a chat session');
       if (output) output.textContent = `OC Assist is ready for ${data.appName}. The app is saved stopped in Apps when it is ready so you can configure and deploy it.`;
       toast(`OC Assist started for ${data.appName}`, false, 6000);
       openAssistChat(data.chat);
       loadAssistSessions();
       loadCoreOpencode();
     } catch (e) {
-      if (output) output.textContent = e.message;
-      toast(e.message, true);
-      if (startedChat?.id) {
-        fetch(`/api/assist/chats/${encodeURIComponent(startedChat.id)}/stop`, { method: 'POST' }).catch(() => {});
+      const recoverable = ['TimeoutError', 'TypeError', 'AbortError', 'NetworkError'].includes(e.name);
+      const message = e.name === 'TimeoutError'
+        ? 'OC Assist is taking longer than expected. Checking for the running chat…'
+        : e.message;
+      if (output) output.textContent = message;
+      const recovered = recoverable ? await recoverAssistChat(appName, chatToken) : null;
+      if (!recovered && chatToken === assistChatToken) {
+        showAssistChatStartError(message);
+        toast(message, true);
       }
+      loadAssistSessions();
+      loadCoreOpencode();
     } finally {
       setLoading(btn, false, 'Create App with OC Assist');
     }
