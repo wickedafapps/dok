@@ -16,11 +16,14 @@ services:
       - ${DOK_STORAGE_ROOT:-.}/apps:/app/apps
       - ${DOK_STORAGE_ROOT:-.}/core:/app/core
       # Host checkout used by in-app Git updates. The updater pulls here and
-      # rebuilds the image, so changes survive container recreation.
-      - ./:/app/host-source
+      # rebuilds the image, so changes survive container recreation. Keep this
+      # an absolute host path when Docker Compose runs from another container
+      # (Maintenance); start.sh and the installer set DOK_SOURCE_PATH.
+      - ${DOK_SOURCE_PATH:-.}:/app/host-source
     environment:
       - PORT=8080
       - DOK_STORAGE_ROOT=${DOK_STORAGE_ROOT:-}
+      - DOK_SOURCE_HOST_PATH=${DOK_SOURCE_PATH:-}
     privileged: false
     user: root
     networks:

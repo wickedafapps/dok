@@ -10,14 +10,152 @@ import { execFile } from 'child_process';
 // always the code checkout and is kept separate so a relocated data root never
 // hides the source tree.
 export const DOK_ROOT = path.resolve(process.env.DOK_ROOT || '/dok');
-export const DOK_SOURCE_ROOT = path.resolve(process.env.DOK_SOURCE_ROOT || process.env.DOK_ROOT || '/dok-source');
 export const HOST_ROOT = path.resolve(process.env.HOST_ROOT || '/host');
 export const MAINT_DATA = path.resolve(process.env.MAINTENANCE_DATA || '/maintenance-data');
 export const MAINT_DATA_HOST = String(process.env.MAINTENANCE_DATA_HOST_PATH || '').trim() || MAINT_DATA;
+
+const SOURCE_MARKERS = ['Dockerfile', path.join('server', 'index.js')];
+const SCAN_SKIP = new Set(['node_modules', '.cache', '.npm', 'proc', 'sys', 'dev', 'run']);
+const SOURCE_SCAN_ROOTS = ['root', 'home', 'srv', 'opt', 'mnt', 'media', 'var/www', 'usr/local/src', 'data', 'tmp'];
+
+export function looksLikeDokSource(dir) {
+  try {
+    return SOURCE_MARKERS.every(file => fs.statSync(path.join(dir, file)).isFile());
+  } catch {
+    return false;
+  }
+}
+
+function sameDirectory(a, b) {
+  try {
+    const left = fs.statSync(a);
+    const right = fs.statSync(b);
+    return left.dev === right.dev && left.ino === right.ino;
+  } catch {
+    return false;
+  }
+}
+
+function sameCheckout(a, b) {
+  if (sameDirectory(a, b)) return true;
+  const fingerprint = dir => {
+    try {
+      const stat = fs.statSync(path.join(dir, '.git', 'HEAD'));
+      return `${stat.dev}:${stat.ino}`;
+    } catch {
+      return '';
+    }
+  };
+  const left = fingerprint(a);
+  return !!left && left === fingerprint(b);
+}
+
+function sourceLogHints() {
+  let text = '';
+  try {
+    const file = path.join(MAINT_DATA, 'logs', 'maintenance.log');
+    const stat = fs.statSync(file);
+    const size = Math.min(stat.size, 512 * 1024);
+    const buffer = Buffer.alloc(size);
+    const fd = fs.openSync(file, 'r');
+    try {
+      fs.readSync(fd, buffer, 0, size, stat.size - size);
+    } finally {
+      fs.closeSync(fd);
+    }
+    text = buffer.toString('utf8');
+  } catch {
+    return [];
+  }
+  const hints = [];
+  for (const line of text.split('\n').reverse()) {
+    let match = line.match(/\bBuilding\s+\S+\s+from\s+(\/\S+)/);
+    if (!match) match = line.match(/\bLaunching Dok with the (?:root|managed) compose\s+(\/\S+)/);
+    if (!match) match = line.match(/\bDok root\s+(\/\S+?),\s+host root/);
+    if (!match) continue;
+    const value = match[1].replace(/\/docker-compose\.ya?ml$/, '');
+    if (value) hints.push(value);
+  }
+  return hints;
+}
+
+function scanForDokSource() {
+  const deadline = Date.now() + 2500;
+  let inspected = 0;
+  for (const relative of SOURCE_SCAN_ROOTS) {
+    const start = path.join(HOST_ROOT, relative);
+    const queue = [{ dir: start, depth: 0 }];
+    while (queue.length && Date.now() < deadline && inspected < 8000) {
+      const { dir, depth } = queue.shift();
+      inspected++;
+      if (looksLikeDokSource(dir) && fs.existsSync(path.join(dir, '.git'))) return dir;
+      if (depth >= 5) continue;
+      let entries = [];
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+      for (const entry of entries) {
+        if (!entry.isDirectory() || SCAN_SKIP.has(entry.name)) continue;
+        queue.push({ dir: path.join(dir, entry.name), depth: depth + 1 });
+      }
+    }
+    if (Date.now() >= deadline) break;
+  }
+  return '';
+}
+
+function sourceHostPath(candidate, configuredRoot) {
+  if (candidate === HOST_ROOT) return '';
+  if (candidate === path.parse(candidate).root) return '';
+  if (candidate.startsWith(HOST_ROOT + path.sep)) return candidate.slice(HOST_ROOT.length);
+  if (candidate !== configuredRoot) return candidate;
+  return '';
+}
+
+function resolveDokSource() {
+  const configuredRoot = path.resolve(process.env.DOK_SOURCE_ROOT || process.env.DOK_ROOT || '/dok-source');
+  const configuredHost = String(process.env.DOK_HOST_PATH || '').trim();
+  const candidates = [];
+  const add = value => {
+    const raw = String(value || '').trim();
+    if (!path.isAbsolute(raw)) return;
+    const clean = path.resolve(raw.replace(/[/\\]+$/, '') || '/');
+    candidates.push(clean);
+    if (clean !== HOST_ROOT && !clean.startsWith(HOST_ROOT + path.sep)) {
+      candidates.push(path.join(HOST_ROOT, clean.replace(/^\/+/, '')));
+    }
+  };
+  add(configuredHost);
+  for (const hint of sourceLogHints()) add(hint);
+  const unique = [...new Set(candidates)];
+  const configuredValid = looksLikeDokSource(configuredRoot);
+  if (configuredValid) {
+    for (const candidate of unique) {
+      if (!sameCheckout(candidate, configuredRoot) || !looksLikeDokSource(candidate)) continue;
+      const host = sourceHostPath(candidate, configuredRoot);
+      if (host) return { root: configuredRoot, host, recovered: false };
+    }
+    return { root: configuredRoot, host: '', recovered: false };
+  }
+  let recovered = null;
+  for (const candidate of unique) {
+    if (!looksLikeDokSource(candidate)) continue;
+    const host = sourceHostPath(candidate, configuredRoot);
+    if (host) return { root: path.resolve(candidate), host, recovered: true };
+    if (!recovered) recovered = { root: path.resolve(candidate), host: '', recovered: true };
+  }
+  if (recovered) return recovered;
+  const scanned = scanForDokSource();
+  if (scanned) return { root: path.resolve(scanned), host: sourceHostPath(scanned, configuredRoot), recovered: true };
+  return { root: configuredRoot, host: '', recovered: false };
+}
+
+const sourceResolution = resolveDokSource();
+export const DOK_SOURCE_ROOT = sourceResolution.root;
+export const DOK_SOURCE_HOST_PATH = sourceResolution.host;
+export const DOK_SOURCE_RECOVERED = sourceResolution.recovered;
 export const DOK_CONTAINER = String(process.env.DOK_CONTAINER || 'wickedafdok').trim();
 export const DOK_PORT = Number(process.env.DOK_PORT) || 8080;
 export const DOK_IMAGE = String(process.env.DOK_IMAGE || 'wickedafdok:latest').trim();
-export const DOK_HOST_PATH = String(process.env.DOK_HOST_PATH || DOK_SOURCE_ROOT).trim();
+export const DOK_HOST_PATH = DOK_SOURCE_HOST_PATH || String(process.env.DOK_HOST_PATH || DOK_SOURCE_ROOT).trim();
 export const DOK_STORAGE_HOST = String(process.env.DOK_STORAGE_HOST_PATH || '').trim();
 export const DOK_COMPOSE_ROOT = (() => {
   try {

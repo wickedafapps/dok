@@ -3937,15 +3937,18 @@ async function ensureHostDirectory(target, { label = 'host path', action = 'crea
   }
 }
 
-function buildWadCompose(info, { network, domain, port, serviceName = 'app', extraVolumes = [] }) {
+function buildWadCompose(info, { network, domain, port, serviceName = 'app', sourceCheckout = '' }) {
   const name = info.Name.replace(/^\//, '');
   const image = info.Config?.Image && info.Config.Image !== '<none>' ? info.Config.Image : info.Image;
   if (!image) throw new Error('WickedAFDok container has no image');
-  const envList = Array.isArray(info.Config?.Env) ? info.Config.Env.filter(e => !/^VIRTUAL_(HOST|PORT|PROTO)=/.test(String(e))) : [];
+  const envList = Array.isArray(info.Config?.Env)
+    ? info.Config.Env.filter(e => !/^(?:VIRTUAL_(?:HOST|PORT|PROTO)|DOK_SOURCE_HOST_PATH)=/.test(String(e)))
+    : [];
   if (domain) {
     envList.push(`VIRTUAL_HOST=${domain}`);
     envList.push(`VIRTUAL_PORT=${port}`);
   }
+  if (sourceCheckout) envList.push(`DOK_SOURCE_HOST_PATH=${sourceCheckout}`);
   const portBindings = info.HostConfig?.PortBindings || {};
   const ports = [];
   for (const key of Object.keys(portBindings)) {
@@ -3960,10 +3963,17 @@ function buildWadCompose(info, { network, domain, port, serviceName = 'app', ext
 
   const volumes = [];
   const seen = new Set();
+  const bindDestination = value => {
+    const parts = String(value || '').split(':');
+    if (parts.length >= 3) parts.pop();
+    return parts.length >= 2 ? parts.slice(1).join(':') : '';
+  };
   for (const b of info.HostConfig?.Binds || []) {
-    if (b && !seen.has(b)) { volumes.push(b); seen.add(b); }
+    if (!b || bindDestination(b) === '/app/host-source') continue;
+    if (!seen.has(b)) { volumes.push(b); seen.add(b); }
   }
   for (const m of info.Mounts || []) {
+    if (m.Destination === '/app/host-source') continue;
     if (m.Type === 'bind' && m.Source && m.Destination) {
       const vol = `${m.Source}:${m.Destination}${m.RW === false ? ':ro' : ''}`;
       if (!seen.has(vol)) { volumes.push(vol); seen.add(vol); }
@@ -3972,8 +3982,9 @@ function buildWadCompose(info, { network, domain, port, serviceName = 'app', ext
       if (!volumes.some(v => v.includes(m.Destination))) volumes.push(vol);
     }
   }
-  for (const volume of Array.isArray(extraVolumes) ? extraVolumes : []) {
-    if (volume && !volumes.includes(volume)) volumes.push(volume);
+  if (sourceCheckout) {
+    const volume = `${sourceCheckout}:/app/host-source`;
+    if (!volumes.includes(volume)) volumes.push(volume);
   }
 
   const restart = info.HostConfig?.RestartPolicy?.Name || 'unless-stopped';
@@ -4033,6 +4044,15 @@ function buildWadCompose(info, { network, domain, port, serviceName = 'app', ext
   return compose;
 }
 
+function looksLikeDokCheckout(dir) {
+  try {
+    return ['Dockerfile', path.join('server', 'index.js')]
+      .every(file => fs.statSync(path.join(dir, file)).isFile());
+  } catch {
+    return false;
+  }
+}
+
 async function scheduleSelfRecreate(domain, network) {
   const port = String(process.env.PORT || 8080);
   const containersAll = await docker.listContainers({ all: true });
@@ -4077,18 +4097,17 @@ async function scheduleSelfRecreate(domain, network) {
   const helperImage = info.Image || info.Config?.Image;
   if (!helperImage) throw new Error('Unable to determine the WickedAFDok image for self-recreation');
 
-  const dataMount = (info.Mounts || []).find(m => m.Destination === '/app/data');
-  const hostDataDir = dataMount?.Type === 'bind' && dataMount.Source ? dataMount.Source : null;
-  const hostCheckout = hostDataDir && path.basename(hostDataDir) === 'data' ? path.dirname(hostDataDir) : '';
-  const extraVolumes = hostCheckout && hostCheckout !== path.parse(hostCheckout).root
-    ? [`${hostCheckout}:/app/host-source`]
-    : [];
+  const sourceMount = (info.Mounts || []).find(m =>
+    m.Destination === '/app/host-source' && m.Type === 'bind' && m.Source);
+  const sourceCheckout = sourceMount?.Source && looksLikeDokCheckout('/app/host-source')
+    ? sourceMount.Source
+    : '';
   writePrivateFile(composePath, buildWadCompose(info, {
     network,
     domain: normalizeDomain(domain),
     port,
     serviceName: 'wickedafdok',
-    extraVolumes
+    sourceCheckout
   }));
 
   const script = ['set -u'];
@@ -5693,11 +5712,8 @@ function maintenanceHostPort() {
 async function maintenanceHostCheckout() {
   const info = await selfContainerInfo();
   const sourceMount = (info?.Mounts || []).find(m => m.Destination === '/app/host-source' && m.Type === 'bind' && m.Source);
-  if (sourceMount?.Source) return path.normalize(sourceMount.Source);
-  const dataMount = (info?.Mounts || []).find(m => m.Destination === '/app/data' && m.Type === 'bind' && m.Source);
-  const checkout = dataMount ? path.dirname(dataMount.Source) : await selfMountSource('/app/host-source');
-  if (!checkout || checkout === '/' || checkout === '.') return null;
-  return checkout;
+  if (!sourceMount?.Source || !looksLikeDokCheckout('/app/host-source')) return null;
+  return path.normalize(sourceMount.Source);
 }
 
 function maintenanceStorageHostPath(checkout) {
@@ -5743,6 +5759,9 @@ function maintenanceComposeText({ checkout, storageRoot, image, installationId: 
     '    privileged: true',
     '    working_dir: /app',
     '    command: ["node", "/app/maintenance/server.js"]',
+    '    environment:',
+    `      - ${yamlScalar(`DOK_HOST_PATH=${checkout}`)}`,
+    `      - ${yamlScalar(`DOK_STORAGE_HOST_PATH=${storage}`)}`,
     '    ports:',
     `      - ${yamlScalar(`${hostPort}:8090`)}`,
     '    volumes:',
@@ -5860,11 +5879,20 @@ async function ensureMaintenanceService({ wait = true, recreate = false } = {}) 
   } else {
     // Recreate through the generated compose so mount changes (the relocated
     // Dok data root and Maintenance store) take effect on an existing container.
-    const context = await ensureMaintenanceCompose();
-    await ensureNetwork('wicked');
-    const args = ['compose', '-p', 'wickedafdok-maintenance', '-f', context.composePath, 'up', '-d', '--remove-orphans'];
-    if (recreate) args.push('--force-recreate');
-    await run('docker', args, { cwd: root, timeout: 180000 });
+    try {
+      const context = await ensureMaintenanceCompose();
+      await ensureNetwork('wicked');
+      const args = ['compose', '-p', 'wickedafdok-maintenance', '-f', context.composePath, 'up', '-d', '--remove-orphans'];
+      if (recreate) args.push('--force-recreate');
+      await run('docker', args, { cwd: root, timeout: 180000 });
+    } catch (e) {
+      if (!info) throw e;
+      // A broken host-source mount must not lock the user out of an existing
+      // Maintenance container; its updater can recover the checkout and repair
+      // the mount from the host path recorded in its logs.
+      console.warn(`Could not regenerate the Maintenance compose (${e.message}); starting the existing container.`);
+      await docker.getContainer(maintenanceContainer).start();
+    }
   }
   const ready = wait ? await waitForMaintenanceHelper(60000) : true;
   return { started: true, running: true, ready };

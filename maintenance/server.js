@@ -7,7 +7,8 @@ import multer from 'multer';
 import pty from 'node-pty';
 import { WebSocketServer } from 'ws';
 import {
-  DOK_ROOT, DOK_SOURCE_ROOT, DOK_COMPOSE_ROOT, DOK_STORAGE_HOST, HOST_ROOT, MAINT_DATA, MAINT_DATA_HOST,
+  DOK_ROOT, DOK_SOURCE_ROOT, DOK_SOURCE_HOST_PATH, DOK_SOURCE_RECOVERED, DOK_COMPOSE_ROOT,
+  DOK_STORAGE_HOST, HOST_ROOT, MAINT_DATA, MAINT_DATA_HOST,
   DOK_CONTAINER, DOK_PORT, DOK_IMAGE, DOK_HOST_PATH,
   MAINTENANCE_URL, DEFAULT_NETWORK, dataDir, appsDir, coreDir, sourcesDir, uploadsDir,
   backupsDir, snapshotsDir, logsDir, opencodeDir, installationPath, installationStatePath, tokenPath,
@@ -87,6 +88,13 @@ function logLine(level, message) {
   if (logCache.length > 3000) logCache.splice(0, logCache.length - 3000);
   try { fs.appendFileSync(path.join(logsDir, 'maintenance.log'), line + '\n', { mode: 0o600 }); } catch {}
   process.stdout.write(line + '\n');
+}
+
+if (DOK_SOURCE_RECOVERED) {
+  logLine('WARN',
+    `The configured source mount is not a Dok checkout. Recovered ${DOK_SOURCE_ROOT}` +
+    `${DOK_SOURCE_HOST_PATH ? ` (host path ${DOK_SOURCE_HOST_PATH})` : ''}. ` +
+    'Run sudo ./setup.sh from the checkout if updates still cannot find the source.');
 }
 
 function cookieToken(headers = {}) {
@@ -444,6 +452,28 @@ function dokComposeArgs(ctx) {
   return args;
 }
 
+function dokHostStoragePath() {
+  if (DOK_STORAGE_HOST) return DOK_STORAGE_HOST;
+  if (DOK_ROOT.startsWith(HOST_ROOT + path.sep)) return DOK_ROOT.slice(HOST_ROOT.length);
+  return '';
+}
+
+function dokComposeHostEnv() {
+  const env = {};
+  if (DOK_SOURCE_HOST_PATH) env.DOK_SOURCE_PATH = DOK_SOURCE_HOST_PATH;
+  const storage = dokHostStoragePath();
+  if (storage) env.DOK_STORAGE_ROOT = storage;
+  return env;
+}
+
+function requireDokSourceHostPath() {
+  if (DOK_SOURCE_HOST_PATH) return DOK_SOURCE_HOST_PATH;
+  throw new Error(
+    'The Dok checkout host path is unknown, so Docker cannot mount the source safely. ' +
+    'Run sudo ./setup.sh from the Dok checkout, then retry.'
+  );
+}
+
 async function buildDokImage(ctx, log = () => {}) {
   if (!fs.existsSync(path.join(DOK_SOURCE_ROOT, 'Dockerfile'))) {
     if (ctx.managed) return null;
@@ -461,12 +491,13 @@ async function buildDokImage(ctx, log = () => {}) {
 async function launchDok({ build = true } = {}) {
   const ctx = dokComposeContext();
   if (!fs.existsSync(ctx.file)) throw new Error(`Dok compose file was not found at ${ctx.file}`);
+  requireDokSourceHostPath();
   await ensureDokSocketOverride(ctx, message => logLine('WARN', message));
   if (build) await buildDokImage(ctx, message => logLine('INFO', message));
   logLine('INFO', `Launching Dok with the ${ctx.managed ? 'managed' : 'root'} compose ${ctx.file}`);
   const args = dokComposeArgs(ctx);
   args.push('up', '-d', '--force-recreate', '--remove-orphans');
-  return run('docker', args, { cwd: ctx.dir, timeout: 0 });
+  return run('docker', args, { cwd: ctx.dir, timeout: 0, env: dokComposeHostEnv() });
 }
 
 async function configureServices(plan, log) {
@@ -1237,6 +1268,7 @@ async function runUpdate({ repo = '', branch = '', force = false }) {
   try {
     job.running = true;
     job.phase = 'checking';
+    requireDokSourceHostPath();
     let initialized = false;
     try {
       await run('git', ['rev-parse', '--git-dir'], { cwd: DOK_SOURCE_ROOT });
@@ -1245,8 +1277,8 @@ async function runUpdate({ repo = '', branch = '', force = false }) {
         .every(file => fs.existsSync(path.join(DOK_SOURCE_ROOT, file)));
       if (!looksLikeDok) {
         throw new Error(
-          `The source directory ${DOK_SOURCE_ROOT} is not a git checkout. ` +
-          'Point DOK_SOURCE_PATH at the Dok checkout and try again.'
+          `The source directory ${DOK_SOURCE_ROOT} is not a Dok checkout. ` +
+          'Run sudo ./setup.sh from the Dok checkout so Maintenance mounts it, then try again.'
         );
       }
       try {
@@ -1320,7 +1352,11 @@ async function runUpdate({ repo = '', branch = '', force = false }) {
     const composeArgs = dokComposeArgs(ctx);
     job.phase = 'recreating';
     log(`Recreating Dok from the ${ctx.managed ? 'managed' : 'root'} compose...`);
-    await run('docker', [...composeArgs, 'up', '-d', '--force-recreate', '--remove-orphans'], { cwd: ctx.dir, timeout: 0 });
+    await run('docker', [...composeArgs, 'up', '-d', '--force-recreate', '--remove-orphans'], {
+      cwd: ctx.dir,
+      timeout: 0,
+      env: dokComposeHostEnv()
+    });
     job.phase = 'waiting';
     const verification = await verifyDokInstallation({ timeoutMs: 300000 });
     if (!verification.ok) throw new Error(`Update recreated Dok, but verification failed: ${verification.error}`);
@@ -1335,21 +1371,23 @@ async function runUpdate({ repo = '', branch = '', force = false }) {
       if (fs.existsSync(composeFile)) {
         const socket = process.env.DOCKER_SOCK || '/var/run/docker.sock';
         const owner = dokOwner();
+        const storageHost = dokHostStoragePath();
+        if (!storageHost) throw new Error('The Dok storage host path is unknown.');
         const mounts = ['-v', `${socket}:/var/run/docker.sock`];
         let composePathInHelper;
         if (useGenerated) {
-          mounts.push('-v', `${DOK_ROOT}:/dok`);
+          mounts.push('-v', `${storageHost}:/dok`);
           composePathInHelper = `/dok/${path.relative(DOK_ROOT, composeFile).split(path.sep).join('/')}`;
         } else {
-          mounts.push('-v', `${DOK_SOURCE_ROOT}:/dok-source`, '-v', `${DOK_ROOT}:/dok`);
+          mounts.push('-v', `${DOK_SOURCE_HOST_PATH}:/dok-source`, '-v', `${storageHost}:/dok`);
           composePathInHelper = `/dok-source/${path.relative(DOK_SOURCE_ROOT, composeFile).split(path.sep).join('/')}`;
         }
         const script = `sleep 3; docker compose -p wickedafdok-maintenance -f ${composePathInHelper} up -d --remove-orphans --force-recreate`;
         await run('docker', [
           'run', '--rm', '-d', '--name', 'wickedafdok-maintenance-refresh',
           ...mounts,
-          '-e', `DOK_SOURCE_PATH=${DOK_HOST_PATH}`,
-          '-e', `DOK_STORAGE_ROOT=${DOK_STORAGE_HOST || DOK_ROOT}`,
+          '-e', `DOK_SOURCE_PATH=${DOK_SOURCE_HOST_PATH}`,
+          '-e', `DOK_STORAGE_ROOT=${storageHost}`,
           '-e', `MAINTENANCE_DATA_PATH=${MAINT_DATA_HOST}`,
           '-e', 'HOST_PATH=/',
           '-e', `DOCKER_SOCK=${socket}`,

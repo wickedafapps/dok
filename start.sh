@@ -13,6 +13,7 @@ case "$STORAGE_ROOT" in
   *) echo "DOK_STORAGE_ROOT must be an absolute host path: $STORAGE_ROOT" >&2; exit 2 ;;
 esac
 export DOK_STORAGE_ROOT="$STORAGE_ROOT"
+export DOK_SOURCE_PATH="$DIR"
 COMPOSE="$DIR/docker-compose.yml"
 ALT="$STORAGE_ROOT/data/wickedafdok/docker-compose.yml"
 SOCK=${DOCKER_SOCK:-/var/run/docker.sock}
@@ -46,6 +47,22 @@ services:
   "$service":
     group_add:
       - "$gid"
+EOF
+}
+
+write_host_source_override() {
+  compose_file=$1
+  out_file=$2
+  rm -f "$out_file"
+  [ -f "$compose_file" ] || return 0
+  service=$(docker compose -f "$compose_file" config --services 2>/dev/null | head -n 1 || true)
+  [ -n "$service" ] || return 0
+  cat > "$out_file" <<EOF
+# managed-by: wickedafdok-start
+services:
+  "$service":
+    volumes:
+      - "$DIR:/app/host-source"
 EOF
 }
 
@@ -103,9 +120,13 @@ if [ -f "$ALT" ]; then
     fi
     detach_legacy_container
     write_socket_override docker-compose.yml docker-compose.socket-gid.yml "$GID"
+    write_host_source_override docker-compose.yml docker-compose.host-source.yml
     set -- docker compose -p wickedafdok -f docker-compose.yml
     if [ -f docker-compose.override.yml ]; then
       set -- "$@" -f docker-compose.override.yml
+    fi
+    if [ -f docker-compose.host-source.yml ]; then
+      set -- "$@" -f docker-compose.host-source.yml
     fi
     if [ -f docker-compose.socket-gid.yml ]; then
       set -- "$@" -f docker-compose.socket-gid.yml
