@@ -1032,6 +1032,124 @@ function yamlScalar(value) {
   return JSON.stringify(String(value ?? '').replace(/\r?\n/g, ' ').replace(/\$/g, () => '$$'));
 }
 
+// Compose v2 ignores the top-level version field and warns about short device
+// mappings. Keep Dok-written compose files on the current syntax so those
+// warnings cannot block validation or deployment.
+function stripComposeVersion(composeText) {
+  const lines = String(composeText || '').replace(/\r\n/g, '\n').split('\n');
+  let removed = false;
+  for (let i = 0; i < lines.length; i++) {
+    const match = lines[i].match(/^(?:["']version["']|version)[ \t]*:[ \t]*(.*)$/);
+    if (!match) continue;
+    const rest = stripYamlComment(match[1]).trim();
+    if (rest && /^[\[{]/.test(rest)) continue;
+    let end = i + 1;
+    if (!rest) {
+      while (end < lines.length) {
+        const child = lines[end];
+        if (!child.trim()) { end++; continue; }
+        if (lineIndent(child) === 0) break;
+        end++;
+      }
+    }
+    lines.splice(i, end - i);
+    removed = true;
+    i--;
+  }
+  if (!removed) return composeText;
+  while (lines.length && !lines[0].trim()) lines.shift();
+  return lines.join('\n');
+}
+
+function parseShortDeviceEntry(value) {
+  const text = String(value ?? '').trim();
+  if (!text || /^[\[{]/.test(text)) return null;
+  const clean = unquoteYamlScalar(text);
+  if (!clean || clean.includes('=') || /\s/.test(clean)) return null;
+  const parts = clean.split(':');
+  if (parts.length > 3) return null;
+  const source = parts[0];
+  const target = parts[1] || source;
+  const permissions = parts[2] || 'rwm';
+  if (!source || !target || !/^[rwm]+$/.test(permissions)) return null;
+  return { source, target, permissions };
+}
+
+function composeDeviceEntryLines(value, indent = '  ') {
+  const text = String(value ?? '').trim();
+  const parsed = parseShortDeviceEntry(text);
+  if (!parsed) return [`${indent}- ${yamlScalar(text)}`];
+  return [
+    `${indent}- source: ${yamlScalar(parsed.source)}`,
+    `${indent}  target: ${yamlScalar(parsed.target)}`,
+    `${indent}  permissions: ${yamlScalar(parsed.permissions)}`
+  ];
+}
+
+function composeDevicesYaml(devices, indent = '    ') {
+  const list = Array.isArray(devices) ? devices : [devices];
+  if (!list.length) return '';
+  let yaml = `${indent}devices:\n`;
+  for (const device of list) {
+    if (device && typeof device === 'object') {
+      const source = String(device.source ?? device.src ?? '').trim();
+      const target = String(device.target ?? device.dst ?? device.destination ?? source).trim();
+      const permissions = String(device.permissions ?? device.perms ?? '').trim() || 'rwm';
+      if (!source || !target) continue;
+      yaml += `${indent}  - source: ${yamlScalar(source)}\n`;
+      yaml += `${indent}    target: ${yamlScalar(target)}\n`;
+      yaml += `${indent}    permissions: ${yamlScalar(permissions)}\n`;
+      continue;
+    }
+    const text = String(device ?? '').trim();
+    if (!text) continue;
+    const parsed = parseShortDeviceEntry(text);
+    if (!parsed) {
+      yaml += `${indent}  - ${yamlScalar(text)}\n`;
+      continue;
+    }
+    yaml += `${indent}  - source: ${yamlScalar(parsed.source)}\n`;
+    yaml += `${indent}    target: ${yamlScalar(parsed.target)}\n`;
+    yaml += `${indent}    permissions: ${yamlScalar(parsed.permissions)}\n`;
+  }
+  return yaml;
+}
+
+function normalizeComposeDevices(composeText) {
+  const source = String(composeText || '');
+  if (!source.trim()) return source;
+  const lines = source.replace(/\r\n/g, '\n').split('\n');
+  const out = [];
+  let changed = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const header = line.match(/^([ \t]*)devices[ \t]*:[ \t]*(.*)$/);
+    if (!header) { out.push(line); continue; }
+    out.push(line);
+    const baseIndent = header[1];
+    if (stripYamlComment(header[2]).trim()) continue;
+    let j = i + 1;
+    for (; j < lines.length; j++) {
+      const child = lines[j];
+      if (!child.trim()) { out.push(child); continue; }
+      const indent = (child.match(/^[ \t]*/) || [''])[0];
+      if (indent.length <= baseIndent.length) break;
+      const item = child.match(/^([ \t]*)-[ \t]+(.*)$/);
+      if (!item) { out.push(child); continue; }
+      const content = stripYamlComment(item[2]).trim();
+      const parsed = parseShortDeviceEntry(content);
+      if (!parsed || !/^\/dev(?:\/|$)/.test(parsed.source)) { out.push(child); continue; }
+      out.push(...composeDeviceEntryLines(content, item[1]));
+      changed = true;
+    }
+    i = j - 1;
+  }
+  if (!changed) return composeText;
+  let result = out.join('\n');
+  if (/\r?\n$/.test(source) && !result.endsWith('\n')) result += '\n';
+  return result;
+}
+
 function unquoteYamlScalar(value) {
   const text = String(value ?? '').trim();
   if (text.length >= 2 && text.startsWith('"') && text.endsWith('"')) {
@@ -1444,9 +1562,7 @@ function runCommandToCompose(command, appName, opts = {}) {
   if (parsed.capDrop.length) {
     compose += `    cap_drop:\n${parsed.capDrop.map(v => `      - ${yamlScalar(v)}`).join('\n')}\n`;
   }
-  if (parsed.devices.length) {
-    compose += `    devices:\n${parsed.devices.map(v => `      - ${yamlScalar(v)}`).join('\n')}\n`;
-  }
+  if (parsed.devices.length) compose += composeDevicesYaml(parsed.devices, '    ');
   if (parsed.addHosts.length) {
     compose += `    extra_hosts:\n${parsed.addHosts.map(v => `      - ${yamlScalar(v)}`).join('\n')}\n`;
   }
@@ -1676,7 +1792,8 @@ async function composeConfig(composeTexts, { projectDir = '' } = {}) {
     const args = ['compose'];
     list.forEach((text, index) => {
       const file = path.join(workDir, `.wickedafdok-inspect-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 8)}.yml`);
-      fs.writeFileSync(file, String(text || ''));
+      const normalized = normalizeComposeDevices(stripComposeVersion(String(text || '')));
+      fs.writeFileSync(file, normalized);
       tmpFiles.push(file);
       args.push('-f', file);
     });
@@ -2225,7 +2342,9 @@ function ensureComposeServiceRestart(composeText) {
 function standardizeAppCompose(composeText, { networkNames = null, defaultNetwork = 'wicked' } = {}) {
   let text = String(composeText || '').replace(/\r\n/g, '\n');
   if (!text.trim()) return text;
+  text = stripComposeVersion(text);
   text = stripComposeProjectName(text);
+  text = normalizeComposeDevices(text);
   text = ensureManagedComposeHeader(text);
   text = ensureComposeServiceRestart(text);
   if (Array.isArray(networkNames)) {
@@ -2407,14 +2526,14 @@ async function validateCompose(composeText, { projectDir = '' } = {}) {
   if (!text.trim()) return { ok: false, issues: ['Compose file is empty'] };
   if (!/^services\s*:/m.test(text)) issues.push('Missing "services:" section');
   if (/^\t/m.test(text)) issues.push('Tabs are not allowed for indentation in YAML; use spaces');
-  if (/\bversion\s*:/i.test(text)) issues.push('Warning: "version" is obsolete in Compose v2 and can be removed');
+  if (/^(?:["']version["']|version)[ \t]*:/m.test(text)) issues.push('Warning: "version" is obsolete in Compose v2 and can be removed');
   if (issues.some(i => !i.startsWith('Warning'))) return { ok: false, issues };
 
   const workDir = projectDir && fs.existsSync(projectDir) ? projectDir : path.join(dataDir, 'tmp');
   try { fs.mkdirSync(workDir, { recursive: true }); } catch {}
   const tmpFile = path.join(workDir, `.wickedafdok-validate-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.yml`);
   try {
-    fs.writeFileSync(tmpFile, text);
+    fs.writeFileSync(tmpFile, normalizeComposeDevices(stripComposeVersion(text)));
     await run('docker', ['compose', '-f', tmpFile, 'config', '--quiet'], { cwd: workDir });
   } catch (e) {
     if (e && e.code === 'ENOENT') {
@@ -2464,7 +2583,7 @@ const BUILDER_FIELD_MODES = {
   read_only: 'boolean',
   stdin_open: 'boolean',
   tty: 'boolean',
-  devices: 'list',
+  devices: 'devices',
   cap_add: 'list',
   cap_drop: 'list',
   security_opt: 'list',
@@ -2563,6 +2682,18 @@ function builderVolumeToString(volume) {
   return `${source ? source + ':' : ''}${target}${readOnly}`;
 }
 
+function builderDeviceToString(device) {
+  if (device === null || device === undefined) return '';
+  if (typeof device !== 'object') return String(device);
+  const source = String(device.source ?? device.src ?? '').trim();
+  const target = String(device.target ?? device.dst ?? device.destination ?? source).trim();
+  if (!source) return '';
+  let text = source === target ? source : `${source}:${target}`;
+  const permissions = String(device.permissions ?? device.perms ?? '').trim();
+  if (permissions && permissions !== 'rwm') text += `:${permissions}`;
+  return text;
+}
+
 function builderFieldValueToString(key, value, type) {
   const mode = type === 'raw' ? 'raw' : (BUILDER_FIELD_MODES[key] || (type ? BUILDER_FIELD_MODES[type] : undefined) || 'raw');
   if (mode === 'boolean') return value === true || value === 'true';
@@ -2583,6 +2714,10 @@ function builderFieldValueToString(key, value, type) {
     if (value && typeof value === 'object') {
       return Object.entries(value).map(([k, v]) => v === null || v === undefined ? String(k) : `${k}=${String(v)}`).join('\n');
     }
+    return value === null || value === undefined ? '' : String(value);
+  }
+  if (mode === 'devices') {
+    if (Array.isArray(value)) return value.map(builderDeviceToString).filter(Boolean).join('\n');
     return value === null || value === undefined ? '' : String(value);
   }
   if (mode === 'list') {
@@ -2736,7 +2871,7 @@ function builderModelFromComposeConfig(config) {
     });
   }
 
-  const handled = new Set(['services', 'networks', 'volumes', 'name']);
+  const handled = new Set(['services', 'networks', 'volumes', 'name', 'version']);
   const other = Object.create(null);
   for (const [key, value] of Object.entries(config && typeof config === 'object' ? config : {})) {
     if (handled.has(key)) continue;
@@ -2919,6 +3054,26 @@ function builderFieldToComposeValue(field, addIssue) {
     const items = builderListItems(value, true);
     if (!items.length) return { skip: true };
     return { value: items };
+  }
+  if (mode === 'devices') {
+    const items = builderListItems(value);
+    if (!items.length) return { skip: true };
+    const devices = [];
+    for (const item of items) {
+      const text = String(item || '').trim();
+      if (!text) continue;
+      if (text.startsWith('{')) {
+        try {
+          const parsed = JSON.parse(text);
+          if (parsed && typeof parsed === 'object' && parsed.source) { devices.push(parsed); continue; }
+        } catch {}
+      }
+      const parsed = parseShortDeviceEntry(text);
+      if (!parsed) { devices.push(text); continue; }
+      devices.push({ source: parsed.source, target: parsed.target, permissions: parsed.permissions });
+    }
+    if (!devices.length) return { skip: true };
+    return { value: devices };
   }
   if (mode === 'list') {
     const items = builderListItems(value);
@@ -3226,7 +3381,7 @@ async function buildComposeFromBuilderModel(input, { projectDir = '', validate =
         });
       } else {
         for (const [key, value] of Object.entries(other)) {
-          if (key === 'name') continue;
+          if (key === 'name' || key === 'version') continue;
           if (['services', 'networks', 'volumes'].includes(key)) {
             addBuilderFieldIssue(fieldIssues, {
               section: 'other', key: '__other__',
@@ -3504,6 +3659,13 @@ function containerToCompose(info, { serviceName = 'app', network = '', networks 
   const env = Array.isArray(info.Config?.Env) ? info.Config.Env : [];
   const command = Array.isArray(info.Config?.Cmd) && info.Config.Cmd.length ? info.Config.Cmd : null;
   const entrypoint = Array.isArray(info.Config?.Entrypoint) && info.Config.Entrypoint.length ? info.Config.Entrypoint : null;
+  const devices = (info.HostConfig?.Devices || [])
+    .map(device => ({
+      source: String(device?.PathOnHost || '').trim(),
+      target: String(device?.PathInContainer || device?.PathOnHost || '').trim(),
+      permissions: String(device?.CgroupPermissions || '').trim() || 'rwm'
+    }))
+    .filter(device => device.source && device.target);
 
   let compose = `# managed-by: wickedafdok\nservices:\n  ${yamlScalar(name)}:\n`;
   compose += `    container_name: ${yamlScalar(info.Name ? info.Name.replace(/^\//, '') : name)}\n`;
@@ -3517,6 +3679,7 @@ function containerToCompose(info, { serviceName = 'app', network = '', networks 
   if (info.Config?.WorkingDir) compose += `    working_dir: ${yamlScalar(info.Config.WorkingDir)}\n`;
   if (!specialMode && ports.length) compose += `    ports:\n${ports.map(p => `      - ${yamlScalar(p)}`).join('\n')}\n`;
   if (volumes.length) compose += `    volumes:\n${volumes.map(v => `      - ${yamlScalar(v)}`).join('\n')}\n`;
+  if (devices.length) compose += composeDevicesYaml(devices, '    ');
   if (env.length) compose += `    environment:\n${env.map(e => `      - ${yamlScalar(e)}`).join('\n')}\n`;
   if (!specialMode && netList.length) {
     compose += `    networks:\n${netList.map(n => `      - ${yamlScalar(n)}`).join('\n')}\n`;
@@ -8705,7 +8868,7 @@ function sanitizeComposeForLibrary(text) {
     if (/^[^\s#]/.test(line)) {
       const keyMatch = line.match(/^([A-Za-z0-9_.-]+)\s*:/);
       const key = keyMatch ? keyMatch[1] : '';
-      if (key === 'name') continue;
+      if (key === 'name' || key === 'version') continue;
       top = key;
       service = '';
       sub = '';
@@ -9334,7 +9497,9 @@ function composeHasVhostKey(text) {
 }
 
 function normalizeEditedAppCompose(entry, compose, { vhostTouched = false, addDefaultNetwork = true } = {}) {
-  let next = stripComposeProjectName(String(compose || ''));
+  let next = stripComposeVersion(String(compose || ''));
+  next = normalizeComposeDevices(next);
+  next = stripComposeProjectName(next);
   next = ensureManagedComposeHeader(next);
   const defaultNetwork = String(configuredDefaults().defaultNetwork || 'wicked').trim() || 'wicked';
   if (addDefaultNetwork && !/^networks\s*:/m.test(next) && !/\bnetwork_mode\s*:/.test(next)) {
