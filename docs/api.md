@@ -37,11 +37,22 @@ Load this file when adding, changing, or calling REST or terminal endpoints.
 - `POST /api/launch/upload` - Upload files and process (required `name` app title)
 - `POST /api/launch/source` - Deploy from sources directory (required `name` app title)
 - Creator routes return the detected `referenceUrl` for the compose editor when an official repository or website is found.
-- `POST /api/assist/start` - Upload optional files, write the OC Assist brief, and start a User-mode `assist` OpenCode session (required `prompt` and `name` app title, optional `data`, `files`, `paths`)
+- `POST /api/assist/start` - Upload optional files, write the OC Assist brief, start the User-mode OpenCode server, create an `assist` chat, and queue the first prompt (required `prompt` and `name` app title, optional `data`, `files`, `paths`); returns `{ chat, appName, briefPath, uploadDir }`
 - `POST /api/launch/finalize` - Complete creation (required app title; save to apps dir, update registry, optional test launch that is always stopped again); accepts `referenceUrl` and otherwise detects it; a per-app lock returns `409 alreadyFinalizing` and failures after the registry write return `created: true`
 - `POST /api/compose/validate` - Validate compose file content
 - `POST /api/compose/parse` - Parse a compose file into editable builder fields
 - `POST /api/compose/build` - Generate compose from builder fields and return field-level issues
+
+## OC Assist Chats
+
+- `GET /api/assist/chats` - List in-memory OC Assist chats with status, app name, and last activity
+- `GET /api/assist/chats/:id` - Chat snapshot: session status, compact messages (text, reasoning, tools, files, patches), pending questions, pending permissions, and a revision hash; restarts the OpenCode server when needed
+- `POST /api/assist/chats/:id/prompt` - Send a follow-up prompt (`{ prompt }`, max 20000 characters)
+- `POST /api/assist/chats/:id/abort` - Abort the current OpenCode run
+- `POST /api/assist/chats/:id/stop` - Abort and remove the chat; stops the shared server when it was the last chat
+- `POST /api/assist/chats/:id/question` - Answer a question request (`{ requestID, answers }`, answers ordered by question)
+- `POST /api/assist/chats/:id/question/reject` - Skip a question request (`{ requestID }`)
+- `POST /api/assist/chats/:id/permission` - Reply to a permission request (`{ requestID, reply }` where reply is `once`, `always`, or `reject`)
 
 ## Maintenance / Installation
 
@@ -76,15 +87,15 @@ Load this file when adding, changing, or calling REST or terminal endpoints.
 - `POST /api/core/:service/:action(start|stop|restart)` - Apply an action to one core service
 - `GET /api/core/app-hints` - Installed-or-running core-service flags and compose environment field hints (`VIRTUAL_HOST`, `VIRTUAL_PORT`, `ENABLE_AUTH`, `LETSENCRYPT_HOST`, `LETSENCRYPT_EMAIL`) used by the app and library compose builders; `?app=<name>` supplies the default routed hostname
 - `GET /api/core/dashboard` - Installed core services with web UIs, their configured/localhost URLs, and running state for the Dashboard console buttons
-- `GET /api/core/opencode` - OpenCode install/version, running sessions, modes, and generated configs
+- `GET /api/core/opencode` - OpenCode install/version, running PTY sessions, OC Assist chats, modes, and generated configs
 - `POST /api/core/opencode/settings` - Save optional model/provider/API key
-- `POST /api/core/opencode/run` - Legacy OpenCode launcher; Dok's UI no longer calls it (OC Assist starts through `POST /api/assist/start`)
-- `POST /api/core/opencode/stop` - Stop all running OpenCode sessions
+- `POST /api/core/opencode/run` - Legacy OpenCode PTY launcher; Dok's UI no longer calls it (OC Assist starts through `POST /api/assist/start`)
+- `POST /api/core/opencode/stop` - Stop every OC Assist chat, the shared OpenCode server, and legacy OpenCode PTY sessions
 
 ## Terminal
 
-- `GET /api/terminal` - Terminal capabilities, OpenCode version, available modes, and sessions
-- `POST /api/terminal/sessions` - Create a PTY session (`{ mode, app }`, where `app` is `shell` or `opencode`)
+- `GET /api/terminal` - Terminal capabilities, OpenCode version, available modes, and PTY sessions
+- `POST /api/terminal/sessions` - Create a PTY session (`{ mode, app }`, where `app` is `shell` or a legacy `opencode` TUI)
 - `POST /api/terminal/sessions/:id/stop` - Stop one session
 - `POST /api/terminal/sessions/stop-all` - Stop all sessions, optionally filtered by `app`
 - `GET /api/terminal/sessions/:id/output?after=<sequence>` - Poll buffered output for the HTTP compatibility transport

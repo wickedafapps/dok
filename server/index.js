@@ -7,6 +7,7 @@ import path from 'path';
 import { execFile, spawn } from 'child_process';
 import crypto from 'crypto';
 import http from 'http';
+import net from 'net';
 import multer from 'multer';
 import { parse as parseShell } from 'shell-quote';
 import { WebSocketServer } from 'ws';
@@ -7903,16 +7904,15 @@ app.post('/api/assist/start', upload.array('files', 100), async (req, res) => {
       'Ask the user only when you genuinely need a domain, port, credential, or host path.',
       'When finished, tell the user the app is saved in the Apps tab and stopped. They must open Deploy to configure routing, ports, paths, and secrets, then deploy it.'
     ].join('\n');
-    const session = await createTerminalSession({
-      mode: 'user',
-      agent: 'assist',
-      app: 'opencode',
+    const chat = await createAssistChat({
+      appName,
       prompt: startPrompt,
       title: 'OC Assist · ' + appName,
-      startupCheck: true
+      briefPath,
+      uploadDir: savedFiles.length ? uploadDir : ''
     });
     started = true;
-    res.json({ ok: true, session, appName, briefPath, uploadDir: savedFiles.length ? uploadDir : '' });
+    res.json({ ok: true, chat, appName, briefPath, uploadDir: savedFiles.length ? uploadDir : '' });
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message });
   } finally {
@@ -12327,6 +12327,394 @@ function terminalEnv(mode, app, settings = {}) {
   return env;
 }
 
+const ASSIST_CHAT_MAX = 8;
+const ASSIST_CHAT_IDLE_STOP_MS = 30 * 60 * 1000;
+const assistChats = new Map();
+let opencodeServer = null;
+let opencodeServerStarting = null;
+
+function clipAssistText(value, max = 40000) {
+  const text = String(value ?? '');
+  return text.length > max ? text.slice(0, max) + '\n… (truncated)' : text;
+}
+
+function assistChatSummary(chat) {
+  return {
+    id: chat.id,
+    appName: chat.appName,
+    title: chat.title,
+    transport: 'chat',
+    createdAt: chat.createdAt,
+    lastActivity: new Date(chat.lastActivity).toISOString(),
+    status: chat.lastStatus || 'idle',
+    waiting: chat.lastWaiting || 0,
+    error: chat.lastError || ''
+  };
+}
+
+function findFreeTcpPort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.unref();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const port = server.address()?.port;
+      server.close(() => port ? resolve(port) : reject(new Error('Could not allocate a local port')));
+    });
+  });
+}
+
+function opencodeServerUrl(server, pathname, withDirectory = true) {
+  const url = new URL(`http://127.0.0.1:${server.port}${pathname.startsWith('/') ? pathname : '/' + pathname}`);
+  if (withDirectory) url.searchParams.set('directory', appsDir);
+  return url;
+}
+
+async function opencodeServerRequest(server, pathname, { method = 'GET', body, timeout = 20000, label = 'request', withDirectory = true } = {}) {
+  let response;
+  try {
+    response = await fetch(opencodeServerUrl(server, pathname, withDirectory), {
+      method,
+      headers: body === undefined ? undefined : { 'content-type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      cache: 'no-store',
+      signal: AbortSignal.timeout(timeout)
+    });
+  } catch (e) {
+    throw httpError(502, `OpenCode server ${label} failed: ${e.message}`);
+  }
+  if (response.status === 204) return null;
+  const text = await response.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  if (!response.ok) {
+    const detail = data && typeof data === 'object'
+      ? (data.message || data.error?.message || data.error || JSON.stringify(data))
+      : text;
+    throw httpError(502, `OpenCode server ${label} failed (${response.status})${detail ? `: ${String(detail).slice(0, 2000)}` : ''}`);
+  }
+  return data;
+}
+
+async function waitForOpencodeServer(server, timeout = 30000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (server.exited) {
+      throw new Error(server.error || `OpenCode exited with code ${server.exitCode ?? 'unknown'}`);
+    }
+    try {
+      const response = await fetch(`http://127.0.0.1:${server.port}/global/health`, {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(1500)
+      });
+      if (response.ok) {
+        const health = await response.json().catch(() => null);
+        if (health?.healthy) return;
+      }
+    } catch {}
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  throw new Error('Timed out waiting for the OpenCode server');
+}
+
+function scheduleOpencodeServerIdleStop(server) {
+  if (!server || server.exited) return;
+  if (server.stopTimer) clearTimeout(server.stopTimer);
+  server.stopTimer = setTimeout(() => {
+    server.stopTimer = null;
+    if (opencodeServer !== server) return;
+    const busy = Array.from(assistChats.values()).some(chat =>
+      chat.lastStatus === 'busy' || chat.lastStatus === 'retry' || (chat.lastWaiting || 0) > 0);
+    if (busy) {
+      scheduleOpencodeServerIdleStop(server);
+      return;
+    }
+    stopOpencodeServer('idle');
+  }, ASSIST_CHAT_IDLE_STOP_MS);
+  if (server.stopTimer.unref) server.stopTimer.unref();
+}
+
+async function startOpencodeServer() {
+  const info = await getOpencodeInfo();
+  if (!info.installed) {
+    throw httpError(503, 'OpenCode is not installed in this container. Rebuild the WickedAFDok image and try again.');
+  }
+  const settings = readSettings();
+  writeOpencodeConfigs(settings);
+  const port = await findFreeTcpPort();
+  const child = spawn(info.path, [
+    'serve', '--hostname', '127.0.0.1', '--port', String(port), '--print-logs', '--log-level', 'INFO'
+  ], {
+    cwd: appsDir,
+    env: terminalEnv('user', 'opencode', settings),
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  const server = {
+    child,
+    port,
+    version: info.version,
+    ready: false,
+    exited: false,
+    exitCode: null,
+    error: '',
+    startedAt: Date.now(),
+    logs: [],
+    stopTimer: null
+  };
+  const capture = chunk => {
+    for (const line of String(chunk).split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      server.logs.push(line);
+      if (server.logs.length > 120) server.logs.shift();
+      if (/error|panic|fatal|failed/i.test(line)) appendServerLog('WARN', `OpenCode server: ${line}`);
+    }
+  };
+  child.stdout.on('data', capture);
+  child.stderr.on('data', capture);
+  child.on('error', err => {
+    server.exited = true;
+    server.error = err.message;
+  });
+  child.on('exit', (code, signal) => {
+    server.exited = true;
+    server.exitCode = code;
+    server.ready = false;
+    if (opencodeServer === server) opencodeServer = null;
+    if (server.stopTimer) clearTimeout(server.stopTimer);
+    const tail = server.logs.slice(-8).join('\n');
+    appendServerLog(code === 0 ? 'INFO' : 'WARN',
+      `OpenCode server exited (code ${code ?? 'unknown'}${signal ? `, ${signal}` : ''})${tail ? `: ${tail}` : ''}`);
+    for (const chat of assistChats.values()) {
+      chat.lastError = `OpenCode server stopped (code ${code ?? 'unknown'}). It will restart on the next request.`;
+    }
+  });
+  opencodeServer = server;
+  try {
+    await waitForOpencodeServer(server);
+  } catch (e) {
+    server.exited = true;
+    try { child.kill('SIGKILL'); } catch {}
+    if (opencodeServer === server) opencodeServer = null;
+    const tail = server.logs.slice(-8).join('\n');
+    throw httpError(502, `OpenCode server failed to start: ${e.message}${tail ? `\n${tail}` : ''}`);
+  }
+  server.ready = true;
+  appendServerLog('INFO', `OpenCode server ready on 127.0.0.1:${port} (pid ${child.pid})`);
+  scheduleOpencodeServerIdleStop(server);
+  return server;
+}
+
+async function ensureOpencodeServer() {
+  if (opencodeServer?.ready && !opencodeServer.exited) return opencodeServer;
+  if (opencodeServerStarting) return opencodeServerStarting;
+  opencodeServerStarting = startOpencodeServer().finally(() => {
+    opencodeServerStarting = null;
+  });
+  return opencodeServerStarting;
+}
+
+function stopOpencodeServer(reason = 'stopped') {
+  const server = opencodeServer;
+  opencodeServer = null;
+  if (!server) return false;
+  server.ready = false;
+  if (server.stopTimer) clearTimeout(server.stopTimer);
+  try { server.child.kill('SIGTERM'); } catch {}
+  const force = setTimeout(() => {
+    try { server.child.kill('SIGKILL'); } catch {}
+  }, 3000);
+  if (force.unref) force.unref();
+  appendServerLog('INFO', `OpenCode server ${reason} (pid ${server.child.pid})`);
+  return true;
+}
+
+function compactAssistMessages(records) {
+  const list = Array.isArray(records) ? records : [];
+  return list.map(record => {
+    const info = record?.info || {};
+    const parts = [];
+    for (const part of Array.isArray(record?.parts) ? record.parts : []) {
+      if (!part || !part.type) continue;
+      if (part.type === 'text') {
+        if (part.synthetic === true) continue;
+        parts.push({ id: part.id, type: 'text', text: clipAssistText(part.text, 200000) });
+      } else if (part.type === 'reasoning') {
+        parts.push({ id: part.id, type: 'reasoning', text: clipAssistText(part.text, 20000) });
+      } else if (part.type === 'tool') {
+        parts.push({
+          id: part.id,
+          type: 'tool',
+          tool: part.tool,
+          callID: part.callID,
+          state: {
+            status: part.state?.status || '',
+            title: clipAssistText(part.state?.title, 500),
+            input: part.state?.input,
+            output: clipAssistText(part.state?.output, 40000),
+            error: clipAssistText(part.state?.error, 10000)
+          }
+        });
+      } else if (part.type === 'file') {
+        parts.push({ id: part.id, type: 'file', filename: part.filename || '', mime: part.mime || '' });
+      } else if (part.type === 'patch') {
+        parts.push({ id: part.id, type: 'patch', files: Array.isArray(part.files) ? part.files.slice(0, 50) : [] });
+      } else if (part.type === 'agent') {
+        parts.push({ id: part.id, type: 'agent', name: part.name || '' });
+      }
+    }
+    return {
+      id: info.id || '',
+      info: {
+        id: info.id || '',
+        role: info.role || '',
+        agent: info.agent || '',
+        model: info.modelID || '',
+        created: info.time?.created || 0,
+        completed: info.time?.completed || 0,
+        error: info.error ? clipAssistText(info.error.message || JSON.stringify(info.error), 4000) : ''
+      },
+      parts
+    };
+  });
+}
+
+function assistQuestionSummary(question) {
+  return {
+    id: question.id,
+    questions: (Array.isArray(question.questions) ? question.questions : []).map(item => ({
+      question: String(item.question || ''),
+      header: String(item.header || ''),
+      multiple: item.multiple === true,
+      custom: item.custom === true,
+      options: (Array.isArray(item.options) ? item.options : []).map(option => ({
+        label: String(option.label || ''),
+        description: String(option.description || '')
+      }))
+    }))
+  };
+}
+
+function assistPermissionSummary(permission) {
+  return {
+    id: permission.id,
+    permission: String(permission.permission || ''),
+    patterns: Array.isArray(permission.patterns) ? permission.patterns.map(String).slice(0, 50) : [],
+    always: Array.isArray(permission.always) ? permission.always.map(String).slice(0, 50) : [],
+    metadata: permission.metadata || {}
+  };
+}
+
+async function assistChatSnapshot(chat) {
+  const server = await ensureOpencodeServer();
+  const sessionPath = `/session/${encodeURIComponent(chat.id)}`;
+  const [records, statuses, questions, permissions] = await Promise.all([
+    opencodeServerRequest(server, `${sessionPath}/message`, { timeout: 30000, label: 'message read' }),
+    opencodeServerRequest(server, '/session/status', { timeout: 15000, label: 'status read' }),
+    opencodeServerRequest(server, '/question', { timeout: 15000, label: 'question read' }).catch(() => []),
+    opencodeServerRequest(server, '/permission', { timeout: 15000, label: 'permission read' }).catch(() => [])
+  ]);
+  const messages = compactAssistMessages(records);
+  const status = statuses && typeof statuses === 'object' && statuses[chat.id]
+    ? statuses[chat.id]
+    : { type: 'idle' };
+  const chatQuestions = (Array.isArray(questions) ? questions : [])
+    .filter(question => question?.sessionID === chat.id)
+    .map(assistQuestionSummary);
+  const chatPermissions = (Array.isArray(permissions) ? permissions : [])
+    .filter(permission => permission?.sessionID === chat.id)
+    .map(assistPermissionSummary);
+  const busy = status.type === 'busy' || status.type === 'retry';
+  const waiting = chatQuestions.length + chatPermissions.length;
+  chat.lastStatus = status.type || 'idle';
+  chat.lastWaiting = waiting;
+  chat.lastError = '';
+  if (busy || waiting) chat.lastActivity = Date.now();
+  scheduleOpencodeServerIdleStop(server);
+  const revision = crypto.createHash('sha1').update(JSON.stringify({
+    status: status.type,
+    messages,
+    questions: chatQuestions.map(question => question.id),
+    permissions: chatPermissions.map(permission => permission.id)
+  })).digest('hex');
+  return {
+    ok: true,
+    chat: assistChatSummary(chat),
+    status,
+    messages,
+    questions: chatQuestions,
+    permissions: chatPermissions,
+    revision
+  };
+}
+
+function requireAssistChat(id) {
+  const chat = assistChats.get(String(id || ''));
+  if (!chat) throw httpError(404, 'This OC Assist chat is no longer running. Start it again from App Creation.');
+  return chat;
+}
+
+async function createAssistChat({ appName, prompt, title, briefPath = '', uploadDir = '' } = {}) {
+  if (assistChats.size >= ASSIST_CHAT_MAX) {
+    const idle = Array.from(assistChats.values())
+      .filter(chat => chat.lastStatus === 'idle' && !(chat.lastWaiting || 0))
+      .sort((a, b) => a.lastActivity - b.lastActivity)[0];
+    if (idle) assistChats.delete(idle.id);
+    else throw httpError(429, `Too many OC Assist chats are open (max ${ASSIST_CHAT_MAX}). Stop one first.`);
+  }
+  const server = await ensureOpencodeServer();
+  const session = await opencodeServerRequest(server, '/session', {
+    method: 'POST',
+    body: { title, agent: 'assist' },
+    timeout: 30000,
+    label: 'session create'
+  });
+  if (!session?.id) throw httpError(502, 'OpenCode did not return a chat session');
+  const now = Date.now();
+  const chat = {
+    id: session.id,
+    appName,
+    title: title || `OC Assist · ${appName}`,
+    briefPath,
+    uploadDir,
+    createdAt: new Date(now).toISOString(),
+    lastActivity: now,
+    lastStatus: 'busy',
+    lastWaiting: 0,
+    lastError: ''
+  };
+  assistChats.set(chat.id, chat);
+  try {
+    await opencodeServerRequest(server, `/session/${encodeURIComponent(chat.id)}/prompt_async`, {
+      method: 'POST',
+      body: { agent: 'assist', parts: [{ type: 'text', text: prompt }] },
+      timeout: 30000,
+      label: 'prompt'
+    });
+  } catch (e) {
+    assistChats.delete(chat.id);
+    opencodeServerRequest(server, `/session/${encodeURIComponent(chat.id)}`, { method: 'DELETE', timeout: 15000 }).catch(() => {});
+    throw e;
+  }
+  scheduleOpencodeServerIdleStop(server);
+  appendServerLog('INFO', `OC Assist chat ${chat.id} started for ${appName}`);
+  return assistChatSummary(chat);
+}
+
+async function stopAllAssistChats() {
+  const chats = Array.from(assistChats.values());
+  assistChats.clear();
+  if (opencodeServer?.ready) {
+    await Promise.allSettled(chats.map(chat =>
+      opencodeServerRequest(opencodeServer, `/session/${encodeURIComponent(chat.id)}/abort`, {
+        method: 'POST',
+        timeout: 10000,
+        label: 'abort'
+      })));
+  }
+  stopOpencodeServer('stopped with all chats');
+  return chats.length;
+}
+
 function scheduleTerminalCleanup(session, delay = 30000) {
   if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
   session.cleanupTimer = setTimeout(() => {
@@ -12665,11 +13053,13 @@ app.get('/api/core/opencode', async (req, res) => {
     const sessions = Array.from(terminalSessions.values())
       .filter(session => session.app === 'opencode')
       .map(terminalSessionSummary);
+    const chats = Array.from(assistChats.values()).map(assistChatSummary);
     res.json({
       installed: info.installed,
       version: info.version,
-      running: sessions.length > 0,
+      running: sessions.length > 0 || chats.length > 0,
       sessions,
+      chats,
       modes: TERMINAL_MODES,
       settings: {
         model: service.model || '',
@@ -12739,9 +13129,150 @@ app.post('/api/core/opencode/run', async (req, res) => {
   }
 });
 
-app.post('/api/core/opencode/stop', (req, res) => {
-  const stopped = stopAllTerminalSessions(session => session.app === 'opencode');
-  res.json({ ok: true, stopped });
+app.post('/api/core/opencode/stop', async (req, res) => {
+  try {
+    const stoppedChats = await stopAllAssistChats();
+    const stoppedSessions = stopAllTerminalSessions(session => session.app === 'opencode');
+    res.json({ ok: true, stopped: stoppedChats + stoppedSessions, chats: stoppedChats, sessions: stoppedSessions });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+app.get('/api/assist/chats', (req, res) => {
+  res.json({
+    ok: true,
+    chats: Array.from(assistChats.values())
+      .map(assistChatSummary)
+      .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
+  });
+});
+
+app.get('/api/assist/chats/:id', async (req, res) => {
+  try {
+    const chat = requireAssistChat(req.params.id);
+    res.json(await assistChatSnapshot(chat));
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+app.post('/api/assist/chats/:id/prompt', async (req, res) => {
+  try {
+    const chat = requireAssistChat(req.params.id);
+    const prompt = String(req.body?.prompt || '').trim();
+    if (!prompt) throw httpError(400, 'Enter a message for OC Assist');
+    if (prompt.length > 20000) throw httpError(400, 'The message is too long (max 20000 characters)');
+    const server = await ensureOpencodeServer();
+    await opencodeServerRequest(server, `/session/${encodeURIComponent(chat.id)}/prompt_async`, {
+      method: 'POST',
+      body: { agent: 'assist', parts: [{ type: 'text', text: prompt }] },
+      timeout: 30000,
+      label: 'prompt'
+    });
+    chat.lastStatus = 'busy';
+    chat.lastError = '';
+    chat.lastActivity = Date.now();
+    scheduleOpencodeServerIdleStop(server);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+app.post('/api/assist/chats/:id/abort', async (req, res) => {
+  try {
+    const chat = requireAssistChat(req.params.id);
+    const server = await ensureOpencodeServer();
+    await opencodeServerRequest(server, `/session/${encodeURIComponent(chat.id)}/abort`, {
+      method: 'POST',
+      timeout: 15000,
+      label: 'abort'
+    });
+    chat.lastStatus = 'idle';
+    chat.lastActivity = Date.now();
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+app.post('/api/assist/chats/:id/stop', async (req, res) => {
+  try {
+    const chat = requireAssistChat(req.params.id);
+    assistChats.delete(chat.id);
+    if (opencodeServer?.ready) {
+      await opencodeServerRequest(opencodeServer, `/session/${encodeURIComponent(chat.id)}/abort`, {
+        method: 'POST',
+        timeout: 10000,
+        label: 'abort'
+      }).catch(() => {});
+    }
+    if (!assistChats.size) stopOpencodeServer('stopped with the last chat');
+    res.json({ ok: true, stopped: true });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+app.post('/api/assist/chats/:id/question', async (req, res) => {
+  try {
+    requireAssistChat(req.params.id);
+    const requestID = String(req.body?.requestID || '').trim();
+    const answers = req.body?.answers;
+    if (!/^que/.test(requestID)) throw httpError(400, 'A valid question request is required');
+    if (!Array.isArray(answers) || !answers.length || answers.some(answer => !Array.isArray(answer))) {
+      throw httpError(400, 'Answers must be an array of selected labels');
+    }
+    const clean = answers.map(answer => answer.map(value => String(value).slice(0, 2000)).slice(0, 30));
+    const server = await ensureOpencodeServer();
+    await opencodeServerRequest(server, `/question/${encodeURIComponent(requestID)}/reply`, {
+      method: 'POST',
+      body: { answers: clean },
+      timeout: 15000,
+      label: 'question reply'
+    });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+app.post('/api/assist/chats/:id/question/reject', async (req, res) => {
+  try {
+    requireAssistChat(req.params.id);
+    const requestID = String(req.body?.requestID || '').trim();
+    if (!/^que/.test(requestID)) throw httpError(400, 'A valid question request is required');
+    const server = await ensureOpencodeServer();
+    await opencodeServerRequest(server, `/question/${encodeURIComponent(requestID)}/reject`, {
+      method: 'POST',
+      timeout: 15000,
+      label: 'question reject'
+    });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+app.post('/api/assist/chats/:id/permission', async (req, res) => {
+  try {
+    requireAssistChat(req.params.id);
+    const requestID = String(req.body?.requestID || '').trim();
+    const reply = String(req.body?.reply || '').trim();
+    if (!/^per/.test(requestID)) throw httpError(400, 'A valid permission request is required');
+    if (!['once', 'always', 'reject'].includes(reply)) throw httpError(400, 'Permission reply must be once, always, or reject');
+    const server = await ensureOpencodeServer();
+    await opencodeServerRequest(server, `/permission/${encodeURIComponent(requestID)}/reply`, {
+      method: 'POST',
+      body: { reply },
+      timeout: 15000,
+      label: 'permission reply'
+    });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
 });
 
 // Core services - app integration hints
@@ -13722,6 +14253,7 @@ if (authVhostSyncTimer.unref) authVhostSyncTimer.unref();
 for (const signal of ['SIGTERM', 'SIGINT']) {
   process.on(signal, () => {
     stopAllTerminalSessions();
+    stopOpencodeServer('stopped during shutdown');
     server.close(() => process.exit(0));
     const timer = setTimeout(() => process.exit(0), 2500);
     if (timer.unref) timer.unref();

@@ -10,3 +10,4 @@ core
 docker-compose.override.yml
 *.log
 maintenance-data
+.e2e-test

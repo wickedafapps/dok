@@ -17,6 +17,7 @@ Load this file when changing `public/index.html`, `public/js/app.js`, or UI sele
 - Containers: `#containersList`, `#containerSearch`, `#containersOpenApps` (opens the Apps tab), `#refreshContainers`
 - Dashboard: `#dashboardTerminalBtn`, `#dashboardCoreLinks`, `#dashboardCoreRefresh`
 - Terminal Modal: `#terminalModal`, `#terminalContainer`, `#terminalStopBtn`, `#terminalStatus`, `#terminalSessionLabel`
+- OC Assist Chat Modal: `#assistChatModal`, `#assistChatTitle`, `#assistChatStatus`, `#assistChatApp`, `#assistChatMessages`, `#assistChatPending`, `#assistChatForm`, `#assistChatInput`, `#assistChatSendBtn`, `#assistChatAbortBtn`, `#assistChatStopBtn`, `#assistChatHint`
 - OpenCode Card: `#coreOpencodeCard`, `#opencodeStatus`, `#opencodeSessions`, `#opencodeStopBtn`, `#opencodeModel`, `#opencodeProvider`, `#opencodeApiKey`, `#opencodeSaveSettings`
 - App Creation: `#runCreateBtn`, `#composeCreateBtn`, `#gitCloneBtn`, `#uploadBtn`, OC Assist (`#assistPrompt`, `#assistData`, `#assistName`, `#assistFiles`, `#assistFolder`, `#assistStartBtn`, `#assistOutput`, `#assistSessions`, `#assistSessionsList`)
 - App Config Modal: `#appConfigModal`, `#appCfgBuilder`, `#appCfgCompose`, `#appCfgEditCompose`, `#appCfgValidate`, `#appCfgReferenceUrl`, `#appCfgReferenceLink`, `#appCfgComplete`, `#appCfgCompleteRun`, `#appCfgProgress`

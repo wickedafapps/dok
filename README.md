@@ -37,7 +37,7 @@ Reopen Maintenance from **Settings → Maintenance** for installs, updates, back
 - Apps join the network selected in the single **App network** field, which defaults to Dok's configured default network (normally `wicked`). The compose editor also has a separate create-network box; `wicked` and the configured default are auto-created when missing. When nginx-proxy is installed, the editor and server keep `VIRTUAL_HOST` and the matching container `VIRTUAL_PORT` paired, remove published host ports from the routed service, and attach it to the selected app network so every app GUI is served through nginx without port collisions.
 - Customize the installation from **Settings → Dok Settings → Designer**: logo, name, tagline, CSS override, and direct editing of nginx-proxy error pages and configuration files.
 - Install, update, back up, repair, and recover the whole installation from the on-demand **Dok Maintenance** container. It keeps an exact installation record and snapshots in `<data location>/Dok/maintenance` after installation (or in `<checkout>-maintenance-data` / `MAINTENANCE_DATA_PATH` before it), runs Admin OpenCode, and replaces the old Host Helper.
-- Open a browser terminal from the dashboard, or launch OpenCode in User mode without any setup. Admin OpenCode runs from Dok Maintenance, where the host checkout and repair tools live. OpenCode starts on demand and stops when you close the terminal.
+- Build apps in a native in-browser OpenCode chat with **OC Assist**, or open a plain terminal from the dashboard. Admin OpenCode runs from Dok Maintenance, where the host checkout and repair tools live. OC Assist starts on demand, keeps running when you close the chat so the build can finish, and stops after it has been idle.
 - Give the Authentik, Technitium, or AdGuard Home web consoles their own domain; WickedAFDok writes the `VIRTUAL_HOST`/`VIRTUAL_PORT` reverse-proxy entries and can apply the change to an existing service.
 - Request and renew Let's Encrypt certificates automatically with the optional `nginxproxy/acme-companion` service, or place certificates manually.
 - Send outgoing mail through any SMTP provider, capture it locally with Mailpit, or run a full Stalwart mail server from the Email card.
@@ -144,7 +144,7 @@ Running a real mail server for your own mailboxes needs inbound port 25, a stati
 
 ## Browser terminal and OpenCode
 
-The **Terminal** button on the dashboard opens a shell in the WickedAFDok container, and **OpenCode** opens the terminal with a User-mode OpenCode session. The terminal is also available from Settings → Core Services → OpenCode.
+The **Terminal** button on the dashboard opens a shell in the WickedAFDok container. **OC Assist** in App Creation opens a native chat with a User-mode OpenCode session. The chat shows the assistant's replies, reasoning, tool calls, changed files, follow-up questions, and permission requests.
 
 OpenCode has two permission modes, split across the two containers:
 
@@ -153,11 +153,11 @@ OpenCode has two permission modes, split across the two containers:
 
 The Terminal button and **Apps shell** button open a normal shell as the container user. Those shells are not permission-restricted; the two OpenCode modes above are.
 
-OpenCode is preconfigured, so launching it needs no input. Set a model and API key in Dok Maintenance's OpenCode card, or run `/connect` inside a session. Provider credentials and User-mode sessions are stored under `data/opencode`; Admin sessions and provider state used by Maintenance live under `<maintenance-data>/opencode`.
+OpenCode is preconfigured, so starting OC Assist needs no input. Set a model and API key in Dok Maintenance's OpenCode card, or run `/connect` inside an Admin session. Provider credentials and User-mode sessions are stored under `data/opencode`; Admin sessions and provider state used by Maintenance live under `<maintenance-data>/opencode`.
 
-Closing a shell terminal stops it. Closing an OC Assist chat leaves OpenCode running so the app build can finish; running sessions stay listed in **App Creation** with an **Open chat** button, and **Stop** on the terminal ends them. OpenCode is intentionally not part of **Start all/Stop all**, because it is a launch-on-demand tool rather than a long-running service.
+Closing a shell terminal stops it. Closing an OC Assist chat leaves OpenCode running so the app build can finish; running chats stay listed in **App Creation** with an **Open chat** button, and **Stop chat** ends one deliberately. The shared OpenCode server stops after 30 minutes without a busy chat. OpenCode is intentionally not part of **Start all/Stop all**, because it is a launch-on-demand tool rather than a long-running service.
 
-The terminal normally uses a WebSocket at `/api/terminal/ws`. If a preview or reverse proxy blocks the upgrade, Dok automatically switches that session to HTTP polling so the shell and OC Assist still work. Forwarding WebSocket upgrades is still recommended because it has lower latency and less overhead.
+OC Assist uses plain HTTP polling against Dok's local OpenCode server, so the chat still works behind proxies that block WebSocket upgrades. The shell terminal normally uses a WebSocket at `/api/terminal/ws`; if a preview or reverse proxy blocks the upgrade, Dok automatically switches that session to HTTP polling. Forwarding WebSocket upgrades is still recommended because it has lower latency and less overhead.
 
 > User mode is a guardrail for the agent, not a hard security boundary: it still runs as the Dok container user. Keep the UI and Maintenance token behind a trusted network or an authenticated reverse proxy, since an Admin shell in Maintenance has full host, container, and Docker access.
 

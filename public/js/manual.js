@@ -143,7 +143,7 @@
         <p>When you select <strong>Create app with OC Assist</strong>, Dok writes a private brief and the uploaded files under <code>sources/oc-assist-&lt;stamp&gt;/</code>, then immediately opens the OpenCode chat in <strong>User mode</strong> with the dedicated <code>assist</code> agent. There is no shell or mode picker: the chat is the only thing shown. The brief and all creator fields are passed automatically; you only need to answer questions if OpenCode needs more information.</p>
         <p>OC Assist reads any repository or reference URL you provide to identify the app&rsquo;s real GUI container port and always writes <code>VIRTUAL_PORT</code> on the primary GUI service, even when you do not supply a domain. For multi-port apps it selects the public web UI port rather than a database, metrics, or internal API port. <code>VIRTUAL_HOST</code> is added when you supply a hostname or ask for routing.</p>
         <p>When the official repository or website is known, OC Assist passes it to the registration helper with <code>--reference-url</code>. It prefers the upstream source repository, homepage, or documentation site and omits the link rather than inventing one.</p>
-        <p>If OpenCode fails during startup, Dok shows the captured terminal error instead of opening an empty chat. Inside the terminal, <strong>Escape</strong> is sent to OpenCode (for its own dialogs); use the terminal&rsquo;s close button to end the session.</p>
+        <p>If OpenCode fails to start or rejects the first prompt, Dok reports the server error instead of opening an empty chat. The chat streams replies, reasoning, tool calls, and changed files, and shows answer cards for questions and permission requests. Closing the window keeps the build running; use <strong>Stop chat</strong> to end it.</p>
         <h4>What the assistant is allowed to do</h4>
         <ul>
           <li>Read and edit files only inside <code>apps/</code>, the OC Assist source folder, and its own brief folder.</li>
@@ -258,7 +258,7 @@
         <p>The shell starts in <code>/app</code> and runs as the Dok container user. It is not permission-restricted.</p>
         <h4>OC Assist</h4>
         <p>OC Assist is the only OpenCode chat launched from Dok. Start it from <strong>App Creation → OC Assist</strong>; Dok opens the chat directly, without shell or mode options. The assistant runs in User mode with permission to edit apps and register them. It saves each app stopped so you can configure and deploy it from Apps.</p>
-        <p>Closing the chat window does not cancel the build. OC Assist keeps running in the background, and running sessions are listed under <strong>App Creation → OC Assist</strong> with an <strong>Open chat</strong> button so you can reattach after a reload or a failed connection. Use <strong>Stop</strong> in the terminal to end it deliberately.</p>
+        <p>Closing the chat window does not cancel the build. OC Assist keeps running in the background, and running chats are listed under <strong>App Creation → OC Assist</strong> with an <strong>Open chat</strong> button so you can reattach after a reload or a failed connection. Use <strong>Stop chat</strong> to end it deliberately. The shared OpenCode server stops after 30 minutes without a busy chat.</p>
         <p>Admin OpenCode is available only inside the Dok Maintenance container. Provider settings for OC Assist can be saved under Settings → Core Services → OpenCode.</p>
       `
     },
@@ -526,12 +526,12 @@
           <li>Use Host Helper or make the target host path writable by the Dok user.</li>
           <li>After a Docker socket group change, rerun setup and start.</li>
         </ul>
-        <h4>Terminal or OpenCode will not open</h4>
+        <h4>Terminal or OC Assist will not open</h4>
         <ul>
-          <li>Check the server log for PTY, shell, or OpenCode errors.</li>
-          <li>The terminal switches to HTTP compatibility mode when a proxy blocks <code>/api/terminal/ws</code>. Forwarding WebSocket upgrades is still faster.</li>
-          <li>The terminal keeps retrying while the connection is interrupted. If the window was closed, reattach the still-running OC Assist session from <strong>App Creation → OC Assist</strong>.</li>
-          <li>Rebuild the image if OpenCode is missing from an older deployment.</li>
+          <li>Check the server log for PTY, shell, or OpenCode server errors.</li>
+          <li>The shell terminal switches to HTTP compatibility mode when a proxy blocks <code>/api/terminal/ws</code>. Forwarding WebSocket upgrades is still faster.</li>
+          <li>OC Assist uses HTTP polling, so a blocked WebSocket upgrade does not stop the chat. If a chat is missing after closing the window, reopen it from <strong>App Creation → OC Assist</strong>.</li>
+          <li>Rebuild the image if OpenCode is missing from an older deployment, then restart Dok.</li>
         </ul>
         <h4>Imported app needs setup</h4>
         <p>This is expected. Export strips installation-specific hostnames, ports, paths, and secrets. Use <strong>Configure &amp; Deploy</strong> and supply them in the builder.</p>
@@ -571,6 +571,7 @@
     gitRepo: 'Git repository URL',
     assistPrompt: 'App description',
     assistData: 'Reference data',
+    assistChatInput: 'Message to OC Assist',
     libraryImportFile: 'Library archive',
     libraryRepoUrl: 'Repository URL',
     libraryRepoBranch: 'Branch or tag',
@@ -604,6 +605,7 @@
     assistName: 'Required app title. OC Assist uses it for the app folder, compose project, and saved library entry.',
     assistFolder: 'Optional existing folder to use as the app source.',
     assistFiles: 'Optional files to give OC Assist as supporting material.',
+    assistChatInput: 'Follow-up message or answer for OC Assist. Enter sends; Shift+Enter adds a new line. Use the answer cards above the composer for questions or permission requests.',
     libraryExportName: 'Optional filename prefix for the exported library archive.',
     libraryImportFile: 'A Dok library .tar.gz archive exported from another installation.',
     libraryRepoUrl: 'Git URL for a repository that contains a Dok library or a single compose/Dockerfile app. HTTPS, SSH, and self-hosted git servers are supported.',

@@ -266,7 +266,7 @@ Dok's persistent data root, storage relocation, and Maintenance storage layout: 
 
 # Do these tasks 1 at a time and focus on the single task at hand. Do a task, push to github, Update AGENTS.md and remove the task, inform the user that you are ready to start the next task.
 
-- OC Assist is now successfully creating apps. However it still fails to to display a usable terminal or opencode chat. Rethink the method being used to display them and implement a functional one.
+- Updates still failing with: 2026-10-30T01:10:14.568Z Update failed: The source directory /dok-source is not a git checkout. Point DOK_SOURCE_PATH at the Dok checkout and try again.
 
 - App Creator methods should examine any given repository links for information on configuration to create the best possible compose file
 

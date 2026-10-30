@@ -508,6 +508,9 @@ function closeModal(id) {
   if (id === 'terminalModal') {
     closeTerminalSession();
   }
+  if (id === 'assistChatModal') {
+    closeAssistChat();
+  }
 }
 
 qsa('[data-close]').forEach(el => {
@@ -4891,6 +4894,507 @@ async function openExistingTerminal(session) {
   setTimeout(fitTerminal, 120);
 }
 
+let assistChatId = null;
+let assistChatPollTimer = null;
+let assistChatToken = 0;
+let assistChatRevision = '';
+let assistChatPendingKey = '';
+let assistChatData = null;
+
+function assistChatBusy(data = assistChatData) {
+  return data?.status?.type === 'busy' || data?.status?.type === 'retry';
+}
+
+function assistChatWaiting(data = assistChatData) {
+  return ((data?.questions?.length || 0) + (data?.permissions?.length || 0)) > 0;
+}
+
+function setAssistChatStatus(text) {
+  const el = qs('#assistChatStatus');
+  if (el) el.textContent = text;
+}
+
+function assistChatStatusText(data) {
+  if (!data) return 'Connecting…';
+  if (assistChatWaiting(data)) return 'Waiting for your response';
+  if (data.status?.type === 'retry') {
+    return `Retrying${data.status.attempt ? ` (attempt ${data.status.attempt})` : ''}…`;
+  }
+  if (assistChatBusy(data)) return 'Working…';
+  if (data.chat?.error) return data.chat.error;
+  return 'Idle — ask a follow-up';
+}
+
+function clearAssistChatPoll() {
+  if (assistChatPollTimer) {
+    clearTimeout(assistChatPollTimer);
+    assistChatPollTimer = null;
+  }
+}
+
+function closeAssistChat() {
+  assistChatToken += 1;
+  clearAssistChatPoll();
+  assistChatId = null;
+  assistChatRevision = '';
+  assistChatPendingKey = '';
+  assistChatData = null;
+  const box = qs('#assistChatMessages');
+  if (box) box.innerHTML = '';
+  const pending = qs('#assistChatPending');
+  if (pending) {
+    pending.innerHTML = '';
+    pending.classList.add('hidden');
+  }
+  const input = qs('#assistChatInput');
+  if (input) input.value = '';
+}
+
+function assistElement(tag, className, text) {
+  const el = document.createElement(tag);
+  if (className) el.className = className;
+  if (text !== undefined) el.textContent = text;
+  return el;
+}
+
+function appendAssistRichText(parent, value) {
+  const text = String(value || '');
+  const segments = text.split(/```/);
+  for (let i = 0; i < segments.length; i += 1) {
+    const segment = segments[i];
+    if (i % 2 === 1) {
+      const code = segment.replace(/^[^\n]*\n/, '').replace(/\s+$/, '');
+      if (!code) continue;
+      parent.appendChild(assistElement('pre', '', code));
+    } else {
+      const clean = segment.replace(/^\n+|\n+$/g, '');
+      if (!clean) continue;
+      parent.appendChild(assistElement('div', '', clean));
+    }
+  }
+}
+
+function renderAssistMessages(data) {
+  const box = qs('#assistChatMessages');
+  if (!box) return;
+  const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+  const openKeys = new Set(
+    Array.from(box.querySelectorAll('details[data-key][open]')).map(el => el.dataset.key)
+  );
+  box.innerHTML = '';
+
+  const messages = Array.isArray(data?.messages) ? data.messages : [];
+  let userMessages = 0;
+  let renderedAssistant = false;
+
+  for (const record of messages) {
+    const info = record?.info || {};
+    const parts = Array.isArray(record?.parts) ? record.parts : [];
+    const text = parts.filter(part => part.type === 'text').map(part => part.text || '').join('\n\n').trim();
+
+    if (info.role === 'user') {
+      userMessages += 1;
+      if (!text) continue;
+      if (userMessages === 1) {
+        const details = assistElement('details', 'assist-request');
+        details.dataset.key = `user-${info.id || userMessages}`;
+        details.appendChild(assistElement('summary', '', 'Your request'));
+        appendAssistRichText(details, text);
+        box.appendChild(details);
+      } else {
+        const wrap = assistElement('div', 'assist-msg user');
+        wrap.appendChild(assistElement('div', 'assist-msg-label', 'You'));
+        const bubble = assistElement('div', 'assist-bubble');
+        appendAssistRichText(bubble, text);
+        wrap.appendChild(bubble);
+        box.appendChild(wrap);
+      }
+      continue;
+    }
+
+    if (info.role !== 'assistant') continue;
+    const wrap = assistElement('div', 'assist-msg assistant');
+    wrap.appendChild(assistElement('div', 'assist-msg-label', 'OC Assist'));
+    let hasContent = false;
+
+    for (const part of parts) {
+      if (part.type === 'text') {
+        const value = String(part.text || '').trim();
+        if (!value) continue;
+        const bubble = assistElement('div', 'assist-bubble');
+        appendAssistRichText(bubble, value);
+        wrap.appendChild(bubble);
+        hasContent = true;
+      } else if (part.type === 'reasoning') {
+        const value = String(part.text || '').trim();
+        if (!value) continue;
+        const details = assistElement('details', 'assist-reasoning');
+        details.dataset.key = part.id || '';
+        details.appendChild(assistElement('summary', '', 'Reasoning'));
+        details.appendChild(assistElement('pre', '', value));
+        wrap.appendChild(details);
+        hasContent = true;
+      } else if (part.type === 'tool') {
+        const state = part.state || {};
+        const details = assistElement('details', 'assist-tool');
+        details.dataset.key = part.id || '';
+        details.dataset.status = state.status || '';
+        if (state.status === 'error') details.open = true;
+        const summary = assistElement('summary');
+        summary.appendChild(assistElement('strong', '', part.tool || 'tool'));
+        if (state.title) summary.appendChild(document.createTextNode(` · ${state.title}`));
+        if (state.status) summary.appendChild(assistElement('span', 'assist-tool-status', state.status));
+        details.appendChild(summary);
+        if (state.input && typeof state.input === 'object' && Object.keys(state.input).length) {
+          let inputText = '';
+          try { inputText = JSON.stringify(state.input, null, 2); } catch { inputText = String(state.input); }
+          if (inputText) details.appendChild(assistElement('pre', '', inputText));
+        }
+        if (state.output) details.appendChild(assistElement('pre', '', state.output));
+        if (state.error) details.appendChild(assistElement('pre', '', state.error));
+        wrap.appendChild(details);
+        hasContent = true;
+      } else if (part.type === 'patch') {
+        const files = Array.isArray(part.files) ? part.files : [];
+        if (!files.length) continue;
+        const details = assistElement('details', 'assist-tool');
+        details.dataset.key = part.id || '';
+        details.appendChild(assistElement('summary', '', `Changed ${files.length} file${files.length === 1 ? '' : 's'}`));
+        details.appendChild(assistElement('pre', '', files.join('\n')));
+        wrap.appendChild(details);
+        hasContent = true;
+      } else if (part.type === 'agent') {
+        if (!part.name) continue;
+        wrap.appendChild(assistElement('div', 'assist-tool', `Delegated to ${part.name}`));
+        hasContent = true;
+      } else if (part.type === 'file') {
+        if (!part.filename) continue;
+        wrap.appendChild(assistElement('div', 'assist-tool', `Attached ${part.filename}`));
+        hasContent = true;
+      }
+    }
+
+    if (info.error) {
+      wrap.appendChild(assistElement('div', 'assist-bubble error', info.error));
+      hasContent = true;
+    }
+    if (hasContent) {
+      box.appendChild(wrap);
+      renderedAssistant = true;
+    }
+  }
+
+  if (assistChatBusy(data)) {
+    const working = assistElement('div', 'assist-working');
+    working.appendChild(assistElement('span', 'spinner'));
+    working.appendChild(document.createTextNode(renderedAssistant ? 'OC Assist is still working…' : 'OC Assist is working…'));
+    box.appendChild(working);
+  } else if (!messages.length) {
+    const empty = assistElement('div', 'assist-chat-empty');
+    empty.appendChild(assistElement('span', 'spinner'));
+    empty.appendChild(document.createTextNode('OC Assist is preparing your app. This can take a few minutes.'));
+    box.appendChild(empty);
+  }
+
+  box.querySelectorAll('details[data-key]').forEach(el => {
+    if (openKeys.has(el.dataset.key)) el.open = true;
+  });
+  if (nearBottom) box.scrollTop = box.scrollHeight;
+}
+
+function assistPendingKeyFor(data) {
+  return JSON.stringify({
+    questions: (data?.questions || []).map(question => question.id),
+    permissions: (data?.permissions || []).map(permission => permission.id)
+  });
+}
+
+function renderAssistPending(data) {
+  const box = qs('#assistChatPending');
+  if (!box) return;
+  box.innerHTML = '';
+  const questions = Array.isArray(data?.questions) ? data.questions : [];
+  const permissions = Array.isArray(data?.permissions) ? data.permissions : [];
+  if (!questions.length && !permissions.length) {
+    box.classList.add('hidden');
+    return;
+  }
+  box.classList.remove('hidden');
+
+  for (const request of questions) {
+    const card = assistElement('div', 'assist-pending-card');
+    card.appendChild(assistElement('div', 'assist-pending-title', 'OC Assist needs an answer'));
+    for (const [index, item] of (request.questions || []).entries()) {
+      const block = assistElement('div', 'assist-pending-question-block');
+      block.dataset.index = String(index);
+      block.dataset.multiple = item.multiple ? 'true' : 'false';
+      if (item.header) block.appendChild(assistElement('div', 'assist-pending-title', item.header));
+      block.appendChild(assistElement('p', 'assist-pending-question', item.question || ''));
+      for (const option of item.options || []) {
+        const label = assistElement('label', 'assist-pending-option');
+        const input = document.createElement('input');
+        input.type = item.multiple ? 'checkbox' : 'radio';
+        input.name = `assist-q-${request.id}-${index}`;
+        input.value = option.label;
+        label.appendChild(input);
+        const text = assistElement('span', '', option.label);
+        if (option.description) text.appendChild(assistElement('small', '', option.description));
+        label.appendChild(text);
+        block.appendChild(label);
+      }
+      if (item.custom) {
+        const input = assistElement('input', 'input assist-pending-custom');
+        input.type = 'text';
+        input.placeholder = 'Type your own answer';
+        block.appendChild(input);
+      }
+      card.appendChild(block);
+    }
+    const actions = assistElement('div', 'assist-pending-actions');
+    const send = assistElement('button', 'btn btn-primary', 'Send answer');
+    send.type = 'button';
+    const reject = assistElement('button', 'btn', 'Skip question');
+    reject.type = 'button';
+    actions.appendChild(send);
+    actions.appendChild(reject);
+    card.appendChild(actions);
+
+    send.addEventListener('click', async () => {
+      const answers = [];
+      for (const block of card.querySelectorAll('.assist-pending-question-block')) {
+        const checked = Array.from(block.querySelectorAll('input[type="checkbox"]:checked, input[type="radio"]:checked'))
+          .map(input => input.value);
+        const custom = block.querySelector('.assist-pending-custom')?.value.trim() || '';
+        const multiple = block.dataset.multiple === 'true';
+        const values = multiple ? [...checked, ...(custom ? [custom] : [])] : (custom ? [custom] : checked);
+        if (!values.length) {
+          toast('Choose an answer for every question', true);
+          return;
+        }
+        answers.push(values);
+      }
+      setLoading(send, true, 'Sending…');
+      setLoading(reject, true);
+      try {
+        await api(`/api/assist/chats/${encodeURIComponent(assistChatId)}/question`, jsonBody({
+          requestID: request.id,
+          answers
+        }));
+        setAssistChatStatus('Answer sent — OC Assist is continuing…');
+        scheduleAssistChatPoll(assistChatToken, 250);
+      } catch (e) {
+        toast(e.message, true);
+      } finally {
+        setLoading(send, false, 'Send answer');
+        setLoading(reject, false, 'Skip question');
+      }
+    });
+
+    reject.addEventListener('click', async () => {
+      setLoading(send, true);
+      setLoading(reject, true, 'Skipping…');
+      try {
+        await api(`/api/assist/chats/${encodeURIComponent(assistChatId)}/question/reject`, jsonBody({
+          requestID: request.id
+        }));
+        setAssistChatStatus('Question skipped — OC Assist is continuing…');
+        scheduleAssistChatPoll(assistChatToken, 250);
+      } catch (e) {
+        toast(e.message, true);
+      } finally {
+        setLoading(send, false, 'Send answer');
+        setLoading(reject, false, 'Skip question');
+      }
+    });
+
+    box.appendChild(card);
+  }
+
+  for (const permission of permissions) {
+    const card = assistElement('div', 'assist-pending-card');
+    card.appendChild(assistElement('div', 'assist-pending-title', `Approval needed: ${permission.permission}`));
+    if (permission.patterns?.length) {
+      card.appendChild(assistElement('p', 'assist-pending-question', permission.patterns.join('\n')));
+    }
+    const actions = assistElement('div', 'assist-pending-actions');
+    const allow = assistElement('button', 'btn btn-primary', 'Allow once');
+    const always = assistElement('button', 'btn', 'Always allow');
+    const deny = assistElement('button', 'btn btn-danger', 'Deny');
+    for (const button of [allow, always, deny]) {
+      button.type = 'button';
+      actions.appendChild(button);
+    }
+    card.appendChild(actions);
+
+    const reply = async (value, button, label) => {
+      setLoading(button, true, label);
+      try {
+        await api(`/api/assist/chats/${encodeURIComponent(assistChatId)}/permission`, jsonBody({
+          requestID: permission.id,
+          reply: value
+        }));
+        setAssistChatStatus('Response sent — OC Assist is continuing…');
+        scheduleAssistChatPoll(assistChatToken, 250);
+      } catch (e) {
+        toast(e.message, true);
+        setLoading(button, false, label.replace('…', ''));
+      }
+    };
+    allow.addEventListener('click', () => reply('once', allow, 'Allowing…'));
+    always.addEventListener('click', () => reply('always', always, 'Allowing…'));
+    deny.addEventListener('click', () => reply('reject', deny, 'Denying…'));
+    box.appendChild(card);
+  }
+}
+
+function updateAssistChatComposer() {
+  const input = qs('#assistChatInput');
+  const send = qs('#assistChatSendBtn');
+  const abort = qs('#assistChatAbortBtn');
+  const stop = qs('#assistChatStopBtn');
+  const hint = qs('#assistChatHint');
+  const busy = assistChatBusy();
+  const waiting = assistChatWaiting();
+  const ready = !!assistChatId;
+  if (input) {
+    input.placeholder = waiting
+      ? 'Answer the question above to continue…'
+      : busy ? 'OC Assist is working…' : 'Ask a follow-up or add information…';
+  }
+  if (send) send.disabled = !ready || busy || waiting || !(input?.value.trim());
+  if (abort) abort.disabled = !ready || !busy;
+  if (stop) stop.disabled = !ready;
+  if (hint) {
+    hint.textContent = waiting
+      ? 'Answer the question above, or skip it.'
+      : busy ? 'OC Assist is working. Cancel run stops the current response.' : 'Enter to send · Shift+Enter for a new line';
+  }
+}
+
+function scheduleAssistChatPoll(token, delay = 0) {
+  clearAssistChatPoll();
+  if (token !== assistChatToken || !assistChatId) return;
+  assistChatPollTimer = setTimeout(() => {
+    assistChatPollTimer = null;
+    pollAssistChat(token);
+  }, Math.max(0, delay));
+}
+
+function applyAssistChatSnapshot(data) {
+  assistChatData = data;
+  const title = data?.chat?.title || 'OC Assist';
+  if (qs('#assistChatTitle')) qs('#assistChatTitle').textContent = title;
+  if (qs('#assistChatApp')) {
+    qs('#assistChatApp').textContent = data?.chat?.appName ? `App: ${data.chat.appName}` : '';
+  }
+  setAssistChatStatus(assistChatStatusText(data));
+
+  const pendingKey = assistPendingKeyFor(data);
+  if (pendingKey !== assistChatPendingKey) {
+    assistChatPendingKey = pendingKey;
+    renderAssistPending(data);
+  }
+  if (data?.revision !== assistChatRevision) {
+    assistChatRevision = data?.revision || '';
+    renderAssistMessages(data);
+  }
+  updateAssistChatComposer();
+}
+
+async function pollAssistChat(token) {
+  if (token !== assistChatToken || !assistChatId) return;
+  const id = assistChatId;
+  let data;
+  try {
+    data = await api(`/api/assist/chats/${encodeURIComponent(id)}`);
+  } catch (e) {
+    if (token !== assistChatToken || id !== assistChatId) return;
+    if (e.status === 404) {
+      toast(e.message, true, 7000);
+      closeAssistChat();
+      qs('#assistChatModal')?.classList.add('hidden');
+      loadAssistSessions();
+      loadCoreOpencode();
+      return;
+    }
+    setAssistChatStatus('Connection lost — retrying…');
+    scheduleAssistChatPoll(token, 2000);
+    return;
+  }
+  if (token !== assistChatToken || id !== assistChatId) return;
+  applyAssistChatSnapshot(data);
+  const delay = assistChatBusy(data) ? 1000 : 2500;
+  scheduleAssistChatPoll(token, delay);
+}
+
+function openAssistChat(chat) {
+  const modal = qs('#assistChatModal');
+  if (!modal || !chat?.id) return;
+  closeAssistChat();
+  modal.classList.remove('hidden');
+  assistChatId = chat.id;
+  assistChatRevision = '';
+  assistChatPendingKey = '';
+  assistChatData = null;
+  if (qs('#assistChatTitle')) qs('#assistChatTitle').textContent = chat.title || 'OC Assist';
+  if (qs('#assistChatApp')) {
+    qs('#assistChatApp').textContent = chat.appName ? `App: ${chat.appName}` : '';
+  }
+  const box = qs('#assistChatMessages');
+  if (box) {
+    box.innerHTML = '';
+    const empty = assistElement('div', 'assist-chat-empty');
+    empty.appendChild(assistElement('span', 'spinner'));
+    empty.appendChild(document.createTextNode('Connecting to OC Assist…'));
+    box.appendChild(empty);
+  }
+  const pending = qs('#assistChatPending');
+  if (pending) {
+    pending.innerHTML = '';
+    pending.classList.add('hidden');
+  }
+  setAssistChatStatus('Connecting…');
+  updateAssistChatComposer();
+  const token = ++assistChatToken;
+  scheduleAssistChatPoll(token, 0);
+  setTimeout(() => qs('#assistChatInput')?.focus(), 100);
+}
+
+async function abortAssistChatRun() {
+  if (!assistChatId) return;
+  const btn = qs('#assistChatAbortBtn');
+  setLoading(btn, true, 'Cancelling…');
+  try {
+    await api(`/api/assist/chats/${encodeURIComponent(assistChatId)}/abort`, { method: 'POST' });
+    setAssistChatStatus('Run cancelled.');
+    scheduleAssistChatPoll(assistChatToken, 400);
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    setLoading(btn, false, 'Cancel run');
+    updateAssistChatComposer();
+  }
+}
+
+async function stopAssistChat() {
+  if (!assistChatId) return;
+  if (!confirm('Stop this OC Assist chat? Any work in progress will be cancelled.')) return;
+  const btn = qs('#assistChatStopBtn');
+  setLoading(btn, true, 'Stopping…');
+  try {
+    await api(`/api/assist/chats/${encodeURIComponent(assistChatId)}/stop`, { method: 'POST' });
+    qs('#assistChatModal')?.classList.add('hidden');
+    closeAssistChat();
+    toast('OC Assist chat stopped');
+    await loadAssistSessions();
+    await loadCoreOpencode();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    setLoading(btn, false, 'Stop chat');
+  }
+}
+
 if (qs('#assistStartBtn')) {
   qs('#assistStartBtn').addEventListener('click', async () => {
     const btn = qs('#assistStartBtn');
@@ -4922,36 +5426,69 @@ if (qs('#assistStartBtn')) {
     if (paths.length) form.append('paths', JSON.stringify(paths));
     setLoading(btn, true, 'Starting…');
     if (output) {
-      output.textContent = 'Starting OpenCode…';
+      output.textContent = 'Starting OC Assist…';
       output.classList.remove('hidden');
     }
-    let startedSession = null;
+    let startedChat = null;
     try {
       const res = await fetch('/api/assist/start', { method: 'POST', body: form });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || res.statusText || 'OC Assist failed to start');
-      startedSession = data.session;
-      if (output) output.textContent = `OpenCode is ready for ${data.appName}. Chat in the terminal; the app is saved stopped in Apps when it is ready so you can configure and deploy it.`;
+      startedChat = data.chat;
+      if (output) output.textContent = `OC Assist is ready for ${data.appName}. The app is saved stopped in Apps when it is ready so you can configure and deploy it.`;
       toast(`OC Assist started for ${data.appName}`, false, 6000);
-      try {
-        await openExistingTerminal(data.session);
-      } catch (attachError) {
-        if (output) {
-          output.textContent = `${attachError.message || 'The chat could not be opened.'} OC Assist is still running; use Open chat below to reconnect.`;
-        }
-        toast('OC Assist is running, but the chat could not be opened. Use Open chat below.', true, 8000);
-      }
+      openAssistChat(data.chat);
       loadAssistSessions();
+      loadCoreOpencode();
     } catch (e) {
       if (output) output.textContent = e.message;
       toast(e.message, true);
-      // The start request itself failed, so there is no session to preserve.
-      if (startedSession?.id) {
-        fetch(`/api/terminal/sessions/${encodeURIComponent(startedSession.id)}/stop`, { method: 'POST' }).catch(() => {});
+      if (startedChat?.id) {
+        fetch(`/api/assist/chats/${encodeURIComponent(startedChat.id)}/stop`, { method: 'POST' }).catch(() => {});
       }
     } finally {
       setLoading(btn, false, 'Create App with OC Assist');
     }
+  });
+}
+
+if (qs('#assistChatStopBtn')) {
+  qs('#assistChatStopBtn').addEventListener('click', stopAssistChat);
+}
+if (qs('#assistChatAbortBtn')) {
+  qs('#assistChatAbortBtn').addEventListener('click', abortAssistChatRun);
+}
+if (qs('#assistChatForm')) {
+  qs('#assistChatForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const input = qs('#assistChatInput');
+    const prompt = input?.value.trim() || '';
+    if (!assistChatId || !prompt) return;
+    if (assistChatBusy() || assistChatWaiting()) {
+      toast(assistChatWaiting() ? 'Answer the question above first' : 'OC Assist is still working', true);
+      return;
+    }
+    const btn = qs('#assistChatSendBtn');
+    setLoading(btn, true, 'Sending…');
+    try {
+      await api(`/api/assist/chats/${encodeURIComponent(assistChatId)}/prompt`, jsonBody({ prompt }));
+      if (input) input.value = '';
+      setAssistChatStatus('Message sent — waiting for OC Assist…');
+      scheduleAssistChatPoll(assistChatToken, 250);
+    } catch (e) {
+      toast(e.message, true);
+    } finally {
+      setLoading(btn, false, 'Send');
+      updateAssistChatComposer();
+    }
+  });
+}
+if (qs('#assistChatInput')) {
+  qs('#assistChatInput').addEventListener('input', updateAssistChatComposer);
+  qs('#assistChatInput').addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return;
+    event.preventDefault();
+    qs('#assistChatForm')?.requestSubmit();
   });
 }
 
@@ -4960,32 +5497,32 @@ async function loadAssistSessions() {
   const list = qs('#assistSessionsList');
   if (!wrap || !list) return;
   try {
-    const res = await api('/api/terminal');
-    const sessions = (res.sessions || []).filter(session => session && session.app === 'opencode' && !session.exited);
-    if (!sessions.length) {
+    const res = await api('/api/assist/chats');
+    const chats = Array.isArray(res.chats) ? res.chats : [];
+    if (!chats.length) {
       wrap.classList.add('hidden');
       list.innerHTML = '';
       return;
     }
-    list.innerHTML = sessions.map(session => {
-      const started = session.createdAt ? new Date(session.createdAt).toLocaleTimeString() : '';
-      const recentlyPolled = Number(session.lastClientAt) > 0 && Date.now() - Number(session.lastClientAt) < 6000;
-      const attached = Number(session.clients) > 0 || recentlyPolled;
-      const clients = attached ? 'chat attached' : 'chat not attached';
-      const meta = [session.title || 'OC Assist', started, clients].filter(Boolean).join(' · ');
+    list.innerHTML = chats.map(chat => {
+      const started = chat.createdAt ? new Date(chat.createdAt).toLocaleTimeString() : '';
+      const state = chat.waiting
+        ? 'waiting for you'
+        : chat.status === 'busy' || chat.status === 'retry' ? 'working' : 'idle';
+      const meta = [chat.title || 'OC Assist', started, state].filter(Boolean).join(' · ');
       return `
         <div class="session-item">
           <div class="session-item-meta">
-            <span class="session-item-title">${escapeHtml(session.title || 'OC Assist')}</span>
-            <span class="session-item-sub">${escapeHtml([started, clients].filter(Boolean).join(' · '))}</span>
+            <span class="session-item-title">${escapeHtml(chat.title || 'OC Assist')}</span>
+            <span class="session-item-sub">${escapeHtml([chat.appName, started, state].filter(Boolean).join(' · '))}</span>
           </div>
-          <button class="btn" data-open-session="${escapeHtml(session.id)}" title="${escapeHtml(meta)}">Open chat</button>
+          <button class="btn" data-open-chat="${escapeHtml(chat.id)}" title="${escapeHtml(meta)}">Open chat</button>
         </div>`;
     }).join('');
-    list.querySelectorAll('[data-open-session]').forEach(btn => {
+    list.querySelectorAll('[data-open-chat]').forEach(btn => {
       btn.addEventListener('click', () => {
-        const session = sessions.find(item => item.id === btn.dataset.openSession);
-        if (session) openExistingTerminal(session);
+        const chat = chats.find(item => item.id === btn.dataset.openChat);
+        if (chat) openAssistChat(chat);
       });
     });
     wrap.classList.remove('hidden');
@@ -5004,12 +5541,14 @@ async function loadCoreOpencode() {
       badge.className = 'mode-pill ' + (res.installed ? 'ok' : 'danger');
     }
     const sessions = res.sessions || [];
+    const chats = res.chats || [];
+    const total = sessions.length + chats.length;
     if (qs('#opencodeSessions')) {
-      qs('#opencodeSessions').textContent = sessions.length
-        ? `${sessions.length} OC Assist session${sessions.length === 1 ? '' : 's'} running`
+      qs('#opencodeSessions').textContent = total
+        ? `${total} OC Assist session${total === 1 ? '' : 's'} running`
         : 'No OC Assist sessions running.';
     }
-    if (qs('#opencodeStopBtn')) qs('#opencodeStopBtn').disabled = sessions.length === 0;
+    if (qs('#opencodeStopBtn')) qs('#opencodeStopBtn').disabled = total === 0;
     if (qs('#opencodeModel')) qs('#opencodeModel').value = res.settings?.model || '';
     if (qs('#opencodeProvider')) qs('#opencodeProvider').value = res.settings?.provider || '';
     if (qs('#opencodeApiKey')) {
@@ -5034,6 +5573,10 @@ if (qs('#opencodeStopBtn')) {
     try {
       const res = await api('/api/core/opencode/stop', jsonBody({}));
       toast(res.stopped ? `Stopped ${res.stopped} OC Assist session${res.stopped === 1 ? '' : 's'}` : 'No OC Assist sessions were running');
+      if (assistChatId) {
+        qs('#assistChatModal')?.classList.add('hidden');
+        closeAssistChat();
+      }
       if (terminalSessionId && terminalSessionApp === 'opencode') {
         terminalSessionId = null;
         terminalSessionApp = '';
@@ -5043,6 +5586,7 @@ if (qs('#opencodeStopBtn')) {
         setTerminalStatus('Stopped');
       }
       await loadCoreOpencode();
+      await loadAssistSessions();
     } catch (e) {
       toast(e.message, true);
     } finally {

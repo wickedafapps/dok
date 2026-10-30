@@ -1310,6 +1310,35 @@
     </div>
   </div>
 
+  <div id="assistChatModal" class="modal hidden">
+    <div class="modal-backdrop" data-close="assistChatModal"></div>
+    <div class="modal-card assist-chat-modal-card">
+      <div class="modal-header terminal-modal-header">
+        <div>
+          <h3 id="assistChatTitle">OC Assist</h3>
+          <div class="inline terminal-meta">
+            <span id="assistChatStatus" class="muted">Connecting…</span>
+            <span id="assistChatApp" class="muted"></span>
+          </div>
+        </div>
+        <div class="inline">
+          <button id="assistChatAbortBtn" class="btn" type="button">Cancel run</button>
+          <button id="assistChatStopBtn" class="btn btn-danger" type="button">Stop chat</button>
+          <button class="btn" type="button" data-close="assistChatModal">Close</button>
+        </div>
+      </div>
+      <div id="assistChatMessages" class="assist-chat-messages" aria-live="polite"></div>
+      <div id="assistChatPending" class="assist-chat-pending hidden"></div>
+      <form id="assistChatForm" class="assist-chat-composer">
+        <textarea id="assistChatInput" class="textarea" rows="2" placeholder="Ask a follow-up or answer OC Assist…"></textarea>
+        <div class="assist-chat-composer-actions">
+          <span id="assistChatHint" class="muted">Enter to send · Shift+Enter for a new line</span>
+          <button type="submit" id="assistChatSendBtn" class="btn btn-primary">Send</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
   <div id="manualModal" class="modal hidden">
     <div class="modal-backdrop" data-close="manualModal"></div>
     <div class="modal-card manual-modal-card">

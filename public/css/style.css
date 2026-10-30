@@ -869,10 +869,231 @@ footer {
   font-size: 12px;
 }
 
+.assist-chat-modal-card {
+  width: min(1040px, 97vw);
+  height: min(900px, 94vh);
+  max-height: 94vh;
+  padding: 14px;
+}
+
+.assist-chat-messages {
+  flex: 1;
+  min-height: 260px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  background: #060a0c;
+}
+
+.assist-chat-empty {
+  margin: auto;
+  color: var(--sub);
+  font-size: 13px;
+  text-align: center;
+  max-width: 520px;
+  line-height: 1.6;
+}
+
+.assist-chat-empty .spinner {
+  border-color: rgba(182, 255, 59, 0.25);
+  border-top-color: var(--accent);
+  margin-right: 8px;
+}
+
+.assist-msg {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-width: 94%;
+}
+
+.assist-msg.user { align-self: flex-end; align-items: flex-end; }
+.assist-msg.assistant { align-self: flex-start; }
+
+.assist-msg-label {
+  color: var(--sub);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.assist-bubble {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 13px;
+  background: #0a0f12;
+  color: var(--text);
+  font-size: 13.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.assist-msg.user .assist-bubble {
+  background: rgba(76, 215, 232, 0.08);
+  border-color: rgba(76, 215, 232, 0.28);
+}
+
+.assist-bubble.error {
+  border-color: rgba(255, 95, 86, 0.45);
+  background: rgba(255, 95, 86, 0.08);
+  color: #ffc4bf;
+}
+
+.assist-bubble pre,
+.assist-tool pre,
+.assist-reasoning pre {
+  margin: 8px 0 0;
+  padding: 9px 11px;
+  border-radius: 8px;
+  background: #05080a;
+  border: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 340px;
+  overflow: auto;
+}
+
+.assist-bubble pre:first-child { margin-top: 0; }
+
+.assist-request,
+.assist-tool,
+.assist-reasoning {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 11px;
+  background: rgba(255, 255, 255, 0.015);
+  color: var(--sub);
+  font-size: 12.5px;
+  align-self: stretch;
+}
+
+.assist-tool[data-status="error"] { border-color: rgba(255, 95, 86, 0.4); }
+.assist-tool[data-status="running"] { border-color: rgba(182, 255, 59, 0.3); }
+
+.assist-request summary,
+.assist-tool summary,
+.assist-reasoning summary {
+  cursor: pointer;
+  color: var(--sub);
+  line-height: 1.5;
+}
+
+.assist-tool summary strong { color: var(--text); font-weight: 600; }
+.assist-tool-status { color: var(--sub); font-size: 11px; margin-left: 6px; }
+.assist-tool[data-status="error"] .assist-tool-status { color: #ffb4ae; }
+.assist-tool[data-status="running"] .assist-tool-status { color: #c6ff5e; }
+
+.assist-working {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--sub);
+  font-size: 12.5px;
+  padding: 2px 4px;
+}
+
+.assist-working .spinner {
+  border-color: rgba(182, 255, 59, 0.2);
+  border-top-color: var(--accent);
+}
+
+.assist-chat-pending {
+  display: grid;
+  gap: 8px;
+  padding: 10px 0 0;
+}
+
+.assist-pending-card {
+  border: 1px solid rgba(255, 189, 46, 0.32);
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: rgba(255, 189, 46, 0.05);
+}
+
+.assist-pending-title {
+  font-size: 12px;
+  color: #ffd166;
+  font-weight: 600;
+  margin-bottom: 5px;
+}
+
+.assist-pending-question {
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.55;
+  margin: 0 0 8px;
+}
+
+.assist-pending-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 0;
+  color: var(--text);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.assist-pending-option input {
+  margin-top: 2px;
+  accent-color: var(--accent);
+}
+
+.assist-pending-option small {
+  display: block;
+  color: var(--sub);
+  font-size: 11.5px;
+  line-height: 1.45;
+  margin-top: 2px;
+}
+
+.assist-pending-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.assist-pending-card .input {
+  margin-top: 6px;
+}
+
+.assist-chat-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding-top: 10px;
+}
+
+.assist-chat-composer .textarea {
+  min-height: 64px;
+  max-height: 180px;
+}
+
+.assist-chat-composer-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
 @media (max-width: 820px) {
   .mode-grid { grid-template-columns: 1fr; }
   .terminal-modal-card { height: 94vh; padding: 10px; }
   .terminal-container { min-height: 240px; }
+  .assist-chat-modal-card { height: 94vh; padding: 10px; }
+  .assist-chat-messages { padding: 10px; }
+  .assist-msg { max-width: 100%; }
 }
 
 .spinner {
