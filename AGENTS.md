@@ -266,8 +266,6 @@ Dok's persistent data root, storage relocation, and Maintenance storage layout: 
 
 # Do these tasks 1 at a time and focus on the single task at hand. Do a task, push to github, Update AGENTS.md and remove the task, inform the user that you are ready to start the next task.
 
-- App Creator methods should examine any given repository links for information on configuration to create the best possible compose file
-
 - App Library: Add an option to deploy without saving. That way it will keep the base config.
 
 - Add authelia user management button to the dashboard Core Services section

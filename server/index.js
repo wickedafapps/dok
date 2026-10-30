@@ -6756,6 +6756,473 @@ function findComposeFile(dir) {
   return composeFiles.map(f => path.join(dir, f)).find(f => fs.existsSync(f)) || null;
 }
 
+const projectConfigSearchDirs = ['docker', 'deploy', 'deployment', 'compose', '.docker'];
+const projectConfigSkipDirs = new Set([
+  '.git', '.github', '.gitlab', '.devcontainer', 'node_modules', 'vendor', 'dist', 'target',
+  'coverage', '.next', '.nuxt', '.cache', '.venv', 'venv', '__pycache__', 'examples',
+  'example', 'samples', 'sample', 'tests', 'test', 'testing', 'docs', 'doc', 'fixtures',
+  'demo', 'demos', 'ci'
+]);
+const projectDockerfileNames = ['Dockerfile', 'Containerfile', 'dockerfile', 'containerfile'];
+const projectReadmeNames = ['README.md', 'README.markdown', 'README.rst', 'README.txt', 'readme.md'];
+
+function projectConfigFileRank(file, root, names) {
+  const parts = path.relative(root, file).split(path.sep);
+  const depth = parts.length - 1;
+  const dir = parts.slice(0, -1).join('/');
+  const preferred = projectConfigSearchDirs.indexOf(dir);
+  return depth * 1000 + (preferred >= 0 ? preferred : 50) * 10 + names.indexOf(parts[parts.length - 1]);
+}
+
+function findProjectConfigFile(dir, names, maxDepth = 2) {
+  const root = path.resolve(dir);
+  const direct = names.map(name => path.join(root, name)).find(file => {
+    try { return fs.statSync(file).isFile(); } catch { return false; }
+  });
+  if (direct) return direct;
+  const candidates = [];
+  let scanned = 0;
+  const visit = (current, depth) => {
+    if (depth > maxDepth || scanned > 4000) return;
+    let entries = [];
+    try { entries = fs.readdirSync(current, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      if (scanned++ > 4000) return;
+      const full = path.join(current, entry.name);
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isFile()) {
+        if (names.includes(entry.name)) candidates.push(full);
+        continue;
+      }
+      if (!entry.isDirectory() || depth >= maxDepth) continue;
+      if (projectConfigSkipDirs.has(entry.name)) continue;
+      if (entry.name.startsWith('.') && entry.name !== '.docker') continue;
+      visit(full, depth + 1);
+    }
+  };
+  visit(root, 0);
+  candidates.sort((a, b) =>
+    projectConfigFileRank(a, root, names) - projectConfigFileRank(b, root, names) ||
+    a.localeCompare(b)
+  );
+  if (!candidates.length) return null;
+  // A collection of example apps has several equally plausible compose files.
+  // Choosing one arbitrarily is worse than leaving the project for manual selection.
+  const locationRank = file => Math.floor(projectConfigFileRank(file, root, names) / 10);
+  const bestRank = locationRank(candidates[0]);
+  const best = candidates.filter(file => locationRank(file) === bestRank);
+  const directories = new Set(best.map(file => path.dirname(file)));
+  return directories.size === 1 ? best[0] : null;
+}
+
+function findProjectComposeFile(dir) {
+  return findProjectConfigFile(dir, composeFiles);
+}
+
+function findProjectDockerfile(dir) {
+  return findProjectConfigFile(dir, projectDockerfileNames);
+}
+
+function readProjectTextFile(file, limit = 512 * 1024) {
+  try {
+    if (!file || !fs.statSync(file).isFile() || fs.statSync(file).size > limit) return '';
+    return fs.readFileSync(file, 'utf-8');
+  } catch {
+    return '';
+  }
+}
+
+function projectReadmeText(dir) {
+  for (const name of projectReadmeNames) {
+    const text = readProjectTextFile(path.join(dir, name));
+    if (text.trim()) return text;
+  }
+  return '';
+}
+
+function splitYamlLineComment(value) {
+  const text = String(value ?? '');
+  let quote = null;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quote) {
+      if (quote === '"' && ch === '\\') { i++; continue; }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; continue; }
+    if (ch === '#' && (i === 0 || /\s/.test(text[i - 1]))) {
+      return { body: text.slice(0, i).trimEnd(), comment: text.slice(i).trim() };
+    }
+  }
+  return { body: text.trimEnd(), comment: '' };
+}
+
+function yamlMappingLineParts(raw) {
+  const list = raw.match(/^([ \t]*)-[ \t]+(.*)$/);
+  const prefix = list ? `${list[1]}- ` : (raw.match(/^[ \t]*/) || [''])[0];
+  const source = list ? list[2] : raw.slice(prefix.length);
+  let quote = null;
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i];
+    if (quote) {
+      if (quote === '"' && ch === '\\') { i++; continue; }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; continue; }
+    if (ch !== ':' || (i < source.length - 1 && !/\s/.test(source[i + 1]))) continue;
+    const key = unquoteYamlValue(source.slice(0, i)).trim();
+    if (!key) return null;
+    const colon = raw.length - source.length + i;
+    const after = raw.slice(colon + 1);
+    const lead = (after.match(/^[ \t]*/) || [''])[0];
+    const { body, comment } = splitYamlLineComment(after.slice(lead.length));
+    return { list: !!list, prefix, key, colon, lead, body, comment };
+  }
+  return null;
+}
+
+function renderRelocatedYamlValue(original, next) {
+  const text = String(original ?? '').trim();
+  const value = String(next ?? '');
+  if ((text.startsWith('[') && text.endsWith(']')) || (text.startsWith('{') && text.endsWith('}'))) return value;
+  if (text.startsWith("'") && text.endsWith("'")) return `'${value.replace(/'/g, "''")}'`;
+  if (text.startsWith('"') && text.endsWith('"')) return JSON.stringify(value);
+  if (!value || /[\s:#]/.test(value)) return JSON.stringify(value);
+  return value;
+}
+
+function relocateProjectComposePath(value, composeDir, projectDir, { explicitOnly = false } = {}) {
+  const text = String(value ?? '').trim();
+  if (!text) return text;
+  if (/^(?:[A-Za-z]:[\\/]|[\\/]|~|\$|https?:\/\/|git:\/\/|ssh:\/\/)/.test(text) || /:\/\//.test(text)) return text;
+  const relative = text === '.' || text === '..' || text.startsWith('./') || text.startsWith('../');
+  if (explicitOnly && !relative) return text;
+  if (!relative && text.includes(':')) return text;
+  const resolved = path.resolve(composeDir, text);
+  const rel = path.relative(projectDir, resolved);
+  if (!rel) return '.';
+  if (rel.startsWith('..') || path.isAbsolute(rel)) return text;
+  const posix = rel.split(path.sep).join('/');
+  return posix.startsWith('.') ? posix : `./${posix}`;
+}
+
+function relocateVolumeShortSpec(value, composeDir, projectDir) {
+  const text = String(value ?? '');
+  const colon = text.indexOf(':');
+  if (colon <= 0) return text;
+  const source = text.slice(0, colon);
+  const next = relocateProjectComposePath(source, composeDir, projectDir, { explicitOnly: true });
+  return next === source ? text : next + text.slice(colon);
+}
+
+function relocateProjectComposePathAssignment(value, composeDir, projectDir) {
+  const text = String(value ?? '');
+  const equals = text.indexOf('=');
+  if (equals <= 0) {
+    const next = relocateProjectComposePath(unquoteYamlValue(text), composeDir, projectDir);
+    return next && next !== unquoteYamlValue(text) ? renderRelocatedYamlValue(text, next) : '';
+  }
+  const name = text.slice(0, equals);
+  const pathValue = text.slice(equals + 1);
+  const original = unquoteYamlValue(pathValue);
+  const next = relocateProjectComposePath(original, composeDir, projectDir);
+  return next && next !== original
+    ? `${name}=${renderRelocatedYamlValue(pathValue, next)}`
+    : '';
+}
+
+function relocateProjectComposeFlowList(value, composeDir, projectDir, { volumeSpecs = false, mappingKeys = null } = {}) {
+  const text = String(value ?? '').trim();
+  if (!text.startsWith('[') || !text.endsWith(']')) return '';
+  let changed = false;
+  const items = splitFlowItems(text.slice(1, -1)).map(item => {
+    const body = String(item || '').trim();
+    if (!body) return body;
+    if (mappingKeys && body.startsWith('{')) {
+      const next = relocateProjectComposeFlowMapping(body, composeDir, projectDir, mappingKeys);
+      if (!next || next === body) return body;
+      changed = true;
+      return next;
+    }
+    const original = unquoteYamlValue(body);
+    const next = volumeSpecs
+      ? relocateVolumeShortSpec(original, composeDir, projectDir)
+      : relocateProjectComposePath(original, composeDir, projectDir);
+    if (!next || next === original) return body;
+    changed = true;
+    return renderRelocatedYamlValue(body, next);
+  });
+  return changed ? `[${items.join(', ')}]` : '';
+}
+
+function relocateProjectComposeFlowMapping(value, composeDir, projectDir, keys) {
+  const text = String(value ?? '').trim();
+  if (!text.startsWith('{') || !text.endsWith('}')) return '';
+  let changed = false;
+  const items = splitFlowItems(text.slice(1, -1)).map(item => {
+    const raw = String(item || '').trim();
+    if (!raw) return raw;
+    const mapping = yamlMappingLineParts(raw);
+    if (!mapping || (keys && !keys.has(mapping.key))) return raw;
+    const original = unquoteYamlValue(mapping.body);
+    const next = relocateProjectComposePath(original, composeDir, projectDir);
+    if (!next || next === original) return raw;
+    changed = true;
+    return raw.slice(0, mapping.colon + 1) + (mapping.lead || ' ') +
+      renderRelocatedYamlValue(mapping.body, next);
+  });
+  return changed ? `{${items.join(', ')}}` : '';
+}
+
+function relocateProjectComposeText(text, composeDir, projectDir) {
+  const lines = String(text || '').replace(/\r\n/g, '\n').split('\n');
+  const stack = [];
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+    const trimmed = raw.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const indent = lineIndent(raw);
+    while (stack.length && indent <= stack[stack.length - 1].indent) stack.pop();
+    const ancestorKeys = new Set(stack.map(item => item.key));
+    const topKey = stack[0]?.key || '';
+    const parentKey = stack[stack.length - 1]?.key || '';
+    const mapping = yamlMappingLineParts(raw);
+    if (mapping) {
+      let next = '';
+      const value = unquoteYamlValue(mapping.body);
+      if (mapping.key === 'build' && topKey === 'services' && stack.length === 2 && mapping.body) {
+        next = mapping.body.trim().startsWith('{')
+          ? relocateProjectComposeFlowMapping(mapping.body, composeDir, projectDir, new Set(['context']))
+          : relocateProjectComposePath(value, composeDir, projectDir);
+      } else if (mapping.key === 'context' && ancestorKeys.has('build')) {
+        next = relocateProjectComposePath(value, composeDir, projectDir);
+      } else if (mapping.key === 'env_file' && topKey === 'services' && mapping.body) {
+        next = mapping.body.trim().startsWith('[')
+          ? relocateProjectComposeFlowList(mapping.body, composeDir, projectDir, { mappingKeys: new Set(['path']) })
+          : relocateProjectComposePath(value, composeDir, projectDir);
+      } else if (mapping.key === 'volumes' && topKey === 'services' && mapping.body && mapping.body.trim().startsWith('[')) {
+        next = relocateProjectComposeFlowList(mapping.body, composeDir, projectDir, { volumeSpecs: true });
+      } else if (mapping.key === 'include' && !stack.length && mapping.body) {
+        const bodyText = mapping.body.trim();
+        next = bodyText.startsWith('[')
+          ? relocateProjectComposeFlowList(mapping.body, composeDir, projectDir, { mappingKeys: new Set(['path']) })
+          : bodyText.startsWith('{')
+            ? relocateProjectComposeFlowMapping(mapping.body, composeDir, projectDir, new Set(['path']))
+            : relocateProjectComposePath(value, composeDir, projectDir);
+      } else if (mapping.key === 'extends' && topKey === 'services' && mapping.body.trim().startsWith('{')) {
+        next = relocateProjectComposeFlowMapping(mapping.body, composeDir, projectDir, new Set(['file']));
+      } else if (mapping.key === 'additional_contexts' && ancestorKeys.has('build') && mapping.body.trim().startsWith('{')) {
+        next = relocateProjectComposeFlowMapping(mapping.body, composeDir, projectDir, null);
+      } else if (mapping.key === 'file' && ['configs', 'secrets'].includes(topKey) && stack.length >= 2) {
+        next = relocateProjectComposePath(value, composeDir, projectDir);
+      } else if (mapping.key === 'file' && ancestorKeys.has('extends')) {
+        next = relocateProjectComposePath(value, composeDir, projectDir);
+      } else if (mapping.key === 'path' && ancestorKeys.has('include')) {
+        next = relocateProjectComposePath(value, composeDir, projectDir);
+      } else if (mapping.key === 'path' && ancestorKeys.has('env_file')) {
+        next = relocateProjectComposePath(value, composeDir, projectDir);
+      } else if (mapping.key === 'source' && topKey === 'services' && ancestorKeys.has('volumes')) {
+        next = relocateProjectComposePath(value, composeDir, projectDir, { explicitOnly: true });
+      } else if (parentKey === 'additional_contexts' && ancestorKeys.has('build')) {
+        next = relocateProjectComposePath(value, composeDir, projectDir);
+      }
+      if (next && next !== value && mapping.body) {
+        const rendered = renderRelocatedYamlValue(mapping.body, next);
+        lines[i] = raw.slice(0, mapping.colon + 1) + (mapping.lead || ' ') + rendered +
+          (mapping.comment ? ` ${mapping.comment}` : '');
+      }
+      stack.push({ indent, key: mapping.key });
+      continue;
+    }
+    const list = raw.match(/^([ \t]*-[ \t]+)(.*)$/);
+    if (!list) continue;
+    const { body, comment } = splitYamlLineComment(list[2]);
+    if (!body) continue;
+    const value = unquoteYamlValue(body);
+    let next = '';
+    if (topKey === 'include' && ancestorKeys.has('include')) {
+      next = relocateProjectComposePath(value, composeDir, projectDir);
+    } else if (ancestorKeys.has('env_file')) {
+      next = relocateProjectComposePath(value, composeDir, projectDir);
+    } else if (ancestorKeys.has('additional_contexts') && ancestorKeys.has('build')) {
+      next = relocateProjectComposePathAssignment(value, composeDir, projectDir);
+    } else if (topKey === 'services' && ancestorKeys.has('volumes')) {
+      next = relocateVolumeShortSpec(value, composeDir, projectDir);
+    }
+    if (next && next !== value) {
+      const rendered = renderRelocatedYamlValue(body, next);
+      lines[i] = list[1] + rendered + (comment ? ` ${comment}` : '');
+    }
+  }
+  return lines.join('\n');
+}
+
+function dockerfileLogicalLines(text) {
+  const lines = [];
+  let current = '';
+  for (const raw of String(text || '').split(/\r?\n/)) {
+    const line = raw.replace(/\s+$/, '');
+    if (!current && line.trimStart().startsWith('#')) continue;
+    current += `${current ? ' ' : ''}${line.trim()}`;
+    if (/\\\s*$/.test(current)) {
+      current = current.replace(/\\\s*$/, '');
+      continue;
+    }
+    if (current.trim()) lines.push(current);
+    current = '';
+  }
+  if (current.trim()) lines.push(current);
+  return lines;
+}
+
+function dockerfileExposePorts(text) {
+  const ports = [];
+  const seen = new Set();
+  for (const line of dockerfileLogicalLines(text)) {
+    const match = line.match(/^EXPOSE\s+(.+)$/i);
+    if (!match) continue;
+    for (const token of match[1].trim().split(/\s+/)) {
+      const clean = token.replace(/^["']|["']$/g, '');
+      const port = clean.match(/^(\d{1,5})(?:-(\d{1,5}))?(?:\/(tcp|udp|sctp))?$/i);
+      if (!port) continue;
+      const start = Number(port[1]);
+      const end = Number(port[2] || port[1]);
+      if (start < 1 || end > 65535 || end < start) continue;
+      const protocol = String(port[3] || 'tcp').toLowerCase();
+      const value = `${start === end ? start : `${start}-${end}`}${protocol === 'tcp' ? '' : `/${protocol}`}`;
+      if (seen.has(value)) continue;
+      seen.add(value);
+      ports.push(value);
+      if (ports.length >= 50) return ports;
+    }
+  }
+  return ports;
+}
+
+function dockerfileVolumeTargets(text) {
+  const targets = [];
+  const seen = new Set();
+  for (const line of dockerfileLogicalLines(text)) {
+    const match = line.match(/^VOLUME\s+(.+)$/i);
+    if (!match) continue;
+    let values = [];
+    const raw = match[1].trim();
+    if (raw.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) values = parsed;
+      } catch {}
+    } else {
+      try { values = parseShell(raw, {}); } catch { values = raw.split(/\s+/); }
+    }
+    for (const value of values) {
+      if (typeof value !== 'string') continue;
+      const target = value.trim();
+      if (!target.startsWith('/') || target === '/' || seen.has(target)) continue;
+      seen.add(target);
+      targets.push(target);
+      if (targets.length >= 20) return targets;
+    }
+  }
+  return targets;
+}
+
+function dockerfileDataSlug(target) {
+  return String(target || '/')
+    .replace(/^\/+|\/+$/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80);
+}
+
+function readmeDockerRunPorts(text) {
+  const source = String(text || '').replace(/\r\n/g, '\n');
+  const lines = source.split('\n');
+  const ports = [];
+  const seen = new Set();
+  const add = (value) => {
+    const port = String(value || '').trim().split(/[-\/]/)[0];
+    if (!/^\d{1,5}$/.test(port)) return;
+    const number = Number(port);
+    if (number < 1 || number > 65535 || seen.has(String(number))) return;
+    seen.add(String(number));
+    ports.push(String(number));
+  };
+  let commands = 0;
+  for (let i = 0; i < lines.length && commands < 20; i++) {
+    const line = lines[i].trim().replace(/^[$>]\s*/, '');
+    if (!/^(?:sudo\s+)?docker\s+run\b/.test(line)) continue;
+    let command = line;
+    while (/\\\s*$/.test(command) && i + 1 < lines.length) {
+      command = command.replace(/\\\s*$/, '');
+      command += ` ${lines[i + 1].trim()}`;
+      i++;
+    }
+    commands++;
+    try {
+      const parsed = parseDockerRun(command);
+      for (const mapping of parsed.ports || []) add(composePortTarget(mapping));
+      for (const exposed of parsed.expose || []) add(exposed);
+    } catch {}
+  }
+  for (const block of source.matchAll(/```[^\n]*\n([\s\S]*?)```/g)) {
+    const content = block[1];
+    if (!/^\s*services\s*:/m.test(content)) continue;
+    let config;
+    try { config = parseBuilderComposeSubset(content); } catch { continue; }
+    for (const service of Object.values(config?.services || {})) {
+      if (!service || typeof service !== 'object') continue;
+      for (const mapping of Array.isArray(service.ports) ? service.ports : []) add(composePortTarget(mapping));
+      for (const exposed of Array.isArray(service.expose) ? service.expose : []) add(exposed);
+    }
+  }
+  return ports;
+}
+
+function projectDockerfileCompose(sourceDir, appName) {
+  const dockerfile = findProjectDockerfile(sourceDir);
+  if (!dockerfile) return '';
+  const dockerfileRel = path.relative(sourceDir, dockerfile).split(path.sep).join('/');
+  const dockerfileText = readProjectTextFile(dockerfile);
+  const expose = dockerfileExposePorts(dockerfileText);
+  const readmePorts = readmeDockerRunPorts(projectReadmeText(sourceDir));
+  for (const port of readmePorts) {
+    if (!expose.includes(port)) expose.push(port);
+  }
+  const volumes = [];
+  for (const target of dockerfileVolumeTargets(dockerfileText)) {
+    const slug = dockerfileDataSlug(target);
+    if (!slug) continue;
+    const source = slug === 'data' ? './data' : `./data/${slug}`;
+    const mount = `${source}:${target}`;
+    if (!volumes.includes(mount)) volumes.push(mount);
+  }
+  let compose = `# managed-by: wickedafdok\nservices:\n  ${yamlScalar(appName)}:\n`;
+  if (dockerfileRel === 'Dockerfile') {
+    compose += '    build: .\n';
+  } else {
+    compose += '    build:\n      context: .\n';
+    compose += `      dockerfile: ${yamlScalar(dockerfileRel)}\n`;
+  }
+  compose += `    container_name: ${yamlScalar(appName)}\n    restart: unless-stopped\n`;
+  if (expose.length) {
+    compose += `    expose:\n${expose.map(port => `      - ${yamlScalar(port)}`).join('\n')}\n`;
+  }
+  if (volumes.length) {
+    compose += `    volumes:\n${volumes.map(volume => `      - ${yamlScalar(volume)}`).join('\n')}\n`;
+  }
+  const virtualPort = expose.length === 1 && !expose[0].includes('/') && !expose[0].includes('-')
+    ? expose[0]
+    : '';
+  if (virtualPort) {
+    compose += `    environment:\n      ${yamlScalar('VIRTUAL_PORT')}: ${yamlScalar(virtualPort)}\n`;
+  }
+  return compose;
+}
+
 const APP_REFERENCE_MAX_URL = 500;
 const APP_REFERENCE_LABELS = [
   'org.opencontainers.image.source',
@@ -7499,22 +7966,26 @@ function prepareAppFromDirectory(sourceDir, appName, { mode = 'auto', appDir: re
   if (isSymlink(appDir)) throw httpError(400, 'Invalid app directory');
   ensureWritableDirectory(appDir, { label: 'app directory' });
   if (!isInsideApps(appDir)) throw httpError(400, 'Invalid app directory');
+  const sourceRoot = path.resolve(sourceDir);
   try {
-    copySourceTree(sourceDir, appDir, {
+    copySourceTree(sourceRoot, appDir, {
       preserveAppData: directoryHasEntries(path.join(appDir, 'data')) || fs.existsSync(path.join(appDir, '.env'))
     });
   } catch {}
 
   let compose = null;
-  const composeFile = findComposeFile(sourceDir);
-  const hasDockerfile = fs.existsSync(path.join(sourceDir, 'Dockerfile'));
-  const useBuild = (mode === 'build' && hasDockerfile) || (!composeFile && hasDockerfile);
+  const composeFile = findProjectComposeFile(sourceRoot);
+  const dockerfile = findProjectDockerfile(sourceRoot);
+  const useBuild = (mode === 'build' && dockerfile) || (!composeFile && dockerfile);
   const baseCompose = useBuild ? null : composeFile;
   if (baseCompose) {
-    compose = fs.readFileSync(baseCompose, 'utf-8');
+    compose = readProjectTextFile(baseCompose);
+    if (path.dirname(baseCompose) !== sourceRoot) {
+      compose = relocateProjectComposeText(compose, path.dirname(baseCompose), sourceRoot);
+    }
     fs.writeFileSync(path.join(appDir, 'docker-compose.yml'), compose);
-  } else if (hasDockerfile) {
-    compose = `# managed-by: wickedafdok\nservices:\n  ${yamlScalar(appName)}:\n    build: .\n    container_name: ${yamlScalar(appName)}\n    restart: unless-stopped\n`;
+  } else if (dockerfile) {
+    compose = projectDockerfileCompose(sourceRoot, appName);
     fs.writeFileSync(path.join(appDir, 'docker-compose.yml'), compose);
   }
   return { appDir, compose };
@@ -7648,8 +8119,8 @@ app.post('/api/launch/git', async (req, res) => {
     }
 
     if (!isInsideDir(dir, sourcesDir)) throw httpError(400, 'Invalid project directory');
-    const hasCompose = !!findComposeFile(dir);
-    const hasDockerfile = fs.existsSync(path.join(dir, 'Dockerfile'));
+    const hasCompose = !!findProjectComposeFile(dir);
+    const hasDockerfile = !!findProjectDockerfile(dir);
     if (!hasCompose && !hasDockerfile) {
       return res.json({
         ok: true,
@@ -7658,7 +8129,7 @@ app.post('/api/launch/git', async (req, res) => {
         path: dir,
         appName: proj,
         type: 'git',
-        message: 'No compose file or Dockerfile found; the clone is available in Projects.'
+        message: 'No single compose file or Dockerfile found; the clone is available in Projects.'
       });
     }
 
@@ -7808,8 +8279,8 @@ app.post('/api/launch/upload', upload.array('files', 200), async (req, res) => {
       movedFiles.push(dest);
     }
 
-    const hasCompose = !!findComposeFile(dir);
-    const hasDockerfile = fs.existsSync(path.join(dir, 'Dockerfile'));
+    const hasCompose = !!findProjectComposeFile(dir);
+    const hasDockerfile = !!findProjectDockerfile(dir);
     if (!hasCompose && !hasDockerfile) {
       return res.json({
         ok: true,
@@ -7819,7 +8290,7 @@ app.post('/api/launch/upload', upload.array('files', 200), async (req, res) => {
         appName: proj,
         type: 'upload',
         count: movedFiles.length,
-        message: 'No compose file or Dockerfile found; the upload is available in Projects.'
+        message: 'No single compose file or Dockerfile found; the upload is available in Projects.'
       });
     }
 
@@ -7880,8 +8351,8 @@ app.post('/api/launch/source', async (req, res) => {
     }
     const project = projectName(name, 'app');
 
-    const hasCompose = !!findComposeFile(dir);
-    const hasDockerfile = fs.existsSync(path.join(dir, 'Dockerfile'));
+    const hasCompose = !!findProjectComposeFile(dir);
+    const hasDockerfile = !!findProjectDockerfile(dir);
     if (!hasCompose && !hasDockerfile && !command) {
       return res.json({
         ok: true,
@@ -7891,7 +8362,7 @@ app.post('/api/launch/source', async (req, res) => {
         appName: project,
         type: 'source',
         mode,
-        message: 'No compose file or Dockerfile found; this project stays in Projects.'
+        message: 'No single compose file or Dockerfile found; this project stays in Projects.'
       });
     }
 
@@ -8743,10 +9214,19 @@ app.get('/api/sources/list', (req, res) => {
       })
       .filter(Boolean)
       .sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === 'dir' ? -1 : 1));
-    const hasCompose = composeFiles.some(f => fs.existsSync(path.join(target, f)));
-    const hasDockerfile = fs.existsSync(path.join(target, 'Dockerfile'));
-    const composeFile = composeFiles.find(f => fs.existsSync(path.join(target, f)));
-    res.json({ rel: path.relative(base, target) || '.', items, hasCompose, hasDockerfile, composeFile, isRoot: target === base });
+    const projectCompose = findProjectComposeFile(target);
+    const projectDockerfile = findProjectDockerfile(target);
+    const composeFile = projectCompose ? path.relative(target, projectCompose).split(path.sep).join('/') : null;
+    const dockerfile = projectDockerfile ? path.relative(target, projectDockerfile).split(path.sep).join('/') : null;
+    res.json({
+      rel: path.relative(base, target) || '.',
+      items,
+      hasCompose: !!projectCompose,
+      hasDockerfile: !!projectDockerfile,
+      composeFile,
+      dockerfile,
+      isRoot: target === base
+    });
   } catch (e) {
     res.status(404).json({ error: e.message });
   }
@@ -9213,23 +9693,26 @@ function copyDirectoryTree(source, dest, { skipTop = [] } = {}) {
 // Builds a library tree from a repository that has a compose file or
 // Dockerfile but no dok-library.json. The repository becomes a single app.
 function synthesizeLibraryFromRepository(repoDir, { name = '', description = '', referenceUrl = '' } = {}) {
-  const repoBase = path.basename(String(repoDir).replace(/[/\\]+$/, ''));
+  const sourceRoot = path.resolve(repoDir);
+  const repoBase = path.basename(sourceRoot.replace(/[/\\]+$/, ''));
   const appName = projectName(name || repoBase, `repo-${Date.now()}`);
-  const composeFile = findComposeFile(repoDir);
-  const hasDockerfile = fs.existsSync(path.join(repoDir, 'Dockerfile'));
-  if (!composeFile && !hasDockerfile) {
+  const composeFile = findProjectComposeFile(sourceRoot);
+  const dockerfile = findProjectDockerfile(sourceRoot);
+  if (!composeFile && !dockerfile) {
     throw httpError(400, 'The repository has no dok-library.json, compose file, or Dockerfile to import');
   }
   const root = fs.mkdtempSync(path.join(tmpDir, 'library-repo-'));
   const appDir = path.join(root, 'apps', appName);
-  copyDirectoryTree(repoDir, appDir, { skipTop: ['.git', 'node_modules', 'data'] });
+  copyDirectoryTree(sourceRoot, appDir, { skipTop: ['.git', 'node_modules', 'data'] });
   const composeRel = 'docker-compose.yml';
   if (composeFile) {
-    const rel = path.relative(repoDir, composeFile).replace(/\\/g, '/');
-    if (rel !== composeRel) fs.copyFileSync(composeFile, path.join(appDir, composeRel));
+    let compose = readProjectTextFile(composeFile);
+    if (path.dirname(composeFile) !== sourceRoot) {
+      compose = relocateProjectComposeText(compose, path.dirname(composeFile), sourceRoot);
+    }
+    fs.writeFileSync(path.join(appDir, composeRel), compose);
   } else {
-    fs.writeFileSync(path.join(appDir, composeRel),
-      `# managed-by: wickedafdok\nservices:\n  ${yamlScalar(appName)}:\n    build: .\n    container_name: ${yamlScalar(appName)}\n    restart: unless-stopped\n`);
+    fs.writeFileSync(path.join(appDir, composeRel), projectDockerfileCompose(sourceRoot, appName));
   }
   const manifest = {
     schema: LIBRARY_SCHEMA,
@@ -9425,9 +9908,10 @@ app.post('/api/library/import-repo', async (req, res) => {
     args.push(repo, repoDir);
     await run('git', args, { env: gitEnvironment(repo) });
     const repositoryReference = referenceUrlFromGitUrl(repo);
+    const sourceRoot = subdir ? path.join(repoDir, ...subdir.split('/')) : repoDir;
     let loaded = libraryManifestFromDirectory(repoDir, subdir);
     if (!loaded) {
-      loaded = synthesizeLibraryFromRepository(repoDir, {
+      loaded = synthesizeLibraryFromRepository(sourceRoot, {
         name: body.name || '',
         description: body.description || '',
         referenceUrl: repositoryReference

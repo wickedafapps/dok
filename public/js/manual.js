@@ -80,7 +80,7 @@
           <li><strong>Git Clone</strong> clones any git repository and looks for compose or Dockerfile files.</li>
           <li><strong>Local upload</strong> uploads files or a folder from your computer.</li>
         </ul>
-        <p>If a git clone or upload has no compose file or Dockerfile, Dok stores it under Projects instead of creating an app. You can deploy it later from that project.</p>
+        <p>Git clones, uploads, Projects deployments, and repository imports inspect the repository for compose files and Dockerfiles in the root and common deployment folders. Nested compose paths are adjusted, and Dockerfile-only projects use their exposed ports, volumes, and README run examples to generate a useful compose file. If several equally likely compose files or Dockerfiles are found, the project stays under Projects so you can open the correct app folder. If no compose file or Dockerfile is found, Dok also stores the project under Projects.</p>
         <p>Every creation method looks for the app&rsquo;s official repository or website and prefills it in <strong>Official repository or website</strong>. Dok checks project metadata, README links, compose and Dockerfile image labels, local image labels, and the git clone URL. If the result is missing or wrong, edit or clear the field before saving. The link appears in Apps for quick configuration reference.</p>
         <p>Created apps join the network selected in <strong>App network</strong>, which defaults to Dok&rsquo;s configured network (normally <code>wicked</code>). Use the create box beside it to add another network. If nginx-proxy is installed, the routed service gets a matching <code>VIRTUAL_HOST</code>/<code>VIRTUAL_PORT</code> pair, is attached to the selected network, and its published host ports are removed so the GUI is served through nginx.</p>
         <p>Before finalising, Dok validates the compose file, resolves networks and bind mounts, checks published ports, and asks for any missing choices. <strong>Save to library</strong> saves the app stopped. <strong>Test launch (stops after test)</strong> starts it briefly, reports the container states, and stops it again. Nothing stays running until you deploy from Apps.</p>
@@ -118,8 +118,9 @@
       html: `
         <p>Enter any git URL, the required app title, and optionally a branch. Private HTTPS repositories use matching git connections saved under Dok Settings; SSH URLs use the container user&rsquo;s keys.</p>
         <ul>
-          <li>If the repository contains <code>docker-compose.yml</code>, <code>compose.yaml</code>, or a <code>Dockerfile</code>, Dok copies it into <code>apps/&lt;name&gt;</code>.</li>
-          <li>Dockerfile-only projects receive a generated compose file that builds the image.</li>
+          <li>Dok checks the repository root and common folders such as <code>docker/</code>, <code>deploy/</code>, and <code>compose/</code> for a compose file or Dockerfile.</li>
+          <li>Nested compose files are moved into the app folder with relative build, env-file, volume, include, and config paths adjusted.</li>
+          <li>Dockerfile-only projects receive a generated compose that builds the image, exposes its <code>EXPOSE</code> ports, maps <code>VOLUME</code> paths under <code>./data</code>, and uses README run examples for extra ports.</li>
           <li>Repositories without either file are routed to Projects instead of becoming apps.</li>
           <li>TLS verification is on by default. <code>WICKEDAFDOK_GIT_INSECURE=1</code> is available for trusted self-signed servers.</li>
         </ul>
@@ -130,7 +131,8 @@
       html: `
         <p>Choose files or a folder from your computer and give the app a name. Uploads are staged in <code>uploads/</code> and then copied into the app source area.</p>
         <ul>
-          <li>If a compose file or Dockerfile is present, the app opens in the compose configuration modal.</li>
+          <li>If a compose file or Dockerfile is present in the root or a common project folder, the app opens in the compose configuration modal.</li>
+          <li>Dockerfile-only uploads get a compose generated from the Dockerfile ports, volumes, and README examples.</li>
           <li>Without either file, the upload is kept under Projects for editing and later deployment.</li>
           <li>Destination paths are traversal-checked and symlinks cannot escape the project directory.</li>
         </ul>
@@ -211,8 +213,8 @@
         <h4>Import</h4>
         <ol>
           <li>Open <strong>Apps</strong> and choose <strong>Import library</strong> for a downloaded archive, or <strong>Import from repository</strong> to clone a git repository directly.</li>
-          <li>For a repository, enter the git URL and optionally a branch and a subfolder containing <code>dok-library.json</code>.</li>
-          <li>Repositories without a library manifest but with a compose file or Dockerfile are imported as a single app.</li>
+          <li>For a repository, enter the git URL and optionally a branch and a subfolder containing <code>dok-library.json</code> or a single compose/Dockerfile app.</li>
+          <li>Repositories without a library manifest but with a compose file or Dockerfile are imported as a single app using the same root/common-folder inspection and nested compose path adjustment as App Creation.</li>
           <li>Confirm overwrite if an app with the same name already exists. Existing app data and <code>.env</code> files are preserved and reused.</li>
         </ol>
         <p>Imported apps are marked <strong>needs setup</strong>. They do not launch automatically. Use <strong>Configure &amp; Deploy</strong> to open the compose builder and supply the information that was stripped, such as hostnames, ports, and bind paths. Saving clears the setup flag.</p>
@@ -610,7 +612,7 @@
     libraryImportFile: 'A Dok library .tar.gz archive exported from another installation.',
     libraryRepoUrl: 'Git URL for a repository that contains a Dok library or a single compose/Dockerfile app. HTTPS, SSH, and self-hosted git servers are supported.',
     libraryRepoBranch: 'Optional branch, tag, or commit to clone. Leave blank for the remote default.',
-    libraryRepoPath: 'Subfolder inside the repository that contains dok-library.json and its apps/ folder.',
+    libraryRepoPath: 'Subfolder inside the repository that contains dok-library.json and its apps/ folder, or a single app with a compose file or Dockerfile.',
     libraryRepoName: 'App name to use when the repository has no dok-library.json and is imported as a single app.',
     nginxAcmeEnabled: 'Create and renew Let\'s Encrypt certificates automatically with nginxproxy/acme-companion.',
     nginxAcmeEmail: 'Contact email used for certificate registration and expiry notices.',
