@@ -467,11 +467,11 @@
     const notice = qs('#landingNotice');
     if (dok.exists) {
       notice.className = 'notice ok';
-      notice.innerHTML = `Dok is installed${dok.running ? ' and running' : ` (${escapeHtml(dok.state || 'stopped')})`}. Use the Overview tab for controls. Reinstalling overwrites the current installation directories.`;
+      notice.innerHTML = `Dok is installed${dok.running ? ' and running' : ` (${escapeHtml(dok.state || 'stopped')})`}. Use the Overview tab for controls. Running the installer again detects the existing installation, lets you reuse or replace its settings, and keeps the app library, app data, sources, uploads, and backups.`;
       notice.classList.remove('hidden');
     } else if (data.installation?.exists) {
       notice.className = 'notice warn';
-      notice.innerHTML = `Saved installation data was found${saved?.completedAt ? ` from ${escapeHtml(when(saved.completedAt))}` : ''}. You can reinstall exactly from a snapshot, or start a fresh installation.`;
+      notice.innerHTML = `Saved installation data was found${saved?.completedAt ? ` from ${escapeHtml(when(saved.completedAt))}` : ''}. You can reinstall exactly from a snapshot, or run the installer to reuse or replace the existing settings while keeping your apps and data.`;
       notice.classList.remove('hidden');
     } else {
       notice.classList.add('hidden');
@@ -480,7 +480,7 @@
     const hasSnapshots = (data.installation?.snapshots || 0) > 0;
     qs('#reinstallBtn').classList.toggle('hidden', !hasSnapshots);
     qs('#openExistingDokBtn').classList.toggle('hidden', !dok.exists);
-    qs('#startInstallBtn').textContent = dok.exists ? 'Start fresh installation (overwrites)' : 'Start installation';
+    qs('#startInstallBtn').textContent = dok.exists ? 'Repair or reinstall Dok' : 'Start installation';
   }
 
   async function loadInstall() {

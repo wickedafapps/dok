@@ -1053,6 +1053,21 @@ function samePath(a, b) {
   try { return path.resolve(a) === path.resolve(b); } catch { return false; }
 }
 
+// Bind mounts expose one host directory at several container paths. Path
+// string comparison is not enough: a reinstall from an already-installed
+// Maintenance container mounts the storage root at both /dok and /host/<path>,
+// and copying it onto itself fails. Compare the underlying file identity too.
+function sameFile(a, b) {
+  if (samePath(a, b)) return true;
+  try {
+    const left = fs.statSync(a);
+    const right = fs.statSync(b);
+    return left.dev === right.dev && left.ino === right.ino;
+  } catch {
+    return false;
+  }
+}
+
 // Dok state is split into three protection categories:
 //   1. replaceable: generated compose files, temporary files, and logs
 //   2. configurable: settings, credentials, secrets, and service configuration
@@ -1211,7 +1226,10 @@ export function normalizeDokDataLocation(dataLocation) {
 
   // Canonical installs always create <dataLocation>/apps for app runtime data,
   // while the Dok storage folder has its own apps directory for the library.
-  if (fs.existsSync(path.join(parent, 'apps'))) return parent;
+  // Check the host-visible path: inside Maintenance the data location is not
+  // mounted at its host path directly.
+  const parentVisible = hostVisiblePath(parent);
+  if (fs.existsSync(path.join(parentVisible, 'apps'))) return parent;
   if (fs.existsSync(inspection.appsRoot)) return location;
   return parent;
 }
@@ -1227,7 +1245,9 @@ export function inspectDokStorage(dataLocation) {
   const directRoot = path.resolve(location);
   // Never treat the source checkout as a previous installation just because a
   // development run left data/apps directories in it.
-  const directEligible = !samePath(directRoot, DOK_SOURCE_ROOT) && !samePath(directRoot, DOK_HOST_PATH);
+  const directEligible = !samePath(directRoot, DOK_SOURCE_ROOT) &&
+    !samePath(directRoot, hostVisiblePath(DOK_SOURCE_ROOT)) &&
+    !samePath(directRoot, DOK_HOST_PATH);
   const direct = directEligible ? inspectStorageRoot(directRoot, location, { requireDataEvidence: true }) : null;
   const chosen = chooseStorageRoot(canonical, direct);
   const layout = samePath(chosen.root, directRoot) ? 'direct' : 'dok-subfolder';
@@ -1321,6 +1341,8 @@ function copyTree(source, target, { overwrite = true, excludeTopLevel = [] } = {
   const resolvedSource = path.resolve(source);
   const resolvedTarget = path.resolve(target);
   if (resolvedSource === resolvedTarget) return;
+  // Only compare existing paths. A missing target will be created below.
+  if (fs.existsSync(target) && sameFile(resolvedSource, resolvedTarget)) return;
   const excluded = new Set(excludeTopLevel);
   fs.mkdirSync(resolvedTarget, { recursive: true });
   fs.cpSync(resolvedSource, resolvedTarget, {
